@@ -45,7 +45,8 @@ tissue, glossary against synonym drift, skills for fumbled workflows, and
    sketch (public header signatures), required behavior, test expectations,
    and which `.unbox/rules/` files apply (§3 map).
 5. **Summon the wave** — one Task per unit, all in ONE message when file
-   sets are disjoint. **THE TOKEN RULE:** never inline harness/rule/brief
+   sets are disjoint. Spikes and high-risk units get the `opus` agent
+   (user decision, slice 3); routine units may use cheaper agents. **THE TOKEN RULE:** never inline harness/rule/brief
    contents into a Task prompt — the agent reads them itself; the guardrail
    bytes land in ITS context, not yours. Canonical summon prompt:
 
