@@ -1,0 +1,30 @@
+# tasks.md — live status
+
+> The orchestrator updates this after EVERY milestone. Keep it terse:
+> slice status + the single next action. History lives in git.
+
+## Now
+
+**Next action:** Slice 1 — install toolchain (`sudo pacman -S meson ninja
+cmake ccache`), then bootstrap the Meson skeleton per `notes/plan.md` §5.
+
+## Slices
+
+| # | Slice | Status | Acceptance |
+|---|---|---|---|
+| 0 | Harness skeleton | **DONE** 2026-06-12 | All harness md files in place |
+| 1 | Bootstrap: toolchain, Meson skeleton, RMLUi subproject compiles, empty kernel links wlroots-0.20 from C++ via the extern-"C" wrapper | pending | `ninja -C build` green; no-op binary runs + exits clean |
+| 2 | tinywl port: kernel skeleton runs nested under labwc | pending | opens as a window; manages a foot toplevel; keyboard/pointer/touch events flow |
+| 3 | **THE SPIKE:** RMLUi→scene bridge | pending | a hello-world RML document composited as a scene node with damage tracking; go/no-go gate |
+| 4 | Extension host + contracts: bus, manifests, static registration; xdg-shell/layer-shell refactored OUT of kernel into core extensions | pending | kernel names no feature; ext-xdg-shell + ext-layer-shell pass suite |
+| 5 | Input routing + ergonomics contract: unified pointer/touch→RMLUi events, keybinding filter chain, touch-mode RCSS variables | pending | same ui surface usable by mouse and finger |
+| 6 | First standard extensions: ext-taskbar + ext-launcher | pending | proves the ui-substrate contract is complete (friction = bad contract) |
+| 7 | ext-window-tiling: pure layout core + thin scene glue | pending | layout math 100% doctest-covered, zero wlroots types in core |
+| 8 | ext-osk: RML keyboard ui surface injecting via wlr_seat | pending | type into foot via touch only; auto-show on text-input focus |
+| 9 | Session hardening: s6 user service, TTY launch on seat0, layout persistence (append-only state + pure reconcile on boot) | pending | survives `kill -9` + s6 restart with workspaces restored |
+
+## Deferred decisions (decide when reached — see notes/plan.md §7)
+
+dlopen extensions · remote builds on builder · xwayland default ·
+OSK virtual-keyboard protocol vs direct seat injection · workspace model ·
+clang-format style details

@@ -1,0 +1,13 @@
+# build trees (build/ = fast dev, build-asan/ = sanitizers)
+build*/
+.cache/
+compile_commands.json
+
+# orchestrator working files (briefs in, reports out)
+prompts/
+reports/
+
+# meson subprojects: keep wraps + our patch files, ignore downloaded sources
+subprojects/*
+!subprojects/*.wrap
+!subprojects/packagefiles/
