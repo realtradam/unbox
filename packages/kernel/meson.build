@@ -5,8 +5,11 @@ kernel_inc = include_directories('include')
 kernel_lib = static_library(
   'unbox-kernel',
   'src/kernel.cpp',
+  'src/server.cpp',
+  'src/toplevel.cpp',
+  'src/input.cpp',
   include_directories: kernel_inc,
-  dependencies: [wlroots_dep, wayland_server_dep, rmlui_dep],
+  dependencies: [wlroots_dep, wayland_server_dep, xkbcommon_dep, rmlui_dep],
 )
 
 # What consumers get. wlroots/wayland propagate because wlr.hpp is a public

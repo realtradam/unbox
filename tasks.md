@@ -5,8 +5,9 @@
 
 ## Now
 
-**Next action:** Slice 2 — port tinywl into the kernel: backend/output/
-seat/scene glue, run nested under labwc, manage a foot toplevel.
+**Next action:** Slice 3 — THE SPIKE: RMLUi→scene bridge (notes/plan.md
+§4). Plan A: GLES 3.2 sibling context → dmabuf-backed FBO → wlr_buffer →
+wlr_scene_buffer. Go/no-go gate for the whole UI design.
 
 ## Slices
 
@@ -14,7 +15,7 @@ seat/scene glue, run nested under labwc, manage a foot toplevel.
 |---|---|---|---|
 | 0 | Harness skeleton | **DONE** 2026-06-12 | All harness md files in place |
 | 1 | Bootstrap: toolchain, Meson skeleton, RMLUi subproject compiles, empty kernel links wlroots-0.20 from C++ via the extern-"C" wrapper | **DONE** 2026-06-12 | met: build green; tests 1/1; binary prints wlroots 0.20.1 + RmlUi 6.2, exits 0 |
-| 2 | tinywl port: kernel skeleton runs nested under labwc | pending | opens as a window; manages a foot toplevel; keyboard/pointer/touch events flow |
+| 2 | tinywl port: kernel skeleton runs nested under labwc | **DONE** 2026-06-12 | met: nested output WL-1, foot toplevel mapped+focused, GLES2 renderer; touch handlers added (tinywl lacks them); headless boot test green |
 | 3 | **THE SPIKE:** RMLUi→scene bridge | pending | a hello-world RML document composited as a scene node with damage tracking; go/no-go gate |
 | 4 | Extension host + contracts: bus, manifests, static registration; xdg-shell/layer-shell refactored OUT of kernel into core extensions | pending | kernel names no feature; ext-xdg-shell + ext-layer-shell pass suite |
 | 5 | Input routing + ergonomics contract: unified pointer/touch→RMLUi events, keybinding filter chain, touch-mode RCSS variables | pending | same ui surface usable by mouse and finger |

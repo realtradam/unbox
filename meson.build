@@ -16,6 +16,7 @@ add_project_arguments('-DWLR_USE_UNSTABLE', language: 'cpp')
 
 wlroots_dep = dependency('wlroots-0.20')
 wayland_server_dep = dependency('wayland-server')
+xkbcommon_dep = dependency('xkbcommon')
 
 # RMLUi: CMake-only upstream, vendored as a wrap-file tarball (NO git
 # submodules — settled decision, notes/plan.md §2) built via the cmake module.
