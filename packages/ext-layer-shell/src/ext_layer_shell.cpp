@@ -39,6 +39,21 @@ auto band_for_layer(enum zwlr_layer_shell_v1_layer layer) -> kernel::SceneLayer 
     return kernel::SceneLayer::top; // unreachable: protocol validates the enum
 }
 
+// Give `surface` the seat keyboard focus, forwarding the currently-pressed
+// keycodes/modifiers if a keyboard is present (wlroots defers to any active
+// grab). Used for both `exclusive` (focus on map) and `on_demand` (focus on
+// click/tap) interactivity.
+void focus_keyboard(Host& host, wlr_surface* surface) {
+    wlr_seat* seat = host.seat();
+    wlr_keyboard* kbd = wlr_seat_get_keyboard(seat);
+    if (kbd != nullptr) {
+        wlr_seat_keyboard_notify_enter(seat, surface, kbd->keycodes,
+                                       kbd->num_keycodes, &kbd->modifiers);
+    } else {
+        wlr_seat_keyboard_notify_enter(seat, surface, nullptr, 0, nullptr);
+    }
+}
+
 class LayerShellExt;
 
 // One live layer surface: its scene node and the wlroots signal bindings.
@@ -114,6 +129,27 @@ public:
         wl_list_for_each(lo, &host.output_layout()->outputs, link) {
             track_output(lo->output);
         }
+
+        // on_demand keyboard interactivity (zwlr v4): focus a layer surface when
+        // the user clicks OR taps it. We take focus only on interaction with OUR
+        // surface and never steal it back — clicking/tapping elsewhere lets focus
+        // move away normally (some other extension's hit handler, or a focus
+        // clear, owns that). These are fire-and-forget Events with N subscribers,
+        // so coexisting with ext-xdg-shell's toplevel-focusing handler on the
+        // same hit stream is fine — the hits are disjoint (its toplevels vs our
+        // layer surfaces). The kernel has already consumed any hit over its own
+        // UI surfaces before we see the event; layer surfaces are client surfaces
+        // and unaffected.
+        pointer_button_ = host.subscribe(
+            host.on_pointer_button(), [this](const kernel::PointerButtonEvent& e) {
+                if (e.pressed) {
+                    focus_on_demand_at(e.lx, e.ly);
+                }
+            });
+        touch_down_ = host.subscribe(
+            host.on_touch_down(), [this](const kernel::TouchDownEvent& e) {
+                focus_on_demand_at(e.lx, e.ly);
+            });
     }
 
     [[nodiscard]] auto host() -> Host& { return *host_; }
@@ -255,6 +291,54 @@ private:
         }
     }
 
+    // Resolve the topmost scene surface at layout point (lx,ly); if it is one of
+    // OUR tracked, mapped layer surfaces requesting on_demand keyboard
+    // interactivity, give it keyboard focus. Called on pointer-button-press and
+    // touch-down. We never clear focus here: taking focus on a hit to our
+    // surface is the whole on_demand contract; moving focus AWAY is someone
+    // else's hit (or a focus clear), never our job.
+    void focus_on_demand_at(double lx, double ly) {
+        double nx = 0;
+        double ny = 0;
+        wlr_scene_node* node =
+            wlr_scene_node_at(&host_->scene()->tree.node, lx, ly, &nx, &ny);
+        if (node == nullptr || node->type != WLR_SCENE_NODE_BUFFER) {
+            return;
+        }
+        wlr_scene_buffer* buffer = wlr_scene_buffer_from_node(node);
+        wlr_scene_surface* scene_surface =
+            wlr_scene_surface_try_from_buffer(buffer);
+        if (scene_surface == nullptr) {
+            return;
+        }
+        // Map the hit wlr_surface back to its layer surface, then confirm it is
+        // OURS (tracked) and on_demand. The scene hit may land on a sub-surface
+        // or popup of the layer surface; try_from_wlr_surface only resolves the
+        // role surface itself, so also accept a hit whose layer surface we own.
+        wlr_layer_surface_v1* layer =
+            wlr_layer_surface_v1_try_from_wlr_surface(scene_surface->surface);
+        if (layer == nullptr || !owns(layer)) {
+            return;
+        }
+        if (!layer->surface->mapped) {
+            return;
+        }
+        if (layer->current.keyboard_interactive !=
+            ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND) {
+            return;
+        }
+        focus_keyboard(*host_, layer->surface);
+    }
+
+    [[nodiscard]] auto owns(wlr_layer_surface_v1* layer) const -> bool {
+        for (const auto& ls : surfaces_) {
+            if (ls->wlr() == layer) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Per-output usable area (our pure-core mirror). N == #outputs (tiny); a
     // flat pointer-keyed vector keeps the public header wlroots-free.
     struct UsableEntry {
@@ -286,6 +370,8 @@ private:
     Listener new_surface_;
     kernel::Subscription output_added_;
     kernel::Subscription output_removed_;
+    kernel::Subscription pointer_button_; // on_demand focus on click
+    kernel::Subscription touch_down_;      // on_demand focus on tap
 
     // A layer surface that arrived before any output existed. Held with only a
     // destroy listener until an output appears (adopt_pending_surfaces), then
@@ -341,8 +427,9 @@ LayerSurface::LayerSurface(LayerShellExt& owner, wlr_layer_surface_v1* surface,
     new_popup_.connect(surface_->events.new_popup, [](void*) {});
 }
 
-// Minimal v1 keyboard interactivity: focus an `exclusive` surface once mapped;
-// leave `none` alone. `on_demand` is deferred to slice 5's input routing.
+// Keyboard interactivity on commit: focus an `exclusive` surface once mapped.
+// `none` and `on_demand` are left alone here — `on_demand` takes focus only on
+// a pointer/touch hit (LayerShellExt::focus_on_demand_at), never on commit.
 void LayerSurface::update_keyboard_focus() {
     if (!surface_->surface->mapped) {
         return;
@@ -351,14 +438,7 @@ void LayerSurface::update_keyboard_focus() {
         ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE) {
         return;
     }
-    wlr_seat* seat = owner_.host().seat();
-    wlr_keyboard* kbd = wlr_seat_get_keyboard(seat);
-    if (kbd != nullptr) {
-        wlr_seat_keyboard_notify_enter(seat, surface_->surface, kbd->keycodes,
-                                       kbd->num_keycodes, &kbd->modifiers);
-    } else {
-        wlr_seat_keyboard_notify_enter(seat, surface_->surface, nullptr, 0, nullptr);
-    }
+    focus_keyboard(owner_.host(), surface_->surface);
 }
 
 } // namespace

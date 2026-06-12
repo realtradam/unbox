@@ -20,7 +20,8 @@ extension-creates-the-global split keeps the kernel featureless.
   to track the output set (assign one to outputless surfaces; re-arrange and
   evict on output loss). Plus a one-shot enumeration of already-existing outputs
   (`host.output_layout()->outputs`) at activate, since outputs predate
-  activation (see Gotchas).
+  activation (see Gotchas). Also `on_pointer_button` + `on_touch_down` for
+  on_demand keyboard focus (see Keyboard interactivity).
 - **Binds (wlroots signals, via RAII `Listener`):** shell `new_surface`; per
   surface its `wlr_surface.commit`, layer-surface `destroy`, and `new_popup`.
 - **Drives:** `wlr_scene_layer_surface_v1_configure` on every commit and output
@@ -47,10 +48,21 @@ will read for per-output usable area. The glue keeps a per-output `Box` updated
 from the helper's `usable_area` out-param using this model's coordinate
 convention.
 
+## Keyboard interactivity
+All three zwlr v4/v5 modes are honored (the global advertises v5; on_demand
+exists since v4):
+- **`exclusive`** — focus the surface when it maps (on commit, `update_keyboard_focus`).
+- **`on_demand`** — focus the surface when the user clicks or taps it. We
+  subscribe `on_pointer_button` (press) and `on_touch_down`, resolve the hit
+  with `wlr_scene_node_at` on `host.scene()`, map the hit `wlr_surface` back to
+  one of our tracked layer surfaces, and focus it if it requests on_demand. We
+  only ever TAKE focus on a hit to our own surface; we never steal it back, so
+  clicking elsewhere lets focus move away normally. Coexists with
+  ext-xdg-shell's toplevel-focusing handler on the same N-subscriber Events —
+  the hits are disjoint (its toplevels vs our layer surfaces).
+- **`none`** — left alone.
+
 ## What was deferred (intentional)
-- **`on_demand` keyboard interactivity:** only `exclusive` (focus on map) and
-  `none` (leave alone) are honored. `on_demand` needs slice 5's input routing
-  (click-to-focus a layer surface) and is a documented TODO.
 - **A typed usable-area service / `usable-area-changed` Event:** not exported.
   The per-output `Box` is computed and held internally; publishing it is left
   to the consumer that actually needs it (tiling) so the contract is shaped by

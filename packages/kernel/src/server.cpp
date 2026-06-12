@@ -69,12 +69,53 @@ void Server::terminate() {
     wl_display_terminate(impl_->display);
 }
 
-auto Server::ui_spike_frame_count() const -> int {
-    return impl_->ui_spike != nullptr ? impl_->ui_spike->frame_count() : 0;
+auto Server::ui_frame_count() const -> int {
+    return impl_->substrate != nullptr ? impl_->substrate->frame_count() : 0;
 }
 
-auto Server::ui_spike_orientation() const -> int {
-    return impl_->ui_spike != nullptr ? impl_->ui_spike->check_orientation() : 0;
+auto Server::ui_orientation() const -> int {
+    return impl_->substrate != nullptr ? impl_->substrate->orientation() : 0;
+}
+
+auto Server::ui_fence_sync_active() const -> bool {
+    return impl_->substrate != nullptr && impl_->substrate->fence_sync_active();
+}
+
+void Server::ui_set_touch_override(UiTouchOverride ov) {
+    if (impl_->substrate == nullptr) {
+        return;
+    }
+    UiSubstrate::TouchModeOverride mapped = UiSubstrate::TouchModeOverride::automatic;
+    if (ov == UiTouchOverride::force_off) {
+        mapped = UiSubstrate::TouchModeOverride::force_off;
+    } else if (ov == UiTouchOverride::force_on) {
+        mapped = UiSubstrate::TouchModeOverride::force_on;
+    }
+    impl_->substrate->set_touch_mode_override(mapped);
+}
+
+// ---- PerExtensionUi (per-extension ui-substrate facade) --------------------
+
+auto PerExtensionUi::create_surface(const UiSurfaceSpec& spec) -> std::unique_ptr<UiSurface> {
+    if (server_->substrate == nullptr) {
+        return nullptr;
+    }
+    wlr_scene_tree* parent = server_->scene_layers[static_cast<std::size_t>(spec.layer)];
+    return server_->substrate->create_surface(id_, parent, spec);
+}
+
+auto PerExtensionUi::available() const -> bool {
+    return server_->substrate != nullptr && server_->substrate->available();
+}
+
+auto PerExtensionUi::touch_mode() const -> bool {
+    return server_->substrate != nullptr && server_->substrate->touch_mode();
+}
+
+void PerExtensionUi::set_touch_mode_override(TouchModeOverride ov) {
+    if (server_->substrate != nullptr) {
+        server_->substrate->set_touch_mode_override(ov);
+    }
 }
 
 // ---- Impl lifecycle --------------------------------------------------------
@@ -169,9 +210,10 @@ void Server::Impl::init() {
         throw std::runtime_error("failed to start the wlr_backend");
     }
 
-    if (options.ui_spike) {
-        start_ui_spike();
-    }
+    // The ui substrate is always built; it reports available()==false on a
+    // backend with no GL path (headless pixman) and create_surface yields
+    // nullptr there, so extensions degrade gracefully. Never throws.
+    start_substrate();
 
     if (!options.startup_cmd.empty()) {
         if (fork() == 0) {
@@ -273,20 +315,22 @@ void Server::Impl::activate_extensions() {
     }
 }
 
-void Server::Impl::start_ui_spike() {
-    if (!wlr_renderer_is_gles2(renderer)) {
-        wlr_log(WLR_INFO, "ui-spike: renderer is not gles2; spike disabled");
-        return;
+void Server::Impl::start_substrate() {
+    // The substrate needs the wlr renderer's EGLDisplay for its sibling GLES
+    // 3.2 context. Only the gles2 renderer exposes one; under pixman (headless
+    // CI) there is no GL path, so the substrate builds but reports unavailable.
+    EGLDisplay display_egl = EGL_NO_DISPLAY;
+    if (wlr_renderer_is_gles2(renderer)) {
+        if (wlr_egl* egl = wlr_gles2_renderer_get_egl(renderer)) {
+            display_egl = wlr_egl_get_display(egl);
+        }
+    } else {
+        wlr_log(WLR_INFO, "ui-substrate: renderer is not gles2; substrate unavailable");
     }
-    wlr_egl* egl = wlr_gles2_renderer_get_egl(renderer);
-    if (egl == nullptr) {
-        wlr_log(WLR_ERROR, "ui-spike: gles2 renderer has no wlr_egl");
-        return;
-    }
-    EGLDisplay display_egl = wlr_egl_get_display(egl);
-    // The spike sits in the overlay band so it composites above everything.
-    ui_spike = UiSpike::create(scene_layers[static_cast<std::size_t>(SceneLayer::overlay)],
-                               display_egl, allocator, renderer);
+    // A data-event/getter throw disables the owning extension via the same
+    // isolation path the bus uses (Server::Impl is the DisableSink).
+    substrate = Substrate::create(display_egl, allocator, renderer,
+                                  [this](ExtensionId who) { disable(who); });
 }
 
 void Server::Impl::shutdown() {
@@ -301,8 +345,9 @@ void Server::Impl::shutdown() {
     }
     extensions.clear();
 
-    // Slice-3 spike: tear down before scene/renderer/allocator die.
-    ui_spike.reset();
+    // The ui substrate owns scene nodes + GL objects on a sibling context and
+    // borrows scene/renderer/allocator: tear it down before they die.
+    substrate.reset();
 
     if (display != nullptr) {
         wl_display_destroy_clients(display);
@@ -377,8 +422,8 @@ void Server::Impl::handle_new_output(wlr_output* wlr_output) {
     outputs.push_back(std::move(owned));
 
     output->frame.connect(wlr_output->events.frame, [this, output](void*) {
-        if (ui_spike != nullptr) {
-            ui_spike->tick();
+        if (substrate != nullptr) {
+            substrate->tick_all();
         }
         wlr_scene_output* scene_output = wlr_scene_get_scene_output(scene, output->output);
         wlr_scene_output_commit(scene_output, nullptr);

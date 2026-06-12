@@ -14,6 +14,10 @@ Use to smoke-test unbox visually without leaving the live labwc session.
    Screenshots are token-expensive — never browse around with captures.
 5. **Crashes:** reproduce under `build-asan/` FIRST and read the sanitizer
    trace before reading any source (see ORCHESTRATOR.md §4).
+   **Killing sessions:** `pkill -x unbox` ONLY — `pkill -f` matches your
+   own shell's command line and kills it mid-command (learned the hard
+   way). Launch detached: `setsid nohup … &` so the session survives the
+   tool call.
 6. **Touch caveat:** nested touch fidelity depends on what labwc forwards.
    Final touch/gesture validation only counts on the real seat (slice 9+,
    s6 service on seat0).

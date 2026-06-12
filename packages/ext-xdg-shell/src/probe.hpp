@@ -6,7 +6,7 @@
 
 // Test-only probe surface (PRIVATE — src/, never part of the contract). The
 // headless integration test needs to assert activate() actually ran on the
-// concrete extension object; the public make_extension() hides the type behind
+// concrete extension object; the public create() hides the type behind
 // kernel::Extension. This factory hands back the same Extension plus a borrowed
 // probe pointer the test can poll. Glue/shell test convenience only.
 
@@ -27,7 +27,7 @@ struct ExtensionWithProbe {
     ActivationProbe* probe = nullptr;                    // borrow into the above
 };
 
-// Same extension as make_extension(), but also yields a probe borrow.
+// Same extension as create(), but also yields a probe borrow.
 [[nodiscard]] auto make_extension_with_probe() -> ExtensionWithProbe;
 
 } // namespace unbox::ext_xdg_shell

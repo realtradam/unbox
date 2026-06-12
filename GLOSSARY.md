@@ -45,7 +45,7 @@
 | **ui substrate** | The kernel subsystem owning RMLUi: contexts, render-to-scene bridge, input routing, theme variables. | shell renderer, ui engine |
 | **ui surface** | One RMLUi document an extension contributes, composited as a scene node. | shell surface, overlay, RML window, panel (when meaning the object) |
 | **data binding** | RMLUi's model↔document binding; the ONLY way extension state reaches RML. | — |
-| **touch-mode** | The theme state that scales hit targets for finger input (RCSS variables, never per-extension hacks). | tablet mode |
+| **touch-mode** | The substrate state signalling finger input (auto-flipped, debounced). NO automatic visual scaling (user decision, slice 5) — extensions may adapt affordances via the change notification (spacing, invisible hit zones, OSK auto-show). | tablet mode |
 
 ## Workflow
 

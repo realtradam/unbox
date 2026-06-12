@@ -64,7 +64,10 @@ tissue, glossary against synonym drift, skills for fumbled workflows, and
 
 6. **Verify.** Read the report from disk, then independently re-run the
    build + tests (+ the asan build for anything touching lifetimes). Trust
-   nothing you haven't re-run yourself.
+   nothing you haven't re-run yourself. UX-FEEL behavior (scaling, timing,
+   gestures) additionally needs a USER hands-on BEFORE the contract is
+   finalized — slice 5's touch-mode burned three agent iterations
+   (1.6→1.25→none) that one early hands-on would have collapsed.
 7. **Resolve** contract gaps: header changes go through the owning unit as
    a new (small) brief; never patch around a bad contract in host-bin.
 8. **Commit** the milestone with a clear message; update `tasks.md`.

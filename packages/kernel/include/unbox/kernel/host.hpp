@@ -7,6 +7,10 @@
 #include <cstdint>
 #include <typeindex>
 
+namespace unbox::kernel {
+class UiSubstrate; // <unbox/kernel/ui.hpp> — the ui-substrate facade Host::ui() returns
+}
+
 // The Host API: the typed facade an Extension receives in activate(). It is
 // PER-EXTENSION — the kernel hands each extension its own Host so that when a
 // hook callback throws, the bus knows which extension to disable. Never pass
@@ -182,11 +186,45 @@ public:
         return static_cast<wlr_scene_tree*>(surface_store().get(surface));
     }
 
+    // The ui substrate (RMLUi behind a typed facade). Contribute ui surfaces +
+    // data bindings through this; never touch GL or RMLUi types. Borrow valid
+    // for your extension's lifetime; carries your id for error isolation. See
+    // <unbox/kernel/ui.hpp>. (Returns a reference even when no GL backend is
+    // present — UiSubstrate::available()/create_surface report that.)
+    [[nodiscard]] virtual auto ui() -> UiSubstrate& = 0;
+
     // ---- Kernel event catalogue ----
     // Subscribe through these to react to kernel-owned input/output. Each
     // returns an Event/Filter you subscribe to with YOUR extension id (the
     // Host supplies it; see subscribe helpers below). The kernel emits; you
     // never emit on these.
+    //
+    // INPUT CONSUMPTION ORDER + IMPLICIT GRAB (contract-docs: this is true,
+    // verified by the kernel suite). Before emitting a pointer-button /
+    // pointer-axis / touch event on the bus, the kernel offers it to the ui
+    // substrate FIRST. Consumption follows STANDARD SEAT IMPLICIT-GRAB rules,
+    // not the cursor's current position:
+    //   - Pointer buttons: the grab is decided at the FIRST button press (when
+    //     no button was down) by whether that press was over a visible ui
+    //     surface. If yes, the substrate owns the WHOLE press..last-release
+    //     stream and consumes it (no bus emit); if no, the bus owns it and
+    //     EVERY event of the stream — including a release that happens to be
+    //     over a ui surface — is emitted on the bus. This is what lets an
+    //     ext-xdg-shell interactive move/resize grab (press on a titlebar)
+    //     receive its release even when the cursor ends over a ui surface.
+    //   - Touch: each touch point's owner is decided at its down (over a ui
+    //     surface vs not); that point's motion/up/cancel route to the same
+    //     owner regardless of where the point travels.
+    //   - A ui surface destroyed mid-grab does not strand the stream: a
+    //     substrate-owned tail stays consumed (delivered nowhere), never
+    //     leaking onto the bus mid-grab.
+    // Pointer MOTION is always emitted on the bus (extensions hit-test the
+    // scene themselves); the substrate also gets motion for hover/leave (and,
+    // during a substrate-owned button grab, the grabbed surface keeps the
+    // moves). Because a ui-surface node is not a client surface, a routing
+    // extension that hit-tests motion finds "no client here" over a ui surface
+    // and clears stale client hover. Keyboard keys are NOT consumed by the
+    // substrate this slice (keyboard-into-ui is deferred).
     [[nodiscard]] virtual auto on_output_added() -> Event<const OutputEvent&>& = 0;
     [[nodiscard]] virtual auto on_output_removed() -> Event<const OutputEvent&>& = 0;
     [[nodiscard]] virtual auto on_pointer_motion() -> Event<const PointerMotionEvent&>& = 0;

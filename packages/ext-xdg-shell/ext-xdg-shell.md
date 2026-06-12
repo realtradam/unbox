@@ -50,9 +50,12 @@ it is never read by another unit.
   (Forwarding button + axis was a real bug found hands-on in a nested session —
   click-drag selection and wheel scroll in foot were dead without it.)
 - **Touch layout-origin-during-grab skew** (slice-2 parity): a touch point's
-  surface origin is captured at down-time and assumed stationary; if the
-  surface moves mid-touch (interactive grab) motion coords skew. Accepted until
-  slice 5.
+  surface origin is captured at down-time and assumed stationary; for ordinary
+  (non-grab) touch routing this still skews if a surface moves mid-touch.
+  Accepted until slice 5. NOTE this does NOT affect a touch-driven move/resize
+  grab: during a grab we suppress the client touch-motion notify entirely (the
+  compositor consumes the drag) and drive the window from the raw layout
+  coords, so the moving-surface origin never fights the grab.
 - **Terminate is `Ctrl+Alt+Backspace`** (the canonical X11 kill-the-server
   chord). It deliberately shares NO key with labwc's defaults — no Escape at all
   — after the user vetoed any overlap (even Alt+Shift+Escape was too close to
@@ -60,14 +63,31 @@ it is never read by another unit.
   unconsumed; pure-core tests guard both that and the new chord.
 - **Interactive move/resize grab is a pure state machine** (`policy::
   GrabMachine`), NOT an ad-hoc cursor-mode flag. The grab is a deterministic
-  function of (button-down, client-requested-move/resize): it engages ONLY
-  while the button is held, every held motion moves/resizes (suppressing the
-  client pointer notify), and a button RELEASE always ends it. This kills the
-  user-observed bug where a titlebar drag didn't move while held but then
-  followed the cursor unclicked after release (the grab's lifetime had been
-  decoupled from the button; a late `request_move` could engage post-release).
-  The glue feeds press/release/request/motion in and executes the returned
-  action; the geometry (grab origin, resize box/edges) lives in the glue.
+  function of (which inputs are down, client-requested-move/resize): it engages
+  ONLY while an input is held, every held motion of the DRIVING input
+  moves/resizes (suppressing that input's client notify), and the driving
+  input's release ends it. This killed the original pointer bug (drag didn't
+  move while held, then followed unclicked after release — grab lifetime
+  decoupled from the button; a late `request_move` engaged post-release).
+  The grab's interaction source is generalized: **pointer button OR a single
+  touch point.** Touch is preferred when a touch point is down (CSD touch drag
+  carries no pointer button), and the grab is PINNED to its originating touch
+  id — a second simultaneous finger neither steers nor ends it; only the
+  originating point's up/cancel does. Pointer and touch are isolated (pointer
+  motion never drives a touch grab and vice versa). The glue feeds
+  press/release/down/up/cancel/request/motion in and executes the returned
+  action; the geometry + driving-input layout position live in the glue.
+- **GLUE REGRESSION (seat implicit-grab balance):** a pointer grab begins
+  because we forwarded the button PRESS to the client (before its `request_move`
+  arrived) — which starts the wlr_seat IMPLICIT pointer grab. We must forward
+  the matching button RELEASE even though the release also ends OUR grab;
+  otherwise the seat's implicit pointer grab stays open forever and silently
+  swallows every later touch-down, so after one mouse titlebar-drag no touch
+  grab ever engages again (deterministic user repro). The driving client
+  ignores the stray release. (The `GrabMachine` was proven innocent here — its
+  pure sequence tests pass clean; the bug was the missing seat notify.) Touch
+  grabs stay balanced because `process_touch_up`/`_cancel` always send the
+  matching `wlr_seat_touch_notify_up`/`_cancel`.
 - **Alt+F1 cycle focuses the back of the focus order** (least-recently
   focused), matching the former kernel; the picked window then moves to front,
   so repeated presses walk the stack. The binding key is consumed even with

@@ -143,17 +143,13 @@ void Server::Impl::new_touch(wlr_input_device* device) {
 // ---- Pointer (via wlr_cursor): move cursor + emit, route nothing ------------
 
 void Server::Impl::emit_pointer_motion(std::uint32_t time_msec) {
-    // Slice-3 spike input proof (kernel-internal; NOT a contract): forward
-    // surface-local coords over the spike node so its button hovers.
-    if (ui_spike != nullptr) {
-        if (wlr_scene_node* spike = ui_spike->node()) {
-            int nx = 0;
-            int ny = 0;
-            wlr_scene_node_coords(spike, &nx, &ny);
-            ui_spike->on_pointer_motion(cursor->x - nx, cursor->y - ny);
-        }
+    // Motion is ALWAYS observed by both the substrate (hover/leave on ui
+    // surfaces) and the bus (extensions hit-test the scene themselves). A ui-
+    // surface node is not a client surface, so a routing extension naturally
+    // finds "no client here" over a ui surface and clears stale client hover.
+    if (substrate != nullptr) {
+        substrate->route_pointer_motion(cursor->x, cursor->y, time_msec);
     }
-
     const PointerMotionEvent ev{cursor->x, cursor->y, time_msec};
     ev_pointer_motion.emit(ev);
 }
@@ -173,22 +169,23 @@ void Server::Impl::attach_cursor_handlers() {
         const auto* event = static_cast<wlr_pointer_button_event*>(data);
         const bool pressed = event->state == WL_POINTER_BUTTON_STATE_PRESSED;
 
-        // Slice-3 spike input proof (kernel-internal): forward clicks over the
-        // spike node so its button reacts.
-        if (ui_spike != nullptr) {
-            if (wlr_scene_node* spike = ui_spike->node()) {
-                if (wlr_scene_node_at(spike, cursor->x, cursor->y, nullptr, nullptr) != nullptr) {
-                    ui_spike->on_pointer_button(pressed);
-                }
-            }
+        // Consumption order: the substrate gets first refusal. If the click is
+        // over a visible ui surface it consumes it (drives the document) and we
+        // do NOT emit on the bus — no click-through to clients beneath.
+        if (substrate != nullptr &&
+            substrate->route_pointer_button(cursor->x, cursor->y, pressed, event->time_msec)) {
+            return;
         }
-
         const PointerButtonEvent ev{event->button, pressed, cursor->x, cursor->y,
                                     event->time_msec};
         ev_pointer_button.emit(ev);
     });
     cursor_axis.connect(cursor->events.axis, [this](void* data) {
         const auto* event = static_cast<wlr_pointer_axis_event*>(data);
+        if (substrate != nullptr &&
+            substrate->route_pointer_axis(cursor->x, cursor->y, event->delta, event->time_msec)) {
+            return; // consumed by a ui surface
+        }
         const PointerAxisEvent ev{event->orientation, event->delta, event->delta_discrete,
                                   event->source, event->time_msec};
         ev_pointer_axis.emit(ev);
@@ -203,6 +200,12 @@ void Server::Impl::attach_cursor_handlers() {
         double ly = 0;
         wlr_cursor_absolute_to_layout_coords(cursor, &event->touch->base, event->x, event->y,
                                              &lx, &ly);
+        // Substrate first refusal (consume-or-pass). A down over a ui surface
+        // is captured by the substrate (tap = click) and not emitted on the bus.
+        if (substrate != nullptr &&
+            substrate->route_touch_down(event->touch_id, lx, ly, event->time_msec)) {
+            return;
+        }
         const TouchDownEvent ev{event->touch_id, lx, ly, event->time_msec};
         ev_touch_down.emit(ev);
     });
@@ -212,16 +215,30 @@ void Server::Impl::attach_cursor_handlers() {
         double ly = 0;
         wlr_cursor_absolute_to_layout_coords(cursor, &event->touch->base, event->x, event->y,
                                              &lx, &ly);
+        // If this touch id was captured by a ui surface at down, the substrate
+        // keeps it (and consumes the motion); otherwise it passes to the bus.
+        if (substrate != nullptr &&
+            substrate->route_touch_motion(event->touch_id, lx, ly, event->time_msec)) {
+            return;
+        }
         const TouchMotionEvent ev{event->touch_id, lx, ly, event->time_msec};
         ev_touch_motion.emit(ev);
     });
     cursor_touch_up.connect(cursor->events.touch_up, [this](void* data) {
         const auto* event = static_cast<wlr_touch_up_event*>(data);
+        if (substrate != nullptr && substrate->route_touch_up(event->touch_id, event->time_msec)) {
+            return; // a captured (ui-surface) touch ended
+        }
         const TouchUpEvent ev{event->touch_id, event->time_msec};
         ev_touch_up.emit(ev);
     });
     cursor_touch_cancel.connect(cursor->events.touch_cancel, [this](void* data) {
         const auto* event = static_cast<wlr_touch_cancel_event*>(data);
+        // A cancel of a substrate-captured touch releases the RML button and is
+        // consumed; otherwise it passes to the bus.
+        if (substrate != nullptr && substrate->route_touch_up(event->touch_id, event->time_msec)) {
+            return;
+        }
         const TouchCancelEvent ev{event->touch_id};
         ev_touch_cancel.emit(ev);
     });

@@ -2,10 +2,11 @@
 
 #include <unbox/kernel/host.hpp>
 #include <unbox/kernel/server.hpp>
+#include <unbox/kernel/ui.hpp>
 #include <unbox/kernel/wlr.hpp>
 
 #include "listener.hpp"
-#include "ui_spike.hpp"
+#include "ui_substrate.hpp"
 
 #include <array>
 #include <cstdint>
@@ -83,9 +84,10 @@ struct Server::Impl : detail::DisableSink {
     // attach nodes via Host::scene_layer(); the kernel owns them.
     std::array<wlr_scene_tree*, 5> scene_layers{};
 
-    // Slice-3 spike (kernel-internal; not a contract). Torn down in shutdown()
-    // BEFORE scene/renderer/allocator.
-    std::unique_ptr<UiSpike> ui_spike;
+    // The ui substrate (the kernel's RMLUi subsystem behind <unbox/kernel/ui.hpp>).
+    // Kernel-owned; torn down in shutdown() BEFORE scene/renderer/allocator. Its
+    // per-extension facades (PerExtensionUi, one per HostImpl) borrow it.
+    std::unique_ptr<Substrate> substrate;
 
     std::list<std::unique_ptr<Output>> outputs;
     std::list<std::unique_ptr<Keyboard>> keyboards;
@@ -148,7 +150,7 @@ struct Server::Impl : detail::DisableSink {
     void init(); // throws std::runtime_error on any component failure
     void shutdown();
     void handle_new_output(wlr_output* output);
-    void start_ui_spike(); // slice-3 spike; never throws, may no-op
+    void start_substrate(); // builds the ui substrate; never throws, may be unavailable
     void register_hook(detail::HookBase& hook); // track for purge/disable
 
     // server.cpp — extension host
@@ -166,11 +168,32 @@ struct Server::Impl : detail::DisableSink {
     void emit_pointer_motion(std::uint32_t time_msec);
 };
 
+// ---- Per-extension ui-substrate facade --------------------------------------
+//
+// The public UiSubstrate an extension gets from Host::ui(). Injects the owning
+// extension id (for error isolation) and resolves a UiSurfaceSpec's SceneLayer
+// to the kernel's scene-layer tree, then delegates to the shared Substrate.
+// Owned by its HostImpl; borrows the kernel-owned Substrate.
+
+class PerExtensionUi final : public UiSubstrate {
+public:
+    PerExtensionUi(Server::Impl* server, ExtensionId id) : server_(server), id_(id) {}
+
+    auto create_surface(const UiSurfaceSpec& spec) -> std::unique_ptr<UiSurface> override;
+    auto available() const -> bool override;
+    auto touch_mode() const -> bool override;
+    void set_touch_mode_override(TouchModeOverride ov) override;
+
+private:
+    Server::Impl* server_;
+    ExtensionId id_;
+};
+
 // ---- Per-extension Host facade ----------------------------------------------
 
 class HostImpl final : public Host {
 public:
-    HostImpl(Server::Impl* server, ExtensionId id) : server_(server), id_(id) {}
+    HostImpl(Server::Impl* server, ExtensionId id) : server_(server), id_(id), ui_(server, id) {}
 
     auto display() -> wl_display* override { return server_->display; }
     auto scene() -> wlr_scene* override { return server_->scene; }
@@ -181,6 +204,7 @@ public:
     auto scene_layer(SceneLayer layer) -> wlr_scene_tree* override {
         return server_->scene_layers[static_cast<std::size_t>(layer)];
     }
+    auto ui() -> UiSubstrate& override { return ui_; }
 
     auto on_output_added() -> Event<const OutputEvent&>& override {
         return server_->ev_output_added;
@@ -231,6 +255,7 @@ protected:
 private:
     Server::Impl* server_;
     ExtensionId id_;
+    PerExtensionUi ui_;
 };
 
 } // namespace unbox::kernel

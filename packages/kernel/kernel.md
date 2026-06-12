@@ -1,19 +1,19 @@
 # kernel — package notes
 
-Slice-4 state: the kernel **names no concrete feature** and boots
-featureless. It owns generic plumbing (compositor/subcompositor/data-device,
-output+scene glue, cursor + xcursor-mgr + seat, the kernel-private ui spike)
-plus the **extension host + typed bus**. ALL shell policy (xdg-shell
-toplevels/popups, focus, alt-cycle, terminate, interactive move/resize,
-keybindings) was EXTRACTED — `src/toplevel.cpp` is deleted; ext-xdg-shell /
-ext-layer-shell recreate it from the contract alone.
+State: the kernel **names no concrete feature** and boots featureless. It owns
+generic plumbing (compositor/subcompositor/data-device, output+scene glue,
+cursor + xcursor-mgr + seat) plus the **extension host + typed bus** and the
+**ui substrate** (the kernel's RMLUi subsystem, slice 5). ALL shell policy was
+EXTRACTED — `src/toplevel.cpp` is deleted; ext-xdg-shell / ext-layer-shell
+recreate it from the contract alone.
 
 Public contract (the ABI): `hooks.hpp` (typed `Event<Args...>` /
 `Filter<T>` + RAII `Subscription`), `extension.hpp` (`Tier`, `Manifest`,
 `Extension`), `host.hpp` (`Host` facade: borrows + event catalogue + scene
-layers + services + typed surface→tree association), `listener.hpp` (the RAII
-`wl_listener` wrapper, now public), `surface_registry.hpp` (`SurfaceRegistration`
-RAII handle + the pure `detail::PointerAssoc` core), `server.hpp` (`install` +
+layers + services + typed surface→tree association + `ui()`), `ui.hpp` (the ui
+substrate: `UiSubstrate`, `UiSurface`, `UiSurfaceSpec` — RMLUi/GL-free typed
+facade), `listener.hpp` (the RAII `wl_listener` wrapper), `surface_registry.hpp`
+(`SurfaceRegistration` + pure `detail::PointerAssoc`), `server.hpp` (`install` +
 `activate_extensions`).
 
 Side-effect graph (who emits / who routes):
@@ -32,9 +32,22 @@ Side-effect graph (who emits / who routes):
   a broken session, not an isolated one. RUNTIME callback throws ARE
   isolated (see below).
 - Scene z-bands live in `Impl::scene_layers[]` (SceneLayer order, created
-  over `scene->tree` background→overlay so stacking is correct). The ui
-  spike now sits in the `overlay` band. Extensions attach via
-  `Host::scene_layer()`.
+  over `scene->tree` background→overlay so stacking is correct). Extensions
+  attach via `Host::scene_layer()`; ui surfaces attach to their spec's layer.
+- **Input consumption order + implicit grab (substrate first refusal).**
+  `input.cpp` offers each pointer-button / pointer-axis / touch event to
+  `substrate->route_*` BEFORE emitting on the bus. Consumption is by IMPLICIT
+  GRAB, not current hit-test: the consumer of the FIRST button press owns the
+  whole press..last-release stream (`PointerButtonGrab`, pure in `ui_core.hpp`);
+  per touch id the down's consumer owns motion/up/cancel (`touch_capture`). So a
+  release/up routes to its press's owner even if the cursor is now over a
+  different surface — this is what stops an ext-xdg-shell titlebar drag sticking
+  when released over a ui surface (slice-5 bug). A ui surface destroyed mid-grab
+  is scrubbed from `pointer_grab_surface`/`touch_capture` in `destroy_surface`;
+  a substrate-owned tail stays consumed (delivered nowhere), never leaking to
+  the bus mid-grab. Pointer MOTION is always both routed (substrate hover/leave;
+  the grabbed surface keeps moves during a substrate grab) AND emitted. The
+  substrate is driven (`tick_all`) from the output frame handler.
 
 Gotchas the headers can't express:
 
@@ -81,7 +94,52 @@ Gotchas the headers can't express:
   (The old "kernel forwards button/axis" doc comment was a verified lie; fixed.)
 - Everything runs on the single `wl_event_loop` thread.
 
-Slice-3 spike gotchas (EGL/dmabuf — read before touching `ui_spike.cpp`):
+ui substrate gotchas (`src/ui_substrate.cpp` + `src/ui_core.hpp`; the slice-3
+spike retired into this — same GL bridge mechanics, now per-surface + real):
+
+- **One shared GL bridge, per-surface targets.** ONE sibling GLES 3.2 context +
+  ONE `Rml::Initialise` + ONE font atlas (`GlBridge`) are shared by all ui
+  surfaces (RAM budget). Each `Surface` owns its own `Rml::Context`, FBO,
+  wlr_buffer(s) and `wlr_scene_buffer` node, so per-surface damage is
+  independent. Surfaces live in a `std::list` (stable addresses; `SurfaceHandle`
+  borrows a `Surface*`); destroying the handle removes the Surface (GL + node).
+- **Production submission sync is an EGL fence** (`EGL_KHR_fence_sync`), not the
+  spike's `glFinish` — `GlBridge::submit_sync()`. Plan A also uses a real
+  **2-deep dmabuf swapchain** (`wlr_swapchain`), with per-swapchain-buffer
+  cached EGLImage+texture (re-import is costly). `Server::ui_fence_sync_active()`
+  reports the fence path is live (test probe).
+- **Document load is LAZY (first render).** RmlUi requires the data model fully
+  built before it parses `{{…}}`/`data-event-*`. So `create_surface` opens the
+  `DataModelConstructor` and STASHES the RML; every `bind_*` binds on that open
+  constructor; the document loads on the first `tick_all`. Binding AFTER first
+  render is a no-op (constructor closed) — documented in ui.hpp.
+- **Data-model name must match the document.** `UiSurfaceSpec::model` (default
+  "ui") is the `data-model="…"` the RML body must carry; the RmlUi CONTEXT name
+  is a separate unique `ui_ctx_N` (RmlUi namespaces contexts globally). A
+  mismatch logs "Could not locate data model" and silently fails to bind —
+  caught once already; the fixture and default are "ui".
+- **touch-mode = per-context dp-ratio (MODERATED).** `TouchModeTracker` (pure,
+  `ui_core.hpp`) flips on last-input kind with a 700ms debounce (touch wins
+  instantly; pointer jitter inside the window is ignored). On a transition the
+  substrate applies `DpRatio::of()` to every context via
+  `SetDensityIndependentPixelRatio`, so `dp`-sized hit targets grow with NO
+  document change. The touch ratio is **1.25** (was 1.6 in slice 5): at 1.6 a
+  dp-sized document visibly zoomed and overflowed its fixed surface, clipping
+  the bottom. 1.25 grows a 44dp target to 55px without the zoom (verified: an
+  80dp button → 80px / 100px). On each transition the substrate also fires every
+  surface's `on_touch_mode_changed(bool)` callback (after applying the ratio,
+  error-isolated) so an extension can `set_size` taller / dirty bindings. The
+  sizing idiom (dp for hit targets, px for body text, or surface headroom) is
+  documented in ui.hpp so slice-6 documents don't repeat the demo's clip.
+- **Slice-5 deferred (documented in ui.hpp):** keyboard-into-ui (text/focus) and
+  list/container data bindings. Scalar (int/double/bool/string getter) + event
+  bindings ship; `set_size` does NOT realloc the GL target (logical resize
+  only) — slice-6 change-request if a taskbar needs live realloc.
+- **`Server::ui_*` probes are test instrumentation only** (frame_count,
+  orientation, fence_sync_active, touch override, element width) — replaced the
+  spike's `ui_spike_*`. Extensions drive the substrate via `Host::ui()`.
+
+Shared GL/EGL/dmabuf lessons (carried from the spike, still load-bearing):
 
 - **The sibling GLES 3.2 context shares the EGLDisplay, NOT GL objects.**
   `eglCreateContext` is called with `share_context = EGL_NO_CONTEXT` on
@@ -112,20 +170,21 @@ Slice-3 spike gotchas (EGL/dmabuf — read before touching `ui_spike.cpp`):
   are NOT public in wlroots 0.20 (`wlr_renderer_get_render_formats` is
   private; only `get_texture_formats` is exported), so we pick the format by
   hand — revisit if a future GPU rejects linear ARGB8888 as a render target.
-- **Submission sync is `glFinish()` (spike fidelity), not a fence.** Plan A
-  must ensure GL writes land before the compositor samples the shared
-  dmabuf. The real substrate should use an EGL fence
-  (`EGL_KHR_fence_sync` is advertised) instead of the full pipeline stall.
+- **Plan A submission sync is an EGL fence** (`GlBridge::submit_sync`,
+  `EGL_KHR_fence_sync`): create fence → glFlush → clientWaitSync(FOREVER) →
+  destroy. glFinish remains only as the fallback if the fence extension is
+  unusable. (The spike used glFinish unconditionally; that decision is closed.)
 - **Plan B's wlr_buffer is a custom `WLR_BUFFER_CAP_DATA_PTR` impl**
   (`ShmBuffer` wrapping a `std::vector`, via `<wlr/interfaces/wlr_buffer.h>`).
   RMLUi outputs premultiplied RGBA8 (R,G,B,A byte order); the buffer is
   FourCC 'AR24' = little-endian {B,G,R,A}, so the copy swaps R<->B. The
   alpha is already premultiplied, which wlroots expects.
-- **`UNBOX_UI_SPIKE_FORCE_SHM=1`** forces the Plan-B path even where Plan A
-  works — kept as fallback-test instrumentation; harmless in production.
-- **Headless (pixman) disables the spike**: no gles2 renderer ⇒ no
-  EGLDisplay ⇒ `start_ui_spike()` no-ops. Headless+gles2 (render node
-  present) DOES exercise Plan A — verified.
+- **`UNBOX_UI_SUBSTRATE_FORCE_SHM=1`** forces the Plan-B path even where Plan A
+  works — fallback-test instrumentation; harmless in production. (Renamed from
+  the spike's `UNBOX_UI_SPIKE_FORCE_SHM`.)
+- **Headless (pixman) ⇒ substrate unavailable**: no gles2 renderer ⇒ no
+  EGLDisplay ⇒ `available()` false, `create_surface` returns nullptr (extensions
+  degrade gracefully). Headless+gles2 (render node) exercises Plan A — verified.
 - **GL framebuffer origin is bottom-left; wlr_buffer scan-out is top-first.**
   RMLUi already maps document-y=0 to the GL framebuffer top via
   `ProjectOrtho(0,w,h,0,...)`, but reading the FBO out (glReadPixels, Plan B)
@@ -144,9 +203,9 @@ Slice-3 spike gotchas (EGL/dmabuf — read before touching `ui_spike.cpp`):
   RMLUi bump alongside the `SetOutputFramebuffer` delta. NOTE: a flip done as
   a display-only transform would have left on-screen hit-testing wrong even
   while a document-space input test passed — verify display+input together.
-- **Orientation regression guard**: the spike document carries distinctive
-  full-width solid bands at its top (`#18e0a0`) and bottom (`#e09018`) edges.
-  `UiSpike::check_orientation()` (exposed as `Server::ui_spike_orientation()`)
-  inspects the Plan-B readback and returns +1 upright / -1 flipped / 0
-  indeterminate. The `kernel` suite asserts it is never -1 (and ==1 when the
-  bridge ran). Position-aware, not just color-aware — a flip can't slip past.
+- **Orientation regression guard** (survives from the spike): the kernel
+  suite's RML test fixture carries full-width solid bands at top (`#18e0a0`) and
+  bottom (`#e09018`). `Substrate::orientation()` (exposed as
+  `Server::ui_orientation()`) inspects a shm-path surface's readback and returns
+  +1 upright / -1 flipped / 0 indeterminate. The suite asserts it is never -1
+  (and ==1 when a shm surface rendered). Position-aware, not just color-aware.

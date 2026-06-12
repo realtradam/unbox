@@ -62,6 +62,7 @@ solves), and the trigger that would reopen it.
 | **Develop nested under labwc**; real seat only via s6 service at slice 9+ | Never brick the live session; wlroots auto-nests | — |
 | **xwayland: optional extension, OFF by default** | RAM; this is an experimental DE — X11 apps opt in | — |
 | Vocabulary source: **wlroots' own names** | P8 + prefer training-baked terms; Wayland's synonym swamp (surface/view/window/toplevel, output/monitor/display) is severe | — |
+| **touch-mode causes NO visual change** (state + typed notification only; dp-ratio stays 1.0) | User found any automatic scaling jarring on hardware (slice-5 hands-on, three iterations: 1.6→1.25→none); extensions adapt affordances explicitly via `on_touch_mode_changed` | Real-seat ergonomics (slice 9+) show finger targets genuinely too small |
 
 ## 3. Architecture
 
@@ -137,9 +138,8 @@ trusted.
 | clang-format style | defer config to slice 1 | first formatting dispute |
 | Catch2 vs doctest revisit | doctest | doctest blocks something real |
 | dmabuf render-format negotiation (`wlr_renderer_get_render_formats` is private in wlroots 0.20) | hardcoded ARGB8888/LINEAR (verified on crocus) | wlroots bump slice or a GPU that rejects it |
-| ui-substrate frame sync: glFinish → EGL fence + 2-deep swapchain | per-frame glFinish (spike fidelity) | real ui substrate lands (slice 5+) |
 | window placement policy (new toplevels overlap at origin) | tinywl parity: no placement | slice 7 tiling (or earlier if it blocks testing) |
-| layer-shell `on_demand` keyboard interactivity | only `exclusive`/`none` honored | slice 5 input routing |
+| ext-keybindings (config-driven) + first unbox.toml parsing | key Filter chain (slice 4) + bindings in ext-xdg-shell | own slice after 6 (user, slice-5 planning) |
 
 ## 8. References
 

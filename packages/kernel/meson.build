@@ -55,7 +55,7 @@ kernel_lib = static_library(
   'src/kernel.cpp',
   'src/server.cpp',
   'src/input.cpp',
-  'src/ui_spike.cpp',
+  'src/ui_substrate.cpp',
   'src/rmlui_renderer_gl3.cpp',
   # Listing the generated header as a source forces codegen before any kernel
   # TU compiles and puts its build dir on this lib's include path.

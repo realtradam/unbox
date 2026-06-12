@@ -45,7 +45,7 @@ TEST_CASE("ext-xdg-shell activates on a headless server and runs clean") {
 }
 
 TEST_CASE("ext-xdg-shell is a core extension named xdg-shell") {
-    auto ext = unbox::ext_xdg_shell::make_extension();
+    auto ext = unbox::ext_xdg_shell::create();
     const auto& m = ext->manifest();
     CHECK(m.id == "xdg-shell");
     CHECK(m.tier == unbox::kernel::Tier::core);

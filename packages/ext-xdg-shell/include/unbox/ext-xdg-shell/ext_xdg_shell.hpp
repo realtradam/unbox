@@ -103,6 +103,6 @@ protected:
 // Construct the extension; install() it into the Server (ownership transfer).
 // Construction is side-effect free — all wiring happens in activate(). The
 // manifest is { id: "xdg-shell", tier: core, depends_on: {} }.
-[[nodiscard]] auto make_extension() -> std::unique_ptr<unbox::kernel::Extension>;
+[[nodiscard]] auto create() -> std::unique_ptr<unbox::kernel::Extension>;
 
 } // namespace unbox::ext_xdg_shell

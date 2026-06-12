@@ -5,12 +5,13 @@
 #include <memory>
 #include <string>
 
-// The compositor core. Slice-4 shape: the kernel names NO concrete feature and
-// boots featureless. It owns the generic plumbing (compositor, subcompositor,
-// data-device, output/scene glue, cursor + seat, the kernel-internal ui
-// spike) and the extension host + typed bus. ALL shell policy (xdg-shell
-// toplevels, focus, cycling, interactive move/resize, keybindings) lives in
-// extensions installed via install() before run().
+// The compositor core. The kernel names NO concrete feature and boots
+// featureless. It owns the generic plumbing (compositor, subcompositor,
+// data-device, output/scene glue, cursor + seat) plus the extension host +
+// typed bus + the ui substrate (the kernel's RMLUi subsystem, reached by
+// extensions via Host::ui() — see <unbox/kernel/ui.hpp>). ALL shell policy
+// (xdg-shell toplevels, focus, cycling, interactive move/resize, keybindings)
+// lives in extensions installed via install() before run().
 //
 // Calling context: single wl_event_loop thread. run() blocks; terminate()
 // is safe to call from event handlers (e.g. a keybinding extension).
@@ -25,17 +26,17 @@ public:
         // live. Dev convenience mirroring tinywl's -s. Empty = nothing.
         std::string startup_cmd{};
 
-        // Slice-3 spike surface (TEMPORARY — replaced by the real ui
-        // substrate contract in slice 4+). When true, the kernel composites
-        // a hello-world RML document as a wlr_scene_buffer node, proving the
-        // RMLUi -> wlr_scene bridge. When false (default), behaviour is
-        // exactly slice-2. If the spike cannot start (e.g. no font, no GL),
-        // it disables itself gracefully and the server runs as if false.
+        // DEPRECATED no-op (slice 5). The slice-3 ui spike retired into the
+        // real ui substrate (Host::ui()); this flag no longer does anything
+        // and is kept only so host-bin's --ui-spike plumbing keeps compiling
+        // until the orchestrator removes it (change-request in
+        // reports/kernel.md). Setting it has no effect. Remove on next
+        // host-bin edit.
         bool ui_spike = false;
     };
 
-    // Creates the display, backend, renderer, allocator, scene, xdg-shell,
-    // cursor, and seat, then starts the backend and opens the socket.
+    // Creates the display, backend, renderer, allocator, scene, cursor, seat,
+    // and the ui substrate, then starts the backend and opens the socket.
     // Throws std::runtime_error if any wlroots component fails.
     [[nodiscard]] static auto create(Options options) -> std::unique_ptr<Server>;
 
@@ -74,17 +75,28 @@ public:
     // Stops run(). Safe from within event handlers.
     void terminate();
 
-    // Frames the slice-3 spike bridge has submitted to the scene so far.
-    // A probe for tests, removed with the spike surface. Returns 0 when
-    // ui_spike is false or the spike disabled itself. Single-thread only.
-    [[nodiscard]] auto ui_spike_frame_count() const -> int;
+    // ---- ui-substrate test instrumentation (kernel suite only) ----
+    // Narrow probes into the kernel-owned ui substrate, kept so the slice-3
+    // regression value (frame-advance + upright-buffer guard) survives as
+    // substrate tests and the production-sync decision is checkable. Not for
+    // extensions (they drive the substrate via Host::ui()); single-thread only.
 
-    // Orientation self-check of the spike's submitted buffer (slice-3 probe,
-    // removed with the spike surface). The document carries distinctive top
-    // and bottom bands; returns +1 if the buffer is upright (top band in the
-    // top rows), -1 if vertically flipped, 0 if indeterminate (disabled, no
-    // frame yet, or not the CPU-readback path). Single-thread only.
-    [[nodiscard]] auto ui_spike_orientation() const -> int;
+    // Total frames the substrate has rendered+submitted across all ui surfaces.
+    [[nodiscard]] auto ui_frame_count() const -> int;
+    // Orientation of a CPU-readback (shm-path) surface's submitted buffer:
+    // +1 upright, -1 vertically flipped (the bug), 0 indeterminate (no shm
+    // surface, no frame yet, or no GL path). The kernel suite asserts != -1.
+    [[nodiscard]] auto ui_orientation() const -> int;
+    // True when the EGL fence-sync submission path is active (Plan-A dmabuf +
+    // EGL_KHR_fence_sync) — i.e. no glFinish on the hot path (notes/plan.md §7).
+    [[nodiscard]] auto ui_fence_sync_active() const -> bool;
+
+    // Pin the substrate's touch-mode for tests (none = automatic). Mirrors
+    // UiSubstrate::TouchModeOverride; lets the suite drive the state machine and
+    // its on_touch_mode_changed notification. Test instrumentation;
+    // single-thread only.
+    enum class UiTouchOverride { automatic, force_off, force_on };
+    void ui_set_touch_override(UiTouchOverride ov);
 
     // Opaque to consumers; defined in src/ (kernel-private state).
     struct Impl;
