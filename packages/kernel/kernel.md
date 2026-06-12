@@ -1,45 +1,84 @@
 # kernel — package notes
 
-Slice-2 state: a working tinywl port (+ touch, which tinywl lacks) wholly
-inside the kernel: backend/output/scene glue, xdg-shell toplevels + popups,
-click/tap-to-focus, Alt-drag-free interactive move/resize (client-requested
-only), keyboard/pointer/touch via one wlr_cursor path. Slice-2 keybindings:
-Alt+Escape = terminate, Alt+F1 = cycle. Slice 4 splits shell policy out
-into extensions.
+Slice-4 state: the kernel **names no concrete feature** and boots
+featureless. It owns generic plumbing (compositor/subcompositor/data-device,
+output+scene glue, cursor + xcursor-mgr + seat, the kernel-private ui spike)
+plus the **extension host + typed bus**. ALL shell policy (xdg-shell
+toplevels/popups, focus, alt-cycle, terminate, interactive move/resize,
+keybindings) was EXTRACTED — `src/toplevel.cpp` is deleted; ext-xdg-shell /
+ext-layer-shell recreate it from the contract alone.
 
-Slice-3 state: THE SPIKE landed on **Plan A** (RMLUi -> dmabuf-backed
-wlr_buffer -> wlr_scene_buffer), with Plan B (FBO + glReadPixels into a
-data-ptr wlr_buffer) as a verified runtime fallback. All bridge state is
-private in `src/ui_spike.{hpp,cpp}` + the adapted GLES3 renderer
-`src/rmlui_renderer_gl3.{h,cpp}`. Public surface delta: `Options::ui_spike`
-+ `Server::ui_spike_frame_count()` (both TEMPORARY, replaced by the real ui
-substrate in slice 4+). Driven from the output frame handler; renders only
-when `ui_spike != nullptr`. Host-bin does NOT yet wire the Option.
+Public contract (the ABI): `hooks.hpp` (typed `Event<Args...>` /
+`Filter<T>` + RAII `Subscription`), `extension.hpp` (`Tier`, `Manifest`,
+`Extension`), `host.hpp` (`Host` facade: borrows + event catalogue + scene
+layers + services + typed surface→tree association), `listener.hpp` (the RAII
+`wl_listener` wrapper, now public), `surface_registry.hpp` (`SurfaceRegistration`
+RAII handle + the pure `detail::PointerAssoc` core), `server.hpp` (`install` +
+`activate_extensions`).
+
+Side-effect graph (who emits / who routes):
+- The kernel EMITS typed Events for its glue (output add/remove; pointer
+  motion/button/axis/frame; touch down/motion/up/cancel/frame) and applies
+  `key_filter` to every key. It moves the cursor, runs seat-capability and
+  seat-protocol glue (request_set_cursor/selection, focus_change default
+  cursor), and forwards a key to the focused client ONLY if no filter link
+  set `handled`. It routes NOTHING else to client surfaces and makes NO
+  focus decision — extensions do that via the bus + the seat borrow.
+- `Server::install()` transfers ownership; `activate_extensions()` (called
+  by `run()`, or earlier by host-bin/tests) topo-sorts by `Manifest
+  depends_on` (ties: tier then install order), then calls each `activate`.
+  Missing dep / cycle / duplicate id = `std::runtime_error` at startup. An
+  `activate()` throw is FATAL (propagates) — a core ext that can't start is
+  a broken session, not an isolated one. RUNTIME callback throws ARE
+  isolated (see below).
+- Scene z-bands live in `Impl::scene_layers[]` (SceneLayer order, created
+  over `scene->tree` background→overlay so stacking is correct). The ui
+  spike now sits in the `overlay` band. Extensions attach via
+  `Host::scene_layer()`.
 
 Gotchas the headers can't express:
 
+- **Error isolation = deferred purge.** A hook callback that throws is
+  caught at the bus boundary; `Server::Impl` (a `detail::DisableSink`) marks
+  the owning extension disabled and `purge()`s its subscriptions from EVERY
+  registered hook (`all_hooks`). Purge during a live dispatch only
+  tombstones (`dead=true`); physical erase happens when that hook's dispatch
+  depth returns to 0 (`compact_if_idle`). So disabling an extension from
+  inside its own callback, and an ext subscribed to multiple hooks, are both
+  safe. Hooks are PINNED (Subscriptions hold a raw `HookBase*`): never move
+  an `Event`/`Filter`; hold them as stable members.
+- **Extensions are destroyed FIRST in `shutdown()`**, reverse of install
+  order, so their RAII members (Subscriptions, Listeners, scene nodes)
+  release while the wlr objects they borrow are still alive. Then the spike,
+  then clients, then server-level Listeners, then wlr objects.
 - **`wlr.hpp` blanks `static` around the wlr includes.** wlroots headers
   use C99 array-parameter syntax (`float color[static 4]`), invalid in
   C++. With `static` blanked, `static inline` helpers become `inline`
-  (ODR-merged, safe). Cost: a function-local `static` inside a header
-  inline would silently lose persistence — none exist in our include set;
-  re-audit when ADDING includes to the wrapper.
+  (ODR-merged, safe). Re-audit when ADDING includes to the wrapper.
 - **RMLUi is kernel-private.** `rmlui_dep` is deliberately absent from
-  `kernel_dep` propagation (see meson.build): extensions contribute RML
-  documents + data bindings via the ui substrate, never RMLUi API calls.
-  Do not "fix" a missing-RMLUi-header error downstream by propagating it.
-- **Shutdown order is load-bearing** (`Impl::shutdown()`): destroy clients
-  → disconnect ALL server-level Listeners → scene/cursor/allocator/
-  renderer/backend/display. A Listener outliving the wlr object owning its
+  `kernel_dep` propagation: extensions contribute RML documents + data
+  bindings via the (future) ui substrate, never RMLUi API calls. Do not
+  "fix" a missing-RMLUi-header error downstream by propagating it.
+- **Server-level Listener disconnect order is load-bearing**
+  (`Impl::shutdown()`): a Listener outliving the wlr object owning its
   signal is a use-after-free (`wl_list_remove` touches neighbor links).
-  Entity-level Listeners are exempt: their destroy events fire (and erase
-  the entities) during `wl_display_destroy_clients` / backend destroy.
+  Entity-level Listeners (Output/Keyboard/TouchDevice) are exempt: their
+  destroy events fire during `wl_display_destroy_clients` / backend destroy.
 - **A Listener handler may destroy its own Listener** (the destroy-event
-  pattern) but the erase/delete must be the handler's LAST action — see
-  listener.hpp. The slice-4 bus formalizes this.
-- **Touch points record their down-surface's layout origin** to derive
-  surface-local motion coords; a surface moving mid-touch (interactive
-  grab) skews them. Acceptable until slice 5's input routing.
+  pattern) but the erase/delete must be the handler's LAST action.
+- **No cross-unit `wlr_surface.data`.** The surface→scene-tree association is
+  a typed kernel contract (`Host::host_surface`/`scene_tree_for`, backed by
+  `Server::Impl::surface_assoc`). The map is kernel-owned but the VALUE tree is
+  an extension's; the returned tree is a borrow valid only while the hosting
+  extension's `SurfaceRegistration` lives. Re-hosting a surface supersedes the
+  old handle (token defense), so a stale handle never tears down the new
+  mapping. Private intra-unit `.data` use is still fine; cross-unit must route
+  through the contract.
+- **Pointer button & axis are NOT forwarded by the kernel** (it only moves the
+  cursor and emits `ev_pointer_button`/`ev_pointer_axis`). The pointer-routing
+  extension forwards them via `wlr_seat_pointer_notify_button/_axis`, same as
+  enter/motion/frame — not notifying during a grab is the suppression mechanism.
+  (The old "kernel forwards button/axis" doc comment was a verified lie; fixed.)
 - Everything runs on the single `wl_event_loop` thread.
 
 Slice-3 spike gotchas (EGL/dmabuf — read before touching `ui_spike.cpp`):

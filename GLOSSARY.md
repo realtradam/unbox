@@ -33,6 +33,7 @@
 | **seat** | The input-device collection owning keyboard/pointer/touch focus (`wlr_seat`). | — |
 | **scene** | The `wlr_scene` retained-mode node tree; provides damage tracking. | render graph, scene tree (write "scene") |
 | **damage** | The output region needing redraw this frame. | dirty region |
+| **scene layer** | An ordered z-band of the scene tree (`background < bottom < normal < top < overlay`; wlr-layer-shell names + `normal` for toplevels). Extensions attach nodes per band, never fighting over stacking order. | z-layer, stacking layer, shell layer |
 | **listener** | A `wl_listener`. Lives inside one unit's glue only; RAII-wrapped at every boundary. | — |
 | **workspace** | A virtual-desktop grouping of toplevels. | desktop, tag |
 | **nested session** | unbox running as a window inside the live labwc session (the dev mode). | embedded mode |

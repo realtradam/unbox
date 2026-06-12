@@ -1,3 +1,5 @@
+#include <unbox/ext-layer-shell/ext_layer_shell.hpp>
+#include <unbox/ext-xdg-shell/ext_xdg_shell.hpp>
 #include <unbox/kernel/kernel.hpp>
 #include <unbox/kernel/server.hpp>
 
@@ -31,6 +33,12 @@ auto main(int argc, char* argv[]) -> int {
 
     try {
         auto server = unbox::kernel::Server::create(std::move(options));
+
+        // The composition root: the ONLY place that names every extension.
+        // install() transfers ownership; run() activates in dependency order.
+        server->install(unbox::ext_xdg_shell::make_extension());
+        server->install(unbox::ext_layer_shell::create());
+
         std::printf("unbox 0.0.1 (wlroots %s, RmlUi %s) on WAYLAND_DISPLAY=%s\n",
                     unbox::kernel::wlroots_version().c_str(),
                     unbox::kernel::rmlui_version().c_str(), server->socket_name().c_str());

@@ -33,4 +33,6 @@ doctest_dep = dependency('doctest')
 
 # Units. Adding one? ALL FOUR steps of .unbox/rules/unit-registration.md.
 subdir('packages/kernel')
+subdir('packages/ext-xdg-shell')
+subdir('packages/ext-layer-shell')
 subdir('packages/host-bin')

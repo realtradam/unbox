@@ -1,14 +1,19 @@
 #pragma once
 
+#include <unbox/kernel/extension.hpp>
+
 #include <memory>
 #include <string>
 
-// The compositor core. Slice-2 shape: a faithful tinywl port (plus touch)
-// living wholly inside the kernel; slice 4 splits shell policy out into
-// extensions behind typed contracts.
+// The compositor core. Slice-4 shape: the kernel names NO concrete feature and
+// boots featureless. It owns the generic plumbing (compositor, subcompositor,
+// data-device, output/scene glue, cursor + seat, the kernel-internal ui
+// spike) and the extension host + typed bus. ALL shell policy (xdg-shell
+// toplevels, focus, cycling, interactive move/resize, keybindings) lives in
+// extensions installed via install() before run().
 //
 // Calling context: single wl_event_loop thread. run() blocks; terminate()
-// is safe to call from event handlers (e.g. a keybinding).
+// is safe to call from event handlers (e.g. a keybinding extension).
 
 namespace unbox::kernel {
 
@@ -41,7 +46,25 @@ public:
     // The WAYLAND_DISPLAY name clients connect with (e.g. "wayland-1").
     [[nodiscard]] auto socket_name() const -> std::string;
 
-    // Runs the event loop until terminate() (default binding: Alt+Escape).
+    // Install an extension (ownership transfer). Call after create(), before
+    // activate_extensions()/run(). Order of install() calls does NOT determine
+    // activation order — that is computed topologically from each Manifest's
+    // depends_on at activate_extensions() time. Installing two extensions with
+    // the same Manifest id throws std::runtime_error here (duplicate id).
+    void install(std::unique_ptr<Extension> extension);
+
+    // Activate every installed extension exactly once, in topological order by
+    // Manifest depends_on (ties broken by tier then install order). Throws
+    // std::runtime_error on a missing dependency, a dependency cycle, or a
+    // duplicate id; the offending ids are named in what(). An exception thrown
+    // by an extension's own activate() propagates out (activation failure is
+    // fatal — a core extension that cannot start is a broken session, not an
+    // isolated one). Idempotent: a second call is a no-op. run() calls this
+    // first if it was not called already.
+    void activate_extensions();
+
+    // Runs the event loop until terminate(). Calls activate_extensions() first
+    // if not already done.
     void run();
 
     // One event-loop turn (≤ timeout_ms); for tests and embedders.
