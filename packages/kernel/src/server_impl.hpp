@@ -4,6 +4,7 @@
 #include <unbox/kernel/wlr.hpp>
 
 #include "listener.hpp"
+#include "ui_spike.hpp"
 
 #include <cstdint>
 #include <list>
@@ -80,6 +81,12 @@ struct Server::Impl {
     wlr_seat* seat = nullptr;
     std::string socket;
 
+    // Slice-3 spike: RMLUi -> wlr_scene bridge. Null unless options.ui_spike
+    // and the bridge started; a started-but-disabled bridge is non-null but
+    // reports Plan::Disabled. Owned here; torn down in shutdown() BEFORE the
+    // scene/renderer/allocator die.
+    std::unique_ptr<UiSpike> ui_spike;
+
     // Ownership (RAII teardown); drained naturally during shutdown by the
     // destroy events wl_display_destroy_clients / backend destroy fire.
     std::list<std::unique_ptr<Output>> outputs;
@@ -135,6 +142,7 @@ struct Server::Impl {
     void init(); // throws std::runtime_error on any component failure
     void shutdown();
     void handle_new_output(wlr_output* output);
+    void start_ui_spike(); // slice-3 spike; never throws, may no-op
 
     // toplevel.cpp
     void handle_new_toplevel(wlr_xdg_toplevel* toplevel);

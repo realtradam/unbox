@@ -19,6 +19,14 @@ public:
         // WAYLAND_DISPLAY pointing at this server) once the socket is
         // live. Dev convenience mirroring tinywl's -s. Empty = nothing.
         std::string startup_cmd{};
+
+        // Slice-3 spike surface (TEMPORARY — replaced by the real ui
+        // substrate contract in slice 4+). When true, the kernel composites
+        // a hello-world RML document as a wlr_scene_buffer node, proving the
+        // RMLUi -> wlr_scene bridge. When false (default), behaviour is
+        // exactly slice-2. If the spike cannot start (e.g. no font, no GL),
+        // it disables itself gracefully and the server runs as if false.
+        bool ui_spike = false;
     };
 
     // Creates the display, backend, renderer, allocator, scene, xdg-shell,
@@ -42,6 +50,18 @@ public:
 
     // Stops run(). Safe from within event handlers.
     void terminate();
+
+    // Frames the slice-3 spike bridge has submitted to the scene so far.
+    // A probe for tests, removed with the spike surface. Returns 0 when
+    // ui_spike is false or the spike disabled itself. Single-thread only.
+    [[nodiscard]] auto ui_spike_frame_count() const -> int;
+
+    // Orientation self-check of the spike's submitted buffer (slice-3 probe,
+    // removed with the spike surface). The document carries distinctive top
+    // and bottom bands; returns +1 if the buffer is upright (top band in the
+    // top rows), -1 if vertically flipped, 0 if indeterminate (disabled, no
+    // frame yet, or not the CPU-readback path). Single-thread only.
+    [[nodiscard]] auto ui_spike_orientation() const -> int;
 
     // Opaque to consumers; defined in src/ (kernel-private state).
     struct Impl;

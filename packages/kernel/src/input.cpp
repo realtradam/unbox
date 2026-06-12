@@ -190,6 +190,20 @@ void Server::Impl::process_cursor_motion(std::uint32_t time_msec) {
         return;
     }
 
+    // Slice-3 spike input proof (NOT the slice-5 routing contract): if the
+    // cursor is over the spike node, forward surface-local coords to RmlUi so
+    // the document's button reacts to hover. Crude and private.
+    if (ui_spike != nullptr) {
+        if (wlr_scene_node* spike = ui_spike->node()) {
+            int nx = 0;
+            int ny = 0;
+            wlr_scene_node_coords(spike, &nx, &ny);
+            const double sx = cursor->x - nx;
+            const double sy = cursor->y - ny;
+            ui_spike->on_pointer_motion(sx, sy);
+        }
+    }
+
     double sx = 0;
     double sy = 0;
     wlr_surface* surface = nullptr;
@@ -221,6 +235,21 @@ void Server::Impl::attach_cursor_handlers() {
     cursor_button.connect(cursor->events.button, [this](void* data) {
         const auto* event = static_cast<wlr_pointer_button_event*>(data);
         wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+
+        // Slice-3 spike input proof: forward clicks over the spike node to
+        // RmlUi so its button reacts to press/release. Crude and private.
+        if (ui_spike != nullptr) {
+            if (wlr_scene_node* spike = ui_spike->node()) {
+                int nx = 0;
+                int ny = 0;
+                wlr_scene_node_coords(spike, &nx, &ny);
+                if (wlr_scene_node_at(spike, cursor->x, cursor->y, nullptr, nullptr) != nullptr) {
+                    ui_spike->on_pointer_button(event->state ==
+                                                WL_POINTER_BUTTON_STATE_PRESSED);
+                }
+            }
+        }
+
         if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
             reset_cursor_mode();
         } else {

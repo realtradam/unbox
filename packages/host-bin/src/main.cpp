@@ -8,7 +8,7 @@
 namespace {
 
 void print_usage(const char* argv0) {
-    std::printf("usage: %s [-s <startup command>]\n", argv0);
+    std::printf("usage: %s [-s <startup command>] [--ui-spike]\n", argv0);
 }
 
 } // namespace
@@ -19,6 +19,10 @@ auto main(int argc, char* argv[]) -> int {
         const std::string_view arg = argv[i];
         if (arg == "-s" && i + 1 < argc) {
             options.startup_cmd = argv[++i];
+        } else if (arg == "--ui-spike") {
+            // Slice-3 spike surface (temporary): composite the hello-world
+            // RML document. Removed with the real ui substrate (slice 4+).
+            options.ui_spike = true;
         } else {
             print_usage(argv[0]);
             return arg == "-h" ? 0 : 1;

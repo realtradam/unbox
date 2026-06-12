@@ -19,7 +19,19 @@ extern "C" {
 #define static
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
+// Slice-3 spike (RMLUi -> wlr_scene bridge): EGL/dmabuf, the GLES2 renderer's
+// EGL accessors, buffer (dmabuf + data-ptr access for the shm fallback),
+// swapchain, and DRM format sets. Re-audited the static-blanking gotcha for
+// these: all are plain declarations; egl.h pulls in <EGL/egl*.h> which have
+// no `static` tokens outside comments (verified). No header-inline function
+// with a function-local `static` is introduced.
+#include <wlr/render/drm_format_set.h>
+#include <wlr/render/egl.h>
+#include <wlr/render/gles2.h>
+#include <wlr/render/swapchain.h>
 #include <wlr/render/wlr_renderer.h>
+// Producer-side interface for the spike's custom data-ptr wlr_buffer (Plan B).
+#include <wlr/interfaces/wlr_buffer.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_data_device.h>
@@ -30,6 +42,7 @@ extern "C" {
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
+#include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_touch.h>
 #include <wlr/types/wlr_xcursor_manager.h>

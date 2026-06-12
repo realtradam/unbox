@@ -58,6 +58,14 @@ void Server::terminate() {
     wl_display_terminate(impl_->display);
 }
 
+auto Server::ui_spike_frame_count() const -> int {
+    return impl_->ui_spike != nullptr ? impl_->ui_spike->frame_count() : 0;
+}
+
+auto Server::ui_spike_orientation() const -> int {
+    return impl_->ui_spike != nullptr ? impl_->ui_spike->check_orientation() : 0;
+}
+
 // ---- Impl lifecycle --------------------------------------------------------
 
 void Server::Impl::init() {
@@ -112,6 +120,10 @@ void Server::Impl::init() {
         throw std::runtime_error("failed to start the wlr_backend");
     }
 
+    if (options.ui_spike) {
+        start_ui_spike();
+    }
+
     if (!options.startup_cmd.empty()) {
         if (fork() == 0) {
             // Child only: don't pollute our own environment.
@@ -123,7 +135,29 @@ void Server::Impl::init() {
     }
 }
 
+void Server::Impl::start_ui_spike() {
+    // The bridge needs the wlr renderer's EGLDisplay to build its sibling
+    // GLES 3.2 context. Only the gles2 renderer exposes one; under the
+    // pixman renderer (e.g. headless CI) there is no GL path, so the spike
+    // stays disabled — slice-2 behaviour is preserved.
+    if (!wlr_renderer_is_gles2(renderer)) {
+        wlr_log(WLR_INFO, "ui-spike: renderer is not gles2; spike disabled");
+        return;
+    }
+    wlr_egl* egl = wlr_gles2_renderer_get_egl(renderer);
+    if (egl == nullptr) {
+        wlr_log(WLR_ERROR, "ui-spike: gles2 renderer has no wlr_egl");
+        return;
+    }
+    EGLDisplay display_egl = wlr_egl_get_display(egl);
+    ui_spike = UiSpike::create(&scene->tree, display_egl, allocator, renderer);
+}
+
 void Server::Impl::shutdown() {
+    // Slice-3 spike: tear down before scene/renderer/allocator die (it owns
+    // a scene node, GL objects on a sibling context, and borrows the others).
+    ui_spike.reset();
+
     if (display != nullptr) {
         wl_display_destroy_clients(display); // fires toplevel/popup destroy events
     }
@@ -199,6 +233,12 @@ void Server::Impl::handle_new_output(wlr_output* wlr_output) {
     outputs.push_back(std::move(owned));
 
     output->frame.connect(wlr_output->events.frame, [this, output](void*) {
+        // Slice-3 spike: render the RMLUi document if dirty, before commit so
+        // its damage is picked up this frame. Cheap no-op when disabled.
+        if (ui_spike != nullptr) {
+            ui_spike->tick();
+        }
+
         wlr_scene_output* scene_output = wlr_scene_get_scene_output(scene, output->output);
         wlr_scene_output_commit(scene_output, nullptr);
 
