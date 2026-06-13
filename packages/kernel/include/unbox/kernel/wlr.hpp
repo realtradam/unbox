@@ -27,6 +27,15 @@ extern "C" {
 // protocol/wlr headers (only `namespace` collides in the current set).
 #define namespace _namespace
 #include <wlr/backend.h>
+// Session escape-hatch (kernel VT switching, Ctrl+Alt+Fn): wlr_session +
+// wlr_session_change_vt. In wlroots 0.20 the session is NOT fetched from the
+// backend (there is no wlr_backend_get_session); it is the out-param of
+// wlr_backend_autocreate, which the kernel captures at init. NULL under the
+// headless/nested backends (no libseat session) — the glue no-ops then.
+// Static-blanking re-audit: this header is plain declarations only (no
+// header-inline function with a function-local static, no `[static N]`
+// array-param), so the surrounding `#define static` is inert across it.
+#include <wlr/backend/session.h>
 #include <wlr/render/allocator.h>
 // Slice-3 spike (RMLUi -> wlr_scene bridge): EGL/dmabuf, the GLES2 renderer's
 // EGL accessors, buffer (dmabuf + data-ptr access for the shm fallback),

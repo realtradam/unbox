@@ -13,9 +13,12 @@
 // state machine, implicit-grab ownership, hit-test geometry) are doctest-ed
 // directly, no wlroots.
 #include "../src/ui_core.hpp"
+// The VT-switch escape hatch's pure core (keysym -> VT number), no wlroots.
+#include "../src/vt_core.hpp"
 
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -346,6 +349,35 @@ TEST_CASE("substrate: a click over a ui surface is CONSUMED (no click-through)")
     // leaked through during rendering/hover).
     CHECK(ext->button_hits_via_bus == 0);
     unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+// ============================================================================
+// VT-switch escape hatch — PURE CORE (no wlroots): keysym -> VT number. The
+// glue (input.cpp) calls wlr_session_change_vt on a hit and consumes; this
+// helper decides the hit. Ctrl+Alt+Fn arrives as XF86Switch_VT_1..12.
+// ============================================================================
+
+TEST_CASE("vt_for_keysym: maps the XF86Switch_VT range to 1..12") {
+    using unbox::kernel::vt_for_keysym;
+
+    // Both endpoints of the range.
+    CHECK(vt_for_keysym(XKB_KEY_XF86Switch_VT_1) == 1U);
+    CHECK(vt_for_keysym(XKB_KEY_XF86Switch_VT_12) == 12U);
+    // A representative interior value.
+    CHECK(vt_for_keysym(XKB_KEY_XF86Switch_VT_2) == 2U);
+    CHECK(vt_for_keysym(XKB_KEY_XF86Switch_VT_7) == 7U);
+
+    // Just outside the range on both sides => nullopt (no VT-switch).
+    CHECK(vt_for_keysym(XKB_KEY_XF86Switch_VT_1 - 1) == std::nullopt);
+    CHECK(vt_for_keysym(XKB_KEY_XF86Switch_VT_12 + 1) == std::nullopt);
+
+    // Plain F1..F12 (no Ctrl+Alt) resolve to ordinary keysyms, NOT the
+    // XF86Switch_VT range — they must pass through untouched.
+    CHECK(vt_for_keysym(XKB_KEY_F1) == std::nullopt);
+    CHECK(vt_for_keysym(XKB_KEY_F12) == std::nullopt);
+
+    // An unrelated keysym.
+    CHECK(vt_for_keysym(XKB_KEY_a) == std::nullopt);
 }
 
 // ============================================================================

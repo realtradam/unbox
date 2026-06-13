@@ -69,6 +69,10 @@ struct Server::Impl : detail::DisableSink {
 
     wl_display* display = nullptr;
     wlr_backend* backend = nullptr;
+    // The libseat/logind session, captured from wlr_backend_autocreate's
+    // out-param at init. NULL under headless/nested backends (no real seat) —
+    // the VT-switch escape hatch no-ops cleanly then. Owned by the backend.
+    wlr_session* session = nullptr;
     wlr_renderer* renderer = nullptr;
     wlr_allocator* allocator = nullptr;
     wlr_scene* scene = nullptr;

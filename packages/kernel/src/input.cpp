@@ -1,5 +1,7 @@
 #include "server_impl.hpp"
 
+#include "vt_core.hpp"
+
 #include <xkbcommon/xkbcommon.h>
 
 namespace unbox::kernel {
@@ -74,6 +76,23 @@ void Server::Impl::new_keyboard(wlr_input_device* device) {
             xkb_state_key_get_syms(keyboard->keyboard->xkb_state, keycode, &syms);
         const std::uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->keyboard);
         const bool pressed = event->state == WL_KEYBOARD_KEY_STATE_PRESSED;
+
+        // SESSION ESCAPE HATCH: Ctrl+Alt+Fn (XF86Switch_VT_1..12) switches the
+        // Linux VT. Handled HERE, kernel-hardwired, BEFORE the key_filter, so no
+        // extension can intercept, consume, or block the only escape from the
+        // real DRM seat (user decision: not config-driven, not rebindable). On
+        // PRESS we change the VT; we CONSUME both press and release (the matching
+        // release carries the same keysym) so the filter never runs and the key
+        // never reaches the focused client. No session (headless/nested =>
+        // session is NULL) is a clean no-op — never crash.
+        for (int i = 0; i < nsyms; ++i) {
+            if (const std::optional<unsigned> vt = vt_for_keysym(syms[i])) {
+                if (pressed && session != nullptr) {
+                    wlr_session_change_vt(session, *vt);
+                }
+                return; // consume: no filter, no client forward (press or release)
+            }
+        }
 
         // Thread each resolved keysym through the key_filter; a filter link may
         // CONSUME the key (set handled=true) — that is how extensions implement

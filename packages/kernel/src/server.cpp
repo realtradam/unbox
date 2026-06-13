@@ -145,7 +145,10 @@ void Server::Impl::init() {
     wlr_log_init(WLR_INFO, nullptr);
 
     display = require(wl_display_create(), "wl_display");
-    backend = require(wlr_backend_autocreate(wl_display_get_event_loop(display), nullptr),
+    // Capture the session out-param: on the real DRM seat it is the libseat
+    // session the VT-switch escape hatch (input.cpp) drives; NULL under
+    // headless/nested (no real seat), where VT switching no-ops cleanly.
+    backend = require(wlr_backend_autocreate(wl_display_get_event_loop(display), &session),
                       "wlr_backend");
     renderer = require(wlr_renderer_autocreate(backend), "wlr_renderer");
     wlr_renderer_init_wl_display(renderer, display);
