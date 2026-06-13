@@ -1,0 +1,66 @@
+# Maintainer: user
+#
+# Local PKGBUILD for the unbox Wayland desktop environment. Builds the CURRENT
+# WORKING TREE (the repo this PKGBUILD lives in), not a clean VCS checkout — so
+# `makepkg` packages exactly what is checked out, and reuses the already-fetched
+# meson subprojects (RmlUi/doctest/toml++) under ../subprojects with no network.
+#
+# Build + install on this machine:
+#     cd packaging && makepkg -si
+# Rebuild after changes:    makepkg -sif      Remove:    pacman -R unbox
+
+pkgname=unbox
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="Experimental Wayland desktop environment: monolithic wlroots compositor + embedded RMLUi"
+arch=('x86_64')
+url="https://github.com/anomalyco/opencode"
+license=('custom')
+# Runtime libraries (RMLUi, doctest, toml++ are static meson subprojects, so they
+# are NOT runtime deps). dbus provides dbus-run-session for the session wrapper.
+depends=('wlroots0.20' 'wayland' 'libxkbcommon' 'pixman' 'libglvnd' 'freetype2'
+         'seatd' 'dbus')
+makedepends=('meson' 'ninja' 'cmake' 'wayland-protocols' 'pkgconf')
+provides=('unbox')
+conflicts=('unbox-git')
+# No separate -debug package (buildtype=plain, no -g); keep it to one artifact.
+options=('!debug')
+source=()
+
+# NOTE: $srcdir/$startdir/$pkgdir are only set INSIDE the functions, so the build
+# dir + source root are computed there (the repo root is packaging/..).
+
+build() {
+    # Plain meson (no devtools/arch-meson dependency, so this builds on any Arch
+    # box). Source is the WORKING TREE; the build dir is private to makepkg
+    # ($srcdir/build) so the dev build/ and build-asan/ trees are untouched. The
+    # meson subprojects (RmlUi/doctest/toml++) come along in the synced tree.
+    #
+    # ALWAYS configure fresh: the toml++ default_library=static override (and any
+    # other subproject option) only applies on a subproject's FIRST configuration,
+    # so a reused/stale build dir would silently fall back to the wrapped default
+    # (shared) and reintroduce the libtomlplusplus.so runtime dependency.
+    rm -rf "$srcdir/build"
+    meson setup --prefix=/usr --libexecdir=lib --buildtype=plain \
+        -Db_pie=true "$startdir/.." "$srcdir/build"
+    meson compile -C "$srcdir/build"
+}
+
+package() {
+    # Installs /usr/bin/unbox + /usr/share/unbox/<unit>/*.rml,*.rcss (the assets
+    # the compiled-in UNBOX_ASSET_DIR_DEFAULT=/usr/share/unbox resolves at runtime).
+    meson install -C "$srcdir/build" --destdir "$pkgdir"
+
+    # The session wrapper (dbus-run-session -- unbox), mirroring start-labwc.sh.
+    install -Dm755 "$startdir/start-unbox" "$pkgdir/usr/bin/start-unbox"
+
+    # A wayland-sessions entry so a display manager (if ever used) can list unbox;
+    # harmless on a bare-TTY setup.
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/wayland-sessions/unbox.desktop" <<'EOF'
+[Desktop Entry]
+Name=unbox
+Comment=Experimental wlroots + RMLUi Wayland desktop
+Exec=start-unbox
+Type=Application
+EOF
+}

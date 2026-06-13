@@ -1,0 +1,10 @@
+#!/bin/sh
+# start-unbox — launch the unbox Wayland session (mirrors start-labwc.sh).
+#
+# Wraps unbox in `dbus-run-session` so unbox and everything its session spawns
+# (PipeWire, WirePlumber, future portals) share a single D-Bus *session* bus.
+# Without this there is no session bus on Artix/s6, which breaks portals and
+# makes PipeWire spam RTKit "ServiceUnknown" warnings.
+#
+# Usage:  from a TTY, run  start-unbox
+exec dbus-run-session -- unbox

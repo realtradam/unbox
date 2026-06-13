@@ -11,9 +11,14 @@
 
 ext_keybindings_inc = include_directories('include')
 
-# toml++ (header-only): an APPROVED dep (notes/plan.md §2), first use here as a
-# Meson wrap kept private to THIS unit (subprojects/tomlplusplus.wrap).
-tomlplusplus_dep = dependency('tomlplusplus')
+# toml++: an APPROVED dep (notes/plan.md §2), a Meson wrap kept private to THIS
+# unit (subprojects/tomlplusplus.wrap). Force default_library=static: the wrapped
+# subproject's own meson.build hardcodes default_library=shared, which would make
+# the installed `unbox` binary NEED libtomlplusplus.so.3 at runtime (only found in
+# the dev build via LD_LIBRARY_PATH; absent from a system install). Linking it
+# statically bakes it into the binary — correct for both dev and the package.
+tomlplusplus_dep = dependency('tomlplusplus',
+                              default_options: ['default_library=static'])
 
 # Glue library. Needs the kernel ABI, ext-xdg-shell's public contract (the glue
 # includes its header to consume the Service + Toplevel), ext-stage-dock's public
