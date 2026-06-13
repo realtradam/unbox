@@ -124,10 +124,12 @@ class Substrate {
 public:
     // Build the substrate on the wlr renderer's EGLDisplay. `egl_display` may
     // be EGL_NO_DISPLAY (no gles2 renderer) — then available() is false and
-    // create_surface yields nullptr. Never throws.
+    // create_surface yields nullptr. `loop` is the kernel's wl_event_loop, used
+    // (dev only, UNBOX_DEV-gated) to poll the hot-reload inotify fd without ever
+    // blocking; pass nullptr to disable watching. Never throws.
     static auto create(EGLDisplay egl_display, wlr_allocator* allocator,
-                       wlr_renderer* renderer, SubstrateDisableFn disable)
-        -> std::unique_ptr<Substrate>;
+                       wlr_renderer* renderer, wl_event_loop* loop,
+                       SubstrateDisableFn disable) -> std::unique_ptr<Substrate>;
 
     ~Substrate();
     Substrate(const Substrate&) = delete;
@@ -205,6 +207,12 @@ public:
     // Click the index-th `tag` element in the first surface's document (fires
     // its data-event-click). False if no such element. Drives a row event.
     auto click_element(const char* tag, int index) -> bool;
+    // Test seam: synchronously reload the first surface's document from its file
+    // (the same reload the dev inotify watcher drives), so tests trigger reload
+    // deterministically without racing real filesystem events. Returns true if a
+    // NEW document was installed (false if no file-backed surface / parse failed
+    // — old doc kept). Test instrumentation only.
+    auto reload_first_surface() -> bool;
 
     struct Impl;
 

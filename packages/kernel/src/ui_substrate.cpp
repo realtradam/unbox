@@ -8,6 +8,7 @@
 #include <RmlUi/Core/DataVariable.h>
 #include <RmlUi/Core/Element.h>
 #include <RmlUi/Core/ElementDocument.h>
+#include <RmlUi/Core/Factory.h>
 #include <RmlUi/Core/SystemInterface.h>
 #include <RmlUi/Core/Variant.h>
 
@@ -19,20 +20,66 @@
 #include <GLES2/gl2ext.h> // glEGLImageTargetTexture2DOES
 #include <GLES3/gl32.h>
 
+// inotify is libc (not wlroots), so it does NOT go through wlr.hpp. Integrated
+// into the kernel's wl_event_loop via wl_event_loop_add_fd so the fd is polled,
+// never blocking the loop.
+#include <sys/inotify.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <list>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// The installed asset root, resolved against for a RELATIVE UiSurfaceSpec::
+// rml_path when $UNBOX_ASSET_DIR is unset. The orchestrator adds
+// -DUNBOX_ASSET_DIR_DEFAULT="<installed data dir>" to the kernel build; until
+// then "." lets the kernel build + run from the source/working dir.
+#ifndef UNBOX_ASSET_DIR_DEFAULT
+#define UNBOX_ASSET_DIR_DEFAULT "."
+#endif
 
 namespace unbox::kernel {
 
 namespace {
 
 constexpr std::uint32_t kDrmFormatArgb8888 = 0x34325241; // 'AR24' = LE {B,G,R,A}
+
+// Resolve UiSurfaceSpec::rml_path to an ABSOLUTE filesystem path so RmlUi can
+// load it and resolve the document's relative <link>/<style>/image refs against
+// its own directory. Absolute paths are used as-is; a relative path resolves
+// against $UNBOX_ASSET_DIR (dev) else UNBOX_ASSET_DIR_DEFAULT (installed data
+// dir, "." fallback). Pure string/path math — no I/O, no throw.
+auto resolve_asset_path(const std::string& rml_path) -> std::string {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path p(rml_path);
+    if (p.is_absolute()) {
+        return p.lexically_normal().string();
+    }
+    const char* env = std::getenv("UNBOX_ASSET_DIR");
+    const fs::path root = (env != nullptr && env[0] != '\0') ? fs::path(env)
+                                                             : fs::path(UNBOX_ASSET_DIR_DEFAULT);
+    fs::path joined = (root / p).lexically_normal();
+    // Make it absolute against the cwd if the root itself was relative (e.g. the
+    // "." fallback), so RmlUi's relative-ref resolution has a stable base.
+    if (!joined.is_absolute()) {
+        joined = (fs::current_path(ec) / joined).lexically_normal();
+    }
+    return joined.string();
+}
+
+// True if the dev hot-reload watcher should run for this process. Gated so a
+// production build does zero watching (no inotify fd, no overhead).
+auto hot_reload_enabled() -> bool {
+    return std::getenv("UNBOX_DEV") != nullptr || std::getenv("UNBOX_HOT_RELOAD") != nullptr;
+}
 
 // Orientation regression guard (kept from the spike): the test fixture document
 // carries full-width solid bands at top (#18e0a0) and bottom (#e09018). The
@@ -60,11 +107,24 @@ public:
             (type == Rml::Log::LT_ERROR || type == Rml::Log::LT_ASSERT) ? WLR_ERROR
             : (type == Rml::Log::LT_WARNING ? WLR_INFO : WLR_DEBUG);
         wlr_log(imp, "[rmlui] %s", message.c_str());
+        // RmlUi's LoadDocument returns a (possibly empty) document even when the
+        // XML fails to parse — the failure is only LOGGED. So the hot-reload path
+        // counts parse errors here to decide whether a fresh load was actually
+        // good (see reload_surface): a "XML parse error" warning or any load-time
+        // ERROR during a reload means keep the previous document.
+        if (type == Rml::Log::LT_ERROR || type == Rml::Log::LT_ASSERT ||
+            (type == Rml::Log::LT_WARNING && message.find("parse error") != Rml::String::npos)) {
+            ++parse_errors_;
+        }
         return true;
     }
 
+    // Snapshot/read the parse-error counter (hot-reload validity check).
+    [[nodiscard]] auto parse_errors() const -> int { return parse_errors_; }
+
 private:
     double start_ = 0.0;
+    int parse_errors_ = 0;
 };
 
 // --- A data-ptr wlr_buffer wrapping heap memory (Plan B target) -----------
@@ -321,7 +381,8 @@ struct Surface {
 
     // Deferred document source (loaded on first tick, after binds are set).
     std::string rml_inline;
-    std::string rml_path;
+    std::string rml_path;        // the spec's path (as the extension passed it)
+    std::string resolved_path;   // absolute path actually loaded (file-backed only)
     bool doc_loaded = false;
 
     // Data bindings. Each bound scalar pairs a getter with a stable slot the
@@ -544,6 +605,47 @@ struct Substrate::Impl {
 
     std::list<Surface> surfaces; // stable addresses (handles borrow Surface*)
 
+    // ---- Dev hot-reload watcher (UNBOX_DEV-gated; see top-of-file helpers) ----
+    // ONE inotify fd integrated into the wl_event_loop. We watch DIRECTORIES (not
+    // inodes) because editors save via temp-file + rename — IN_CLOSE_WRITE /
+    // IN_MOVED_TO on the dir, matched by filename, catches that reliably. Each
+    // watched dir maps to the file basenames in it that back a surface. Reloads
+    // are coalesced and applied at the next tick_all (debounce within a frame).
+    wl_event_loop* loop = nullptr;
+    int inotify_fd = -1;
+    wl_event_source* inotify_source = nullptr;
+    // inotify watch descriptor (one per watched directory) -> directory path.
+    std::unordered_map<int, std::string> watch_dirs;
+    // directory path -> the surfaces whose document (or same-dir RCSS/assets)
+    // live there. A change to ANY file in the dir reloads them (covers the .rml
+    // AND a sibling .rcss the document <link>s, with no need to parse links).
+    std::unordered_map<std::string, std::vector<Surface*>> dir_surfaces;
+    // surfaces flagged dirty by a file event, drained (coalesced) at tick_all.
+    std::vector<Surface*> pending_reloads;
+
+    // Bring up the inotify fd + its wl_event_loop source (dev only). Idempotent;
+    // a failure leaves inotify_fd < 0 (watching simply disabled, no error).
+    void init_watcher(wl_event_loop* event_loop);
+    // Remove the event source + close the inotify fd (teardown / no surfaces).
+    void teardown_watcher();
+    // Watch the directory of `abs_file` and remember that `s` depends on it.
+    // No-op if hot-reload is disabled or the fd is unusable.
+    void watch_file_for(Surface* s, const std::string& abs_file);
+    // Stop tracking `s` across all watched dirs (on destroy / before re-watch).
+    void unwatch_surface(Surface* s);
+    // Drain the inotify fd; flag dependent surfaces for reload (coalesced).
+    void on_inotify_readable();
+    // Reload `s`'s document from its file, preserving context/model/bindings/
+    // geometry/visibility/previews; error-isolated (keeps the old doc on a bad
+    // parse). Returns true if a NEW document was installed. Caller holds nothing;
+    // this makes the GL context current itself.
+    bool reload_surface(Surface& s);
+    // Load `s`'s document for the FIRST time (file via resolved path, else
+    // inline), Show() it, and register the hot-reload watch if file-backed.
+    // Caller holds the sibling context current. Returns the loaded document or
+    // nullptr (logged, never throws).
+    Rml::ElementDocument* load_document_first(Surface& s);
+
     // Previews (slice-10 spike): stable addresses (PreviewHandle borrows a
     // PreviewState*). `next_preview_id` numbers the "unbox-preview://N" URIs.
     std::list<PreviewState> previews;
@@ -710,6 +812,208 @@ bool Substrate::Impl::init_surface_gl(Surface& s) {
     return true;
 }
 
+// ---- Document load (first) + dev hot-reload --------------------------------
+
+namespace {
+// wl_event_loop fd callback: just drains inotify (never blocks the loop).
+auto inotify_dispatch(int /*fd*/, std::uint32_t /*mask*/, void* data) -> int {
+    static_cast<Substrate::Impl*>(data)->on_inotify_readable();
+    return 0;
+}
+} // namespace
+
+void Substrate::Impl::init_watcher(wl_event_loop* event_loop) {
+    loop = event_loop;
+    if (!hot_reload_enabled() || loop == nullptr || inotify_fd >= 0) {
+        return;
+    }
+    inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (inotify_fd < 0) {
+        wlr_log(WLR_ERROR, "ui-substrate: inotify_init1 failed; hot-reload disabled");
+        return;
+    }
+    inotify_source = wl_event_loop_add_fd(loop, inotify_fd, WL_EVENT_READABLE,
+                                          inotify_dispatch, this);
+    if (inotify_source == nullptr) {
+        close(inotify_fd);
+        inotify_fd = -1;
+        wlr_log(WLR_ERROR, "ui-substrate: wl_event_loop_add_fd failed; hot-reload disabled");
+        return;
+    }
+    wlr_log(WLR_INFO, "ui-substrate: dev hot-reload ON (inotify watching asset dirs)");
+}
+
+void Substrate::Impl::teardown_watcher() {
+    if (inotify_source != nullptr) {
+        wl_event_source_remove(inotify_source);
+        inotify_source = nullptr;
+    }
+    if (inotify_fd >= 0) {
+        close(inotify_fd); // also drops all inotify watches
+        inotify_fd = -1;
+    }
+    watch_dirs.clear();
+    dir_surfaces.clear();
+    pending_reloads.clear();
+}
+
+Rml::ElementDocument* Substrate::Impl::load_document_first(Surface& s) {
+    Rml::ElementDocument* doc = nullptr;
+    if (!s.rml_path.empty()) {
+        s.resolved_path = resolve_asset_path(s.rml_path);
+        doc = s.context->LoadDocument(s.resolved_path);
+        if (doc == nullptr) {
+            wlr_log(WLR_ERROR, "ui-substrate: failed to load document '%s' (resolved '%s')",
+                    s.rml_path.c_str(), s.resolved_path.c_str());
+            return nullptr;
+        }
+        // Dev-only: watch the document's directory for editor saves.
+        if (hot_reload_enabled()) {
+            watch_file_for(&s, s.resolved_path);
+        }
+    } else {
+        doc = s.context->LoadDocumentFromMemory(s.rml_inline);
+        if (doc == nullptr) {
+            wlr_log(WLR_ERROR, "ui-substrate: failed to load inline document");
+            return nullptr;
+        }
+    }
+    doc->Show();
+    return doc;
+}
+
+void Substrate::Impl::watch_file_for(Surface* s, const std::string& abs_file) {
+    if (inotify_fd < 0) {
+        return;
+    }
+    std::error_code ec;
+    const std::string dir = std::filesystem::path(abs_file).parent_path().string();
+    if (dir.empty()) {
+        return;
+    }
+    auto& deps = dir_surfaces[dir];
+    if (std::find(deps.begin(), deps.end(), s) == deps.end()) {
+        deps.push_back(s);
+    }
+    // Add the dir watch once (inotify_add_watch on the same path returns the
+    // SAME wd, so this is idempotent — re-arming after a watched file is
+    // replaced is automatic since we watch the directory, not the inode).
+    const int wd = inotify_add_watch(inotify_fd, dir.c_str(),
+                                     IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
+    if (wd >= 0) {
+        watch_dirs[wd] = dir;
+    }
+}
+
+void Substrate::Impl::unwatch_surface(Surface* s) {
+    for (auto it = dir_surfaces.begin(); it != dir_surfaces.end();) {
+        auto& deps = it->second;
+        deps.erase(std::remove(deps.begin(), deps.end(), s), deps.end());
+        if (deps.empty()) {
+            it = dir_surfaces.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    pending_reloads.erase(std::remove(pending_reloads.begin(), pending_reloads.end(), s),
+                          pending_reloads.end());
+}
+
+void Substrate::Impl::on_inotify_readable() {
+    // Drain ALL queued inotify events (the fd is non-blocking; one readable
+    // notification may carry many). Flag every surface in a changed directory
+    // for reload — coalesced into pending_reloads (dedup) and applied once at
+    // the next tick_all, so a temp+rename burst causes a single reload.
+    alignas(struct inotify_event) char buf[4096];
+    for (;;) {
+        const ssize_t n = read(inotify_fd, buf, sizeof(buf));
+        if (n <= 0) {
+            break; // EAGAIN (drained) or closed
+        }
+        std::size_t off = 0;
+        while (off + sizeof(struct inotify_event) <= static_cast<std::size_t>(n)) {
+            auto* ev = reinterpret_cast<struct inotify_event*>(buf + off);
+            auto wd_it = watch_dirs.find(ev->wd);
+            if (wd_it != watch_dirs.end()) {
+                auto deps_it = dir_surfaces.find(wd_it->second);
+                if (deps_it != dir_surfaces.end()) {
+                    for (Surface* s : deps_it->second) {
+                        if (std::find(pending_reloads.begin(), pending_reloads.end(), s) ==
+                            pending_reloads.end()) {
+                            pending_reloads.push_back(s);
+                        }
+                    }
+                }
+            }
+            off += sizeof(struct inotify_event) + ev->len;
+        }
+    }
+}
+
+bool Substrate::Impl::reload_surface(Surface& s) {
+    // Only file-backed, already-loaded surfaces reload. The data model + the
+    // extension's registered bind_*/bind_list*/bind_event getters are CONTEXT-
+    // and substrate-owned, so they survive — we never touch s.ctor/s.*_bindings.
+    if (s.context == nullptr || s.resolved_path.empty() || !s.doc_loaded) {
+        return false;
+    }
+    const bool cur = gl.make_current();
+    bool installed = false;
+    try {
+        // RCSS edits only re-parse if the stylesheet cache is dropped first.
+        // Load the NEW document BEFORE unloading the old one, so a broken file
+        // leaves the previous good document rendering (error isolation). RmlUi
+        // returns a (possibly empty) document even on a parse failure — it only
+        // LOGS the error — so we bracket the load with the SystemInterface's
+        // parse-error counter and treat any increase as a failed reload.
+        Rml::Factory::ClearStyleSheetCache();
+        const int errors_before = gl.system ? gl.system->parse_errors() : 0;
+        Rml::ElementDocument* fresh = s.context->LoadDocument(s.resolved_path);
+        const bool parse_failed = gl.system && gl.system->parse_errors() != errors_before;
+        if (fresh != nullptr && parse_failed) {
+            // The "fresh" document is broken (empty/partial); discard it and keep
+            // the previous good one rendering.
+            s.context->UnloadDocument(fresh);
+            fresh = nullptr;
+        }
+        if (fresh == nullptr) {
+            wlr_log(WLR_ERROR, "ui-substrate: hot-reload parse failed for '%s'; keeping previous",
+                    s.resolved_path.c_str());
+        } else {
+            if (s.document != nullptr) {
+                s.context->UnloadDocument(s.document);
+            }
+            s.document = fresh;
+            // Re-apply geometry/visibility (a reload must not move/resize/hide).
+            // The context was already laid out to s.width/s.height; visibility is
+            // the surface's current state, not the document default.
+            if (s.is_visible) {
+                s.document->Show();
+            } else {
+                s.document->Hide();
+            }
+            // The fresh document re-binds to the still-present data model; force
+            // every bound variable to re-read on the next frame.
+            if (s.model) {
+                s.model.DirtyAllVariables();
+            }
+            installed = true;
+        }
+    } catch (...) {
+        // A throwing reload is contained to the owning extension exactly like a
+        // throwing getter/hook — never the session.
+        wlr_log(WLR_ERROR, "ui-substrate: hot-reload threw for '%s'; keeping previous",
+                s.resolved_path.c_str());
+        if (disable) {
+            disable(s.who);
+        }
+    }
+    if (cur) {
+        gl.restore_current();
+    }
+    return installed;
+}
+
 void Substrate::Impl::render_surface(Surface& s) {
     if (s.context == nullptr) {
         return;
@@ -720,16 +1024,10 @@ void Substrate::Impl::render_surface(Surface& s) {
         s.doc_loaded = true;
         s.model = s.ctor.GetModelHandle();
         s.ctor = Rml::DataModelConstructor{}; // close the constructor
-        if (!s.rml_path.empty()) {
-            s.document = s.context->LoadDocument(s.rml_path);
-        } else {
-            s.document = s.context->LoadDocumentFromMemory(s.rml_inline);
-        }
+        s.document = load_document_first(s);
         if (s.document == nullptr) {
-            wlr_log(WLR_ERROR, "ui-substrate: failed to load document");
-            return;
+            return; // logged inside; nothing to render this frame
         }
-        s.document->Show();
     }
     refresh_bindings(s);
     if (s.model) {
@@ -894,6 +1192,10 @@ bool Substrate::Impl::resize_surface_gl(Surface& s, int w, int h) {
 }
 
 void Substrate::Impl::destroy_surface(Surface* s) {
+    // Drop the hot-reload watch tracking for this surface FIRST (so a queued
+    // file event can never reload a dying surface). The inotify dir watch itself
+    // is left armed (cheap) and is reaped at teardown_watcher.
+    unwatch_surface(s);
     const bool cur = gl.make_current();
     if (s->scene_buffer != nullptr) {
         wlr_scene_node_destroy(&s->scene_buffer->node);
@@ -1155,12 +1457,14 @@ void Substrate::Impl::destroy_preview(PreviewState* p) {
 // ---- Substrate (private surface) --------------------------------------------
 
 auto Substrate::create(EGLDisplay egl_display, wlr_allocator* allocator, wlr_renderer* renderer,
-                       SubstrateDisableFn disable) -> std::unique_ptr<Substrate> {
+                       wl_event_loop* loop, SubstrateDisableFn disable)
+    -> std::unique_ptr<Substrate> {
     auto impl = std::make_unique<Impl>();
     impl->allocator = allocator;
     impl->renderer = renderer;
     impl->disable = std::move(disable);
     impl->gl.init(egl_display); // sets gl.ok; failure => unavailable substrate
+    impl->init_watcher(loop);   // dev-only (UNBOX_DEV); no-op otherwise
     return std::unique_ptr<Substrate>(new Substrate(std::move(impl)));
 }
 
@@ -1178,6 +1482,7 @@ Substrate::~Substrate() {
     while (!impl_->surfaces.empty()) {
         impl_->destroy_surface(&impl_->surfaces.front());
     }
+    impl_->teardown_watcher(); // remove the wl_event_loop source + close the fd
     impl_->gl.teardown();
 }
 
@@ -1288,6 +1593,26 @@ auto Substrate::preview_import_is_dmabuf() const -> bool { return impl_->last_pr
 void Substrate::tick_all() {
     if (!impl_->available() || impl_->surfaces.empty()) {
         return;
+    }
+    // Apply any hot-reload requests coalesced from inotify since the last tick
+    // (dev only). reload_surface manages the GL context itself + is error-
+    // isolated, so a broken file here can't stop the frame.
+    if (!impl_->pending_reloads.empty()) {
+        std::vector<Surface*> due;
+        due.swap(impl_->pending_reloads);
+        for (Surface* s : due) {
+            // Still alive? (unwatch_surface scrubs destroyed ones, but be safe.)
+            bool live = false;
+            for (Surface& e : impl_->surfaces) {
+                if (&e == s) {
+                    live = true;
+                    break;
+                }
+            }
+            if (live) {
+                impl_->reload_surface(*s);
+            }
+        }
     }
     if (!impl_->gl.make_current()) {
         return;
@@ -1526,6 +1851,13 @@ auto Substrate::click_element(const char* tag, int index) -> bool {
         }
         elements[static_cast<std::size_t>(index)]->Click();
         return true;
+    }
+    return false;
+}
+
+auto Substrate::reload_first_surface() -> bool {
+    for (Surface& s : impl_->surfaces) {
+        return impl_->reload_surface(s);
     }
     return false;
 }

@@ -129,6 +129,14 @@ public:
     // Test instrumentation; single-thread only.
     auto ui_click_element(const char* tag, int index) -> bool;
 
+    // Synchronously reload the first ui surface's document from its rml_path file
+    // — the same reload the dev hot-reload (UNBOX_DEV) inotify watcher drives,
+    // exposed so tests trigger it deterministically without racing real
+    // filesystem events. Returns true if a NEW document was installed (false if
+    // no file-backed surface or the new file failed to parse — the old document
+    // is kept). Test instrumentation; single-thread only.
+    auto ui_reload_surface() -> bool;
+
     // Pin the substrate's touch-mode for tests (none = automatic). Mirrors
     // UiSubstrate::TouchModeOverride; lets the suite drive the state machine and
     // its on_touch_mode_changed notification. Test instrumentation;

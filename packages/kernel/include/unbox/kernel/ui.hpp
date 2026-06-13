@@ -177,6 +177,30 @@ protected:
 // `rml_inline` OR an asset path in `rml_path` (path wins if both set). Geometry
 // is layout-space; `layer` defaults to overlay (above toplevels). `visible`
 // is the initial visibility.
+//
+// rml_path RESOLUTION. An ABSOLUTE path is loaded as-is. A RELATIVE path
+// resolves against the asset root: `$UNBOX_ASSET_DIR` if set, else the
+// compile-time install data dir (`UNBOX_ASSET_DIR_DEFAULT`, falling back to the
+// process working dir). So a unit passes e.g. `rml_path =
+// "ext-stage-dock/dock.rml"` and the dev launch sets `UNBOX_ASSET_DIR=<repo>/
+// assets`. The document's own `<link>`/`<style>`/image srcs resolve RELATIVE TO
+// THE DOCUMENT'S DIRECTORY, so a dock.rml that links a dock.rcss in the same dir
+// just works. A missing/unreadable/malformed file yields a null surface from
+// create_surface (graceful degrade, never throws) — same contract as no-GL.
+//
+// DEV HOT-RELOAD (zero overhead in production). When the process env sets
+// `UNBOX_DEV` (or `UNBOX_HOT_RELOAD`), the substrate watches the directory of a
+// file-backed surface and, on an editor save (handled via dir-watch so the usual
+// temp-file+rename works), RELOADS the document live — no recompile, no restart.
+// A reload PRESERVES the surface's RmlUi context, its data model, and every
+// bind_*/bind_list*/bind_event getter/callback you registered (you set them once
+// "before the first frame"; do NOT re-register on reload — the substrate keeps
+// them and re-evaluates {{…}}/data-for/data-event against the new document), and
+// PRESERVES the surface's geometry/visibility and any registered preview
+// textures. RCSS edits re-parse (the stylesheet cache is dropped). A malformed
+// save is ERROR-ISOLATED: the previous good document keeps rendering, one warning
+// is logged, and the next good save recovers — a bad file never crashes or
+// disables the session. Inline (`rml_inline`) surfaces are not watched.
 struct UiSurfaceSpec {
     std::string rml_inline{};                 // inline RML document text
     std::string rml_path{};                   // path to an .rml asset (assets/<unit>/…)

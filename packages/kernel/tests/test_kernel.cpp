@@ -17,6 +17,8 @@
 #include "../src/vt_core.hpp"
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -1265,6 +1267,314 @@ TEST_CASE("substrate: set_size resizes the render target (grow renders, shrink r
     CHECK(server->ui_resize_realloc_count() == after_shrink);
     pump(*server, 5);
     CHECK(is_painted_blue(server->ui_pixel(30, 30)));
+}
+
+// ============================================================================
+// slice-10 / rml_path + dev HOT-RELOAD. A ui surface loads its document from a
+// FILE (UiSurfaceSpec::rml_path), and a dev watcher reloads it live on a save —
+// preserving the RmlUi context, data model, the extension's registered bindings,
+// and the surface geometry/visibility. The reload is exercised deterministically
+// via the Server::ui_reload_surface() test seam (no inotify race). Headless+
+// gles2, position-aware ui_pixel readback like the alpha/clip/resize tests.
+// ============================================================================
+
+namespace {
+
+// Write `contents` to `path` (truncating). Returns false on failure.
+auto write_file(const std::filesystem::path& path, const std::string& contents) -> bool {
+    std::ofstream f(path, std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    f << contents;
+    return static_cast<bool>(f);
+}
+
+// A full-bleed body of one color. `color` is an RCSS hex like "#2080e0".
+auto full_body_rml(const std::string& color) -> std::string {
+    return "<rml><head><style>"
+           "body { margin: 0px; }"
+           "#fill { display: block; position: absolute; left: 0px; top: 0px;"
+           " width: 4000px; height: 4000px; background-color: " +
+           color + "; }"
+           "</style></head><body data-model=\"ui\"><div id=\"fill\"></div></body></rml>";
+}
+
+// An extension that loads its surface from a file path (no inline RML).
+class PathSurfaceExtension : public unbox::kernel::Extension {
+public:
+    explicit PathSurfaceExtension(std::string path) : path_(std::move(path)) {}
+    auto manifest() const -> const Manifest& override { return manifest_; }
+    void activate(Host& host) override {
+        UiSurfaceSpec spec;
+        spec.rml_path = path_; // absolute path => loaded as-is
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 80;
+        spec.height = 80;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    std::string path_;
+    Manifest manifest_{"path-surface-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+// True if px (RRGGBBAA) is ~green #20c040, opaque.
+auto is_green(unsigned int px) -> bool {
+    const int r = static_cast<int>((px >> 24) & 0xff);
+    const int g = static_cast<int>((px >> 16) & 0xff);
+    const int b = static_cast<int>((px >> 8) & 0xff);
+    return (px & 0xffu) == 0xffu && g > 140 && g > r && g > b && r < 90;
+}
+// True if px (RRGGBBAA) is ~red #d03020, opaque.
+auto is_red(unsigned int px) -> bool {
+    const int r = static_cast<int>((px >> 24) & 0xff);
+    const int g = static_cast<int>((px >> 16) & 0xff);
+    const int b = static_cast<int>((px >> 8) & 0xff);
+    return (px & 0xffu) == 0xffu && r > 150 && r > g && r > b && g < 90;
+}
+
+// A unique temp path under the system temp dir for this test run.
+auto temp_rml(const char* tag) -> std::filesystem::path {
+    auto dir = std::filesystem::temp_directory_path() / "unbox-kernel-tests";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir / (std::string("hot-reload-") + tag + "-" +
+                  std::to_string(::getpid()) + ".rml");
+}
+
+} // namespace
+
+TEST_CASE("substrate: load a surface document from rml_path (file), render its color") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    const auto path = temp_rml("load");
+    REQUIRE(write_file(path, full_body_rml("#20c040"))); // green
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PathSurfaceExtension(path.string());
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 30); // lazy first-load happens on first render
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return; // no GL path: skip
+    }
+
+    // The file's full-body green is composited (proves rml_path loaded a file).
+    CHECK(is_green(server->ui_pixel(40, 40)));
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+TEST_CASE("substrate: rml_path resolves a RELATIVE path against UNBOX_ASSET_DIR") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    // Lay out <assetroot>/unit-x/doc.rml and load it via the RELATIVE path
+    // "unit-x/doc.rml" with UNBOX_ASSET_DIR pointing at <assetroot>.
+    const auto root = std::filesystem::temp_directory_path() / "unbox-kernel-tests" /
+                      (std::string("assetroot-") + std::to_string(::getpid()));
+    const auto unit_dir = root / "unit-x";
+    std::error_code ec;
+    std::filesystem::create_directories(unit_dir, ec);
+    REQUIRE(write_file(unit_dir / "doc.rml", full_body_rml("#20c040"))); // green
+    setenv("UNBOX_ASSET_DIR", root.string().c_str(), 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PathSurfaceExtension("unit-x/doc.rml"); // RELATIVE
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 30);
+
+    if (ext->has_surface() && server->ui_frame_count() > 0) {
+        CHECK(is_green(server->ui_pixel(40, 40))); // resolved + loaded
+    }
+
+    unsetenv("UNBOX_ASSET_DIR");
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("substrate: hot-reload re-parses RCSS (file change -> new color)") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    const auto path = temp_rml("recolor");
+    REQUIRE(write_file(path, full_body_rml("#20c040"))); // green first
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PathSurfaceExtension(path.string());
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 30);
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return;
+    }
+    CHECK(is_green(server->ui_pixel(40, 40)));
+
+    // Rewrite the file with a DIFFERENT body color, then trigger reload via the
+    // deterministic test seam. The new RCSS color must composite — proof that
+    // reload re-parses RCSS (ClearStyleSheetCache) and re-loads the document.
+    REQUIRE(write_file(path, full_body_rml("#d03020"))); // red now
+    CHECK(server->ui_reload_surface());                  // a NEW doc installed
+    pump(*server, 10);
+    CHECK(is_red(server->ui_pixel(40, 40)));             // failing-then-passing
+    CHECK_FALSE(is_green(server->ui_pixel(40, 40)));
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+namespace {
+// A file-backed list document + an extension that binds a runtime-sized list.
+const char* kListReloadRml = R"RML(<rml>
+<head><style>
+body { margin: 0px; background-color: #101010; }
+p { display: block; }
+</style></head>
+<body data-model="ui">
+<p data-for="row : slots"><span>{{ row.title }}</span></p>
+</body>
+</rml>)RML";
+
+class ListPathExtension : public unbox::kernel::Extension {
+public:
+    explicit ListPathExtension(std::string path) : path_(std::move(path)) {}
+    auto manifest() const -> const Manifest& override { return manifest_; }
+    void activate(Host& host) override {
+        titles = {"a", "b", "c"};
+        UiSurfaceSpec spec;
+        spec.rml_path = path_;
+        spec.width = 200;
+        spec.height = 200;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+        if (surface_ != nullptr) {
+            surface_->bind_list("slots", [this] { return titles.size(); });
+            surface_->bind_list_string("slots", "title",
+                                       [this](std::size_t r) { return titles.at(r); });
+        }
+    }
+    void set_rows(std::vector<std::string> rows) {
+        titles = std::move(rows);
+        if (surface_ != nullptr) {
+            surface_->dirty("slots");
+        }
+    }
+    std::vector<std::string> titles;
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    std::string path_;
+    Manifest manifest_{"list-path-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+} // namespace
+
+TEST_CASE("substrate: hot-reload preserves a list data binding") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    const auto path = temp_rml("list");
+    REQUIRE(write_file(path, kListReloadRml));
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new ListPathExtension(path.string());
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 30);
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return;
+    }
+    // 3 bound rows render 3 <span> rows.
+    CHECK(server->ui_element_count("span") == 3);
+
+    // Reload the SAME file (no re-registration by the extension). The bindings
+    // must survive: the list still renders its rows after reload.
+    REQUIRE(server->ui_reload_surface());
+    pump(*server, 5);
+    CHECK(server->ui_element_count("span") == 3); // bindings preserved across reload
+
+    // And mutating the vector + dirty still works AFTER reload (the getter the
+    // extension registered once, before first frame, is still live).
+    ext->set_rows({"one", "two", "three", "four", "five"});
+    pump(*server, 5);
+    CHECK(server->ui_element_count("span") == 5);
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+TEST_CASE("substrate: a malformed hot-reload is isolated; old doc kept; recovers") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    const auto path = temp_rml("malformed");
+    REQUIRE(write_file(path, full_body_rml("#20c040"))); // good green first
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PathSurfaceExtension(path.string());
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 30);
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return;
+    }
+    CHECK(is_green(server->ui_pixel(40, 40)));
+
+    // Save a BROKEN file (not a valid RML document) and reload: no throw escapes,
+    // the previous GOOD document keeps rendering, and the session is alive.
+    REQUIRE(write_file(path, std::string("this is <not !! valid &&& rml at all")));
+    CHECK_FALSE(server->ui_reload_surface()); // no new doc installed
+    pump(*server, 10);
+    CHECK(is_green(server->ui_pixel(40, 40))); // OLD good doc still rendering
+    CHECK(server->ui_frame_count() > 0);       // session alive, still ticking
+
+    // A subsequent GOOD save recovers (now red).
+    REQUIRE(write_file(path, full_body_rml("#d03020")));
+    CHECK(server->ui_reload_surface());
+    pump(*server, 10);
+    CHECK(is_red(server->ui_pixel(40, 40)));
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
 }
 
 // ============================================================================

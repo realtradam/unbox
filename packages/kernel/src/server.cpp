@@ -105,6 +105,10 @@ auto Server::ui_click_element(const char* tag, int index) -> bool {
     return impl_->substrate != nullptr && impl_->substrate->click_element(tag, index);
 }
 
+auto Server::ui_reload_surface() -> bool {
+    return impl_->substrate != nullptr && impl_->substrate->reload_first_surface();
+}
+
 void Server::ui_set_touch_override(UiTouchOverride ov) {
     if (impl_->substrate == nullptr) {
         return;
@@ -371,8 +375,11 @@ void Server::Impl::start_substrate() {
         wlr_log(WLR_INFO, "ui-substrate: renderer is not gles2; substrate unavailable");
     }
     // A data-event/getter throw disables the owning extension via the same
-    // isolation path the bus uses (Server::Impl is the DisableSink).
+    // isolation path the bus uses (Server::Impl is the DisableSink). The
+    // wl_event_loop lets the substrate poll the dev hot-reload inotify fd
+    // (UNBOX_DEV-gated) without ever blocking the loop.
     substrate = Substrate::create(display_egl, allocator, renderer,
+                                  wl_display_get_event_loop(display),
                                   [this](ExtensionId who) { disable(who); });
 }
 
