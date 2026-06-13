@@ -275,10 +275,45 @@ TEST_CASE("ext-stage-dock c2: minimize hides the focused window + adds a slot; r
     probe->restore(0);
     CHECK(probe->slot_count() == 0);          // slot dropped (Preview, if any, freed)
     CHECK(tree->node.enabled == true);        // show() re-enabled the scene node
+    // INVARIANT: restore must re-establish focused_ on the shown window, else the
+    // next minimize (guarded on focused_ != nullptr) is a no-op (the real-seat
+    // bug). With ONE window, minimize had set focused_=nullptr, so this is the
+    // re-establishment the restore path is responsible for.
+    CHECK(probe->has_focused() == true);
 
     // A guarded out-of-range restore is a no-op.
     probe->restore(5);
     CHECK(probe->slot_count() == 0);
+
+    for (int i = 0; i < 10; ++i) {
+        pump(*server, c.display);
+    }
+
+    // --- RE-MINIMIZE the same window after the dock fully emptied (1->0->1) ----
+    // Real-seat regression: with ONE window, minimize sets focused_=nullptr (no
+    // OTHER window to focus), and restore must RE-ESTABLISH focused_ to the shown
+    // window. hide() never moves seat keyboard focus, so the restoring focus() is
+    // a no-op at the seat and on_toplevel_focused does NOT re-fire — so the glue
+    // must set focused_ itself on restore. If it does not, this second
+    // minimize_focused() (guarded on focused_ != nullptr) is a no-op and the slot
+    // count stays 0. The fix makes the SAME window minimizable again with NO new
+    // window mapped. This is the SAME tl (never unmapped); its borrow is still
+    // live (observer still holds it).
+    CHECK(observer->mapped() == tl);          // still the only mapped window
+    CHECK(tree->node.enabled == true);        // restored + visible before re-minimize
+    CHECK(probe->has_focused() == true);      // dock still tracks a focused window
+    probe->minimize_focused();
+    CHECK(probe->slot_count() == 1);          // re-minimized into the dock (the bug fix)
+    CHECK(tree->node.enabled == false);       // hide() disabled it again
+    CHECK(observer->mapped() == tl);          // still NOT unmapped
+
+    for (int i = 0; i < 10; ++i) {
+        pump(*server, c.display);
+    }
+    // Restore once more so we tear down from a clean (empty, shown) state.
+    probe->restore(0);
+    CHECK(probe->slot_count() == 0);
+    CHECK(tree->node.enabled == true);
 
     for (int i = 0; i < 10; ++i) {
         pump(*server, c.display);

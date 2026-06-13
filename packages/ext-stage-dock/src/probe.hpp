@@ -41,6 +41,12 @@ public:
 
     // The current number of dock slots (minimized windows).
     [[nodiscard]] virtual auto slot_count() const -> std::size_t = 0;
+
+    // Whether the dock currently has a focused window (focused_ != nullptr) — the
+    // exact guard do_minimize_focused()/the Super+M filter check before acting.
+    // After a restore the dock MUST report a focused window (restore re-focuses
+    // the shown window), or the next minimize would be a no-op. Glue-test only.
+    [[nodiscard]] virtual auto has_focused() const -> bool = 0;
 };
 
 struct ExtensionWithProbe {

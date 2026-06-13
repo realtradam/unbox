@@ -86,6 +86,20 @@ struct DockMetrics {
     return 2 * m.pad + count * m.slot_height + (count - 1) * m.gap;
 }
 
+// The POSITIVE surface height that hugs `count` cards: content_height(count)
+// clamped to a strictly-positive minimum. The ui substrate REJECTS a surface
+// with non-positive geometry (create_surface/set_size return nullptr + log an
+// error), so the empty dock (count 0 -> content_height 0) must still be created
+// / resized at a positive size and merely hidden (set_visible(false)), never at
+// height 0. Returns max(content_height(count), 1): >= 1 for every count >= 0,
+// equal to content_height once there is at least one card. (Width never hits 0
+// in practice — dock_width is a fixed positive constant — but callers should
+// likewise guard it; this helper covers the height, which is the count-driven
+// dimension.)
+[[nodiscard]] inline auto surface_height(const DockMetrics& m, int count) -> int {
+    return std::max(1, content_height(m, count));
+}
+
 // The on-screen rect of slot `i` (0-based) within the dock content, given the
 // current vertical `scroll` offset (px scrolled DOWN; 0 = top). The slot's
 // content-space top is pad + i*(slot_height+gap); subtracting `scroll` yields

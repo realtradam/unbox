@@ -187,6 +187,56 @@ TEST_CASE("content_height: 0/1/many slots") {
     CHECK(lay::content_height(m, 3) == 2 * 20 + 3 * 100 + 2 * 10); // 360
 }
 
+// The glue (src/extension.cpp) sizes the dock SURFACE rect to HUG the card stack
+// via content_height(card-stack metrics, slot count) instead of the full output
+// height — so the transparent strip captures input only over the cards (brief
+// §3: the substrate consumes input over the whole rect regardless of visual
+// transparency). These are the exact px values the surface height takes, with
+// the card-stack metrics that mirror the kDockRml RCSS (kCardHeight=124 outer
+// card height, kCardGap=8 inter-card margin, kStripPad=8 body padding). Keep in
+// lockstep with src/extension.cpp's kCard*/kStripPad constants + dock_metrics().
+TEST_CASE("dock surface height hugs the card stack (content_height with RCSS card metrics)") {
+    // Mirror src/extension.cpp: kCardHeight=124, kCardGap=8, kStripPad=8.
+    lay::DockMetrics card{.output_w = 1920, .output_h = 1080, .dock_width = 240,
+                          .slot_height = 124, .gap = 8, .pad = 8};
+    // Empty dock -> 0 content (but the SURFACE is clamped positive, below).
+    CHECK(lay::content_height(card, 0) == 0);
+    // One card -> 2*pad + card (no trailing gap).
+    CHECK(lay::content_height(card, 1) == 2 * 8 + 124);                   // 140
+    // Two cards -> +gap between them.
+    CHECK(lay::content_height(card, 2) == 2 * 8 + 2 * 124 + 1 * 8);       // 272
+    // Many cards grow linearly and stay FAR under the full output height, so the
+    // surface never spans the whole left edge (the hug-the-cards property).
+    CHECK(lay::content_height(card, 4) == 2 * 8 + 4 * 124 + 3 * 8);       // 536
+    CHECK(lay::content_height(card, 4) < card.output_h);                  // < 1080
+}
+
+// REGRESSION GUARD (0-geometry boot bug): the ui substrate REJECTS a surface
+// with non-positive geometry ("surface needs positive geometry") and returns
+// nullptr, so the EMPTY dock must be created/resized at a POSITIVE height, not 0.
+// surface_height() — the helper the glue's surface_height_for() delegates to —
+// clamps content_height to >= 1, so create_surface/set_size are never called
+// with height 0. Cover EVERY count the glue can produce, especially the empty
+// case the headless test cannot distinguish from the substrate-null path.
+TEST_CASE("surface_height is ALWAYS positive (empty-dock 0-geometry guard)") {
+    lay::DockMetrics card{.output_w = 1920, .output_h = 1080, .dock_width = 240,
+                          .slot_height = 124, .gap = 8, .pad = 8};
+    // The empty dock: content_height is 0, but the surface height is clamped to 1.
+    CHECK(lay::content_height(card, 0) == 0);
+    CHECK(lay::surface_height(card, 0) == 1);   // positive placeholder (hidden)
+    // Once there is at least one card, surface_height == content_height (>0).
+    CHECK(lay::surface_height(card, 1) == lay::content_height(card, 1));
+    CHECK(lay::surface_height(card, 4) == lay::content_height(card, 4));
+    // Never non-positive for any plausible count (incl. a negative/degenerate).
+    for (int n = -2; n <= 20; ++n) {
+        CHECK(lay::surface_height(card, n) >= 1);
+    }
+    // Even with degenerate (zeroed) metrics — defensive: still >= 1, never 0.
+    lay::DockMetrics zero{};
+    CHECK(lay::surface_height(zero, 0) >= 1);
+    CHECK(lay::surface_height(zero, 3) >= 1);
+}
+
 TEST_CASE("slot_box: vertical stacking by stride, inset width") {
     auto m = metrics(); // pad 20, slot 100, gap 10, dock_width 300
     auto s0 = lay::slot_box(m, 0, 0);
