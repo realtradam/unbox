@@ -11,6 +11,8 @@ spawn fuzzel, Alt+Tab / Alt+Shift+Tab → stable focus rotation over all topleve
 Alt+F1, Ctrl+Alt+Backspace → quit. ext-xdg-shell's hardcoded keybinds migrated
 out. Kernel now exports `WAYLAND_DISPLAY` so extension-spawned clients reach unbox
 (was the fuzzel "no monitors" root cause). build + build-asan both green.
+Follow-up: Ctrl+Alt+F1..F12 VT switching is now kernel-hardwired (the session
+escape hatch).
 
 **Next action:** Slice 6 — ext-taskbar + ext-launcher (first standard
 extensions; prove the ui-substrate contract). Queued into it from

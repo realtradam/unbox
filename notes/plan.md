@@ -65,6 +65,7 @@ solves), and the trigger that would reopen it.
 | **touch-mode causes NO visual change** (state + typed notification only; dp-ratio stays 1.0) | User found any automatic scaling jarring on hardware (slice-5 hands-on, three iterations: 1.6→1.25→none); extensions adapt affordances explicitly via `on_touch_mode_changed` | Real-seat ergonomics (slice 9+) show finger targets genuinely too small |
 | **Keybindings are config-driven via `unbox.toml`** — ext-keybindings (core) is the first `unbox.toml` consumer/parser; external fuzzel-on-Super stands in for an in-process launcher for now | Fastest path to a usable DE (Super→fuzzel, Alt+Tab); exercises the key_filter + ext-xdg-shell focus contract with no new UI | A bespoke in-process launcher/taskbar lands (slice 6) |
 | **Kernel exports `WAYLAND_DISPLAY`** (setenv at startup) so any process an extension spawns connects to unbox, not the session that launched unbox | Spawned clients inherit the process env; without it fuzzel hit the parent labwc (`wayland-0`) → "no monitors" | — |
+| **VT switching (Ctrl+Alt+Fn) is kernel-hardwired** before the key_filter (`wlr_session_change_vt`) | It is the session escape hatch — must work even if an extension throws or greedily consumes keys; not a rebindable feature (user decision) | — |
 
 ## 3. Architecture
 
