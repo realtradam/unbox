@@ -5,6 +5,15 @@
 
 ## Now
 
+**DEV WORKFLOW (RML/RCSS hot-reload — use this):** UI documents are external assets
+under `assets/<unit>/` (e.g. `assets/ext-stage-dock/dock.rml` + `dock.rcss`), loaded
+via `UiSurfaceSpec::rml_path`. Launch unbox with
+`UNBOX_ASSET_DIR=<repo>/assets UNBOX_DEV=1` (reads the source tree + arms an inotify
+watcher). Then editing a .rml/.rcss and saving HOT-RELOADS the live surface — NO
+recompile, NO restart (bindings/geometry preserved; a broken file keeps the old doc).
+Real-seat verified. Installed builds find assets via `-DUNBOX_ASSET_DIR_DEFAULT`.
+(9c0c0bf kernel, f852141 dock+build)
+
 **Just landed — usability slice (user-driven, real-seat verified on the CF-AX3):**
 `ext-keybindings` (new core ext) reads keybindings from `unbox.toml`: tap-Super →
 spawn fuzzel, Alt+Tab / Alt+Shift+Tab → stable focus rotation over all toplevels,
