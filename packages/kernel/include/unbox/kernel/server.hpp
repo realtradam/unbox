@@ -91,6 +91,18 @@ public:
     // EGL_KHR_fence_sync) — i.e. no glFinish on the hot path (notes/plan.md §7).
     [[nodiscard]] auto ui_fence_sync_active() const -> bool;
 
+    // True when the most recent create_preview imported the snapshot via the
+    // dmabuf -> EGLImage -> sampled-texture path (slice-10 preview spike, Fork
+    // B). False before any preview, or on a backend without the GL import path.
+    // The kernel suite asserts this is true on a gles2/dmabuf backend.
+    [[nodiscard]] auto ui_preview_import_is_dmabuf() const -> bool;
+
+    // Packed 0xRRGGBBAA of the first shm-path ui surface's submitted buffer at
+    // layout pixel (x,y) (row 0 = top). 0 if no shm surface / no frame / out of
+    // bounds. Position-aware readback so the preview-spike test can assert a
+    // known source color reached the expected spot inside an <img>.
+    [[nodiscard]] auto ui_pixel(int x, int y) const -> unsigned int;
+
     // Pin the substrate's touch-mode for tests (none = automatic). Mirrors
     // UiSubstrate::TouchModeOverride; lets the suite drive the state machine and
     // its on_touch_mode_changed notification. Test instrumentation;

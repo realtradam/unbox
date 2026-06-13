@@ -1210,8 +1210,37 @@ struct TGAHeader {
 // Restore packing
 #pragma pack()
 
+// unbox (slice-10 preview spike): map an externally-owned GL texture to a
+// source URI so LoadTexture() resolves it. See header.
+void RenderInterface_GL3::register_preview_texture(const Rml::String& source, unsigned int texture_id, Rml::Vector2i dimensions)
+{
+	preview_textures[source] = PreviewTexture{texture_id, dimensions};
+	preview_texture_ids.insert(texture_id);
+}
+
+void RenderInterface_GL3::unregister_preview_texture(const Rml::String& source)
+{
+	auto it = preview_textures.find(source);
+	if (it == preview_textures.end())
+		return;
+	preview_texture_ids.erase(it->second.texture_id);
+	preview_textures.erase(it);
+}
+
 Rml::TextureHandle RenderInterface_GL3::LoadTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source)
 {
+	// unbox: a preview URI resolves to its registered, externally-owned texture
+	// (the substrate's imported dmabuf->EGLImage->texture). Returns the GL id as
+	// the handle; ReleaseTexture() will skip deleting it (caller owns it).
+	{
+		auto it = preview_textures.find(source);
+		if (it != preview_textures.end())
+		{
+			texture_dimensions = it->second.dimensions;
+			return (Rml::TextureHandle)it->second.texture_id;
+		}
+	}
+
 	Rml::FileInterface* file_interface = Rml::GetFileInterface();
 	Rml::FileHandle file_handle = file_interface->Open(source);
 	if (!file_handle)
@@ -1486,6 +1515,10 @@ void RenderInterface_GL3::RenderBlur(float sigma, const Gfx::FramebufferData& so
 
 void RenderInterface_GL3::ReleaseTexture(Rml::TextureHandle texture_handle)
 {
+	// unbox: never delete an externally-owned preview texture — its GL lifetime
+	// belongs to the substrate's Preview, which deletes it on its own teardown.
+	if (preview_texture_ids.count((unsigned int)texture_handle) != 0)
+		return;
 	glDeleteTextures(1, (GLuint*)&texture_handle);
 }
 

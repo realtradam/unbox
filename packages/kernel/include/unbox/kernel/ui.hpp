@@ -122,6 +122,42 @@ struct UiSurfaceSpec {
     bool visible = true;
 };
 
+// A FROZEN, graphically scalable image of a toplevel's pixels, snapshotted from
+// a wlr_scene_tree at create/refresh time and imported as a texture INTO the ui
+// substrate's RMLUi context. Show it by putting source_uri() into an RML
+// <img src="..."> in ANY ui surface this same substrate created (the preview's
+// texture lives in the shared sibling GLES context, so every surface can sample
+// it). Owned by the contributing extension via unique_ptr; destruction frees the
+// imported texture + EGLImage + snapshot dmabuf and unregisters the URI. NOT
+// live — it is a copy, so the source toplevel may later be hidden or destroyed
+// without affecting an existing Preview. Event-loop thread only.
+class Preview {
+public:
+    virtual ~Preview() = default;
+    Preview(const Preview&) = delete;
+    auto operator=(const Preview&) -> Preview& = delete;
+
+    // The <img src> value resolving to this preview's texture inside any ui
+    // surface of this substrate (e.g. "unbox-preview://7"). Stable for life.
+    [[nodiscard]] virtual auto source_uri() const -> std::string = 0;
+    // Natural pixel size of the snapshot (aspect ratio). The <img> may be sized
+    // to any box via RCSS; RML scales the texture to fit.
+    [[nodiscard]] virtual auto source_width() const -> int = 0;
+    [[nodiscard]] virtual auto source_height() const -> int = 0;
+
+    // Re-snapshot from the original source scene tree if it is still valid.
+    // The borrow validity of the source tree is the CALLER's concern: the
+    // substrate cannot detect a freed wlr_scene_tree, so calling refresh()
+    // after the source has been destroyed is UNDEFINED BEHAVIOUR — the caller
+    // MUST drop the Preview when its source toplevel unmaps/destroys. A
+    // refresh() that fails to render (e.g. substrate lost its GL path) is a
+    // no-op and leaves the previous snapshot intact. NEVER throws.
+    virtual void refresh() = 0;
+
+protected:
+    Preview() = default;
+};
+
 // The kernel's ui substrate, reached via Host::ui(). Per-session, kernel-owned;
 // the reference is a borrow valid for your extension's lifetime. Carries your
 // extension identity for error isolation.
@@ -138,6 +174,23 @@ public:
     // NEVER throws.
     [[nodiscard]] virtual auto create_surface(const UiSurfaceSpec& spec)
         -> std::unique_ptr<UiSurface> = 0;
+
+    // Snapshot the pixels drawn under `source` (a scene subtree — typically a
+    // toplevel's scene tree) into an ARGB8888 dmabuf via the wlr renderer, then
+    // import that dmabuf into the RMLUi sibling context as a sampled GL texture
+    // and register it under an "unbox-preview://N" URI. Show the result by
+    // putting the returned Preview's source_uri() into an RML <img src="..."> in
+    // any ui surface this substrate created. Ownership transfers to you
+    // (unique_ptr). Returns nullptr if the substrate is unavailable (no GL path,
+    // e.g. headless pixman) or the snapshot/import failed. `source` is a borrow
+    // used only during this call (and on refresh()). NEVER throws.
+    //
+    // SCOPE (slice-10 spike): a single-surface toplevel is fully supported; the
+    // snapshot composites every WLR_SCENE_NODE_BUFFER under `source` at its tree
+    // offset, so simple subsurface stacks composite too, but complex
+    // transform/clip/opacity per node is NOT honoured yet (a follow-up).
+    [[nodiscard]] virtual auto create_preview(wlr_scene_tree* source)
+        -> std::unique_ptr<Preview> = 0;
 
     // Whether the substrate has a working GL bridge on this backend. When
     // false, create_surface returns nullptr (degrade gracefully).

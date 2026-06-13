@@ -353,6 +353,32 @@ struct Surface {
     int frame_count = 0;
 };
 
+// ---- PreviewState -----------------------------------------------------------
+//
+// A frozen snapshot of a scene subtree, imported as a sampled GL texture in the
+// RMLUi sibling context and registered under an "unbox-preview://N" URI. The
+// snapshot is captured into an ARGB8888 LINEAR dmabuf by the wlr renderer
+// (wlr_renderer_begin_buffer_pass), then that dmabuf is imported into the
+// sibling context exactly like the surface path (EGLImage -> texture), but here
+// the texture is SAMPLED by RmlUi rather than used as an FBO color attachment.
+// This is the slice-3 bridge run in reverse (wlr pixels -> dmabuf -> EGLImage ->
+// RmlUi texture). Lives in Substrate::Impl::previews (stable addresses).
+struct PreviewState {
+    Substrate::Impl* owner = nullptr;
+    int id = 0;
+    std::string uri;
+
+    wlr_scene_tree* source = nullptr; // borrow; valid only per call (caller's concern)
+    int width = 0;
+    int height = 0;
+
+    // The snapshot dmabuf (held alive for the texture's life) + its import.
+    wlr_buffer* buffer = nullptr;      // ARGB8888 LINEAR dmabuf (own_buffer)
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    GLuint tex = 0;                    // sampled by RmlUi via the URI registration
+    bool dmabuf = false;               // true once a dmabuf import succeeded
+};
+
 // ---- Substrate::Impl --------------------------------------------------------
 
 struct Substrate::Impl {
@@ -364,6 +390,12 @@ struct Substrate::Impl {
     TouchModeTracker touch_mode_tracker;
 
     std::list<Surface> surfaces; // stable addresses (handles borrow Surface*)
+
+    // Previews (slice-10 spike): stable addresses (PreviewHandle borrows a
+    // PreviewState*). `next_preview_id` numbers the "unbox-preview://N" URIs.
+    std::list<PreviewState> previews;
+    int next_preview_id = 0;
+    bool last_preview_dmabuf = false; // test probe: last import took the dmabuf path
 
     // Pointer implicit grab: the consumer of the first button press owns the
     // whole press..release stream (standard seat behavior). `pointer_grab`
@@ -422,6 +454,15 @@ struct Substrate::Impl {
     bool init_surface_gl(Surface& s);
     void render_surface(Surface& s); // caller holds context current
     void destroy_surface(Surface* s);
+
+    // Preview snapshot + import (caller holds the sibling context current).
+    // snapshot_into_buffer composites every WLR_SCENE_NODE_BUFFER under `source`
+    // into `p.buffer` via the wlr renderer; import_snapshot (re)imports that
+    // dmabuf as the sampled GL texture and registers the URI. Both return false
+    // (and clean up) on any failure.
+    bool snapshot_into_buffer(PreviewState& p);
+    bool import_snapshot(PreviewState& p);
+    void destroy_preview(PreviewState* p);
 
     // Forward a synthesized pointer event into a surface's Rml context. Returns
     // whether RmlUi (or our hit-test) treats it as consumed.
@@ -686,6 +727,218 @@ void Substrate::Impl::ctx_button(Surface& s, bool pressed) {
     }
 }
 
+// ---- Preview snapshot + import ----------------------------------------------
+//
+// The snapshot is captured by the wlr GLES2 renderer (NOT the sibling RMLUi
+// context) into a LINEAR ARGB8888 dmabuf, then that dmabuf is imported into the
+// sibling context as a sampled GL texture (slice-3 bridge in reverse). All wlr
+// renderer work happens on the WLR EGL context; all import/texture work after
+// the snapshot happens on the sibling context (the caller makes it current).
+
+namespace {
+
+// Recursively composite every enabled WLR_SCENE_NODE_BUFFER under `node` into
+// `pass`, offset by the accumulated (ox,oy) from the snapshot tree's origin.
+// Single-surface toplevels and simple subsurface stacks composite; per-node
+// transform/clip/opacity beyond position is a documented follow-up.
+void composite_buffers(wlr_scene_node* node, int ox, int oy, wlr_render_pass* pass,
+                       wlr_renderer* renderer) {
+    if (!node->enabled) {
+        return;
+    }
+    const int x = ox + node->x;
+    const int y = oy + node->y;
+    if (node->type == WLR_SCENE_NODE_BUFFER) {
+        auto* sb = wlr_scene_buffer_from_node(node);
+        if (sb->buffer != nullptr) {
+            wlr_texture* tex = wlr_texture_from_buffer(renderer, sb->buffer);
+            if (tex != nullptr) {
+                const int w = sb->dst_width > 0 ? sb->dst_width : static_cast<int>(tex->width);
+                const int h = sb->dst_height > 0 ? sb->dst_height : static_cast<int>(tex->height);
+                wlr_render_texture_options opts{};
+                opts.texture = tex;
+                opts.dst_box = wlr_box{x, y, w, h};
+                opts.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED;
+                wlr_render_pass_add_texture(pass, &opts);
+                wlr_texture_destroy(tex);
+            }
+        }
+    } else if (node->type == WLR_SCENE_NODE_TREE) {
+        auto* tree = wlr_scene_tree_from_node(node);
+        wlr_scene_node* child = nullptr;
+        wl_list_for_each(child, &tree->children, link) {
+            composite_buffers(child, x, y, pass, renderer);
+        }
+    }
+}
+
+// Natural pixel extent (max right/bottom of buffer nodes) of the subtree, in
+// the tree's own coordinate space (origin 0,0). 0x0 if the tree has no buffers.
+void tree_extent(wlr_scene_node* node, int ox, int oy, int& max_w, int& max_h) {
+    if (!node->enabled) {
+        return;
+    }
+    const int x = ox + node->x;
+    const int y = oy + node->y;
+    if (node->type == WLR_SCENE_NODE_BUFFER) {
+        auto* sb = wlr_scene_buffer_from_node(node);
+        if (sb->buffer != nullptr) {
+            const int w = sb->dst_width > 0 ? sb->dst_width : sb->buffer->width;
+            const int h = sb->dst_height > 0 ? sb->dst_height : sb->buffer->height;
+            max_w = std::max(max_w, x + w);
+            max_h = std::max(max_h, y + h);
+        }
+    } else if (node->type == WLR_SCENE_NODE_TREE) {
+        auto* tree = wlr_scene_tree_from_node(node);
+        wlr_scene_node* child = nullptr;
+        wl_list_for_each(child, &tree->children, link) {
+            tree_extent(child, x, y, max_w, max_h);
+        }
+    }
+}
+
+} // namespace
+
+bool Substrate::Impl::snapshot_into_buffer(PreviewState& p) {
+    // Size the snapshot to the subtree's natural extent (relative to the tree
+    // origin: children offsets are relative to `source`, so start at 0,0).
+    int w = 0;
+    int h = 0;
+    tree_extent(&p.source->node, -p.source->node.x, -p.source->node.y, w, h);
+    if (w <= 0 || h <= 0) {
+        wlr_log(WLR_INFO, "ui-substrate: preview source has no pixels to snapshot");
+        return false;
+    }
+
+    // (Re)allocate the dmabuf if the extent changed (refresh of a resized
+    // toplevel). The buffer is LINEAR ARGB8888, same format the surface path
+    // uses, so the same EGL import preconditions apply.
+    if (p.buffer == nullptr || p.width != w || p.height != h) {
+        if (p.buffer != nullptr) {
+            wlr_buffer_drop(p.buffer);
+            p.buffer = nullptr;
+        }
+        wlr_drm_format fmt{};
+        fmt.format = kDrmFormatArgb8888;
+        std::uint64_t modifiers[] = {0 /* DRM_FORMAT_MOD_LINEAR */};
+        fmt.len = 1;
+        fmt.capacity = 1;
+        fmt.modifiers = modifiers;
+        p.buffer = wlr_allocator_create_buffer(allocator, w, h, &fmt);
+        if (p.buffer == nullptr) {
+            wlr_log(WLR_ERROR, "ui-substrate: preview dmabuf allocation failed");
+            return false;
+        }
+        p.width = w;
+        p.height = h;
+    }
+
+    // Composite the subtree's buffers into the dmabuf via the WLR renderer. This
+    // runs on the wlr renderer's own EGL context (the caller has the SIBLING
+    // context current for the import that follows; begin_buffer_pass switches to
+    // the wlr context internally and restores nothing — so we re-make-current
+    // the sibling context after submit, in import_snapshot's caller).
+    wlr_buffer_pass_options pass_opts{};
+    wlr_render_pass* pass = wlr_renderer_begin_buffer_pass(renderer, p.buffer, &pass_opts);
+    if (pass == nullptr) {
+        wlr_log(WLR_ERROR, "ui-substrate: preview begin_buffer_pass failed");
+        return false;
+    }
+    // Clear to transparent first (the toplevel may not cover the whole extent).
+    wlr_render_rect_options clear{};
+    clear.box = wlr_box{0, 0, w, h};
+    clear.color = wlr_render_color{0.f, 0.f, 0.f, 0.f};
+    clear.blend_mode = WLR_RENDER_BLEND_MODE_NONE;
+    wlr_render_pass_add_rect(pass, &clear);
+    composite_buffers(&p.source->node, -p.source->node.x, -p.source->node.y, pass, renderer);
+    if (!wlr_render_pass_submit(pass)) {
+        wlr_log(WLR_ERROR, "ui-substrate: preview render_pass_submit failed");
+        return false;
+    }
+    return true;
+}
+
+bool Substrate::Impl::import_snapshot(PreviewState& p) {
+    // The caller holds the sibling context current. Re-import the dmabuf as a
+    // sampled texture (EGLImage -> glEGLImageTargetTexture2DOES), then register
+    // it under the URI so RmlUi's LoadTexture resolves <img src="unbox-...">.
+    if (!gl.dmabuf_import_ok || gl.egl_create_image == nullptr ||
+        gl.gl_image_target_texture == nullptr) {
+        return false;
+    }
+    wlr_dmabuf_attributes attribs{};
+    if (!wlr_buffer_get_dmabuf(p.buffer, &attribs) || attribs.n_planes < 1) {
+        wlr_log(WLR_ERROR, "ui-substrate: preview buffer has no dmabuf");
+        return false;
+    }
+    EGLint ia[] = {
+        EGL_WIDTH,                     attribs.width,
+        EGL_HEIGHT,                    attribs.height,
+        EGL_LINUX_DRM_FOURCC_EXT,      static_cast<EGLint>(attribs.format),
+        EGL_DMA_BUF_PLANE0_FD_EXT,     attribs.fd[0],
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(attribs.offset[0]),
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,  static_cast<EGLint>(attribs.stride[0]),
+        EGL_NONE,
+    };
+    EGLImageKHR img =
+        gl.egl_create_image(gl.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, ia);
+    if (img == EGL_NO_IMAGE_KHR) {
+        wlr_log(WLR_ERROR, "ui-substrate: preview eglCreateImageKHR failed (0x%x)", eglGetError());
+        return false;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    gl.gl_image_target_texture(GL_TEXTURE_2D, static_cast<GLeglImageOES>(img));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // Replace any prior import (refresh): drop old registration + GL objects.
+    if (gl.render_iface) {
+        gl.render_iface->unregister_preview_texture(p.uri);
+    }
+    if (p.tex != 0) {
+        glDeleteTextures(1, &p.tex);
+    }
+    if (p.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+        gl.egl_destroy_image(gl.egl_display, p.image);
+    }
+    p.tex = tex;
+    p.image = img;
+    p.dmabuf = true;
+    if (gl.render_iface) {
+        gl.render_iface->register_preview_texture(p.uri, p.tex,
+                                                  Rml::Vector2i(p.width, p.height));
+    }
+    return true;
+}
+
+void Substrate::Impl::destroy_preview(PreviewState* p) {
+    const bool cur = gl.make_current();
+    if (gl.render_iface) {
+        gl.render_iface->unregister_preview_texture(p->uri);
+    }
+    if (p->tex != 0) {
+        glDeleteTextures(1, &p->tex);
+        p->tex = 0;
+    }
+    if (p->image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+        gl.egl_destroy_image(gl.egl_display, p->image);
+        p->image = EGL_NO_IMAGE_KHR;
+    }
+    if (cur) {
+        gl.restore_current();
+    }
+    if (p->buffer != nullptr) {
+        wlr_buffer_drop(p->buffer);
+        p->buffer = nullptr;
+    }
+    previews.remove_if([p](const PreviewState& e) { return &e == p; });
+}
+
 // ---- Substrate (private surface) --------------------------------------------
 
 auto Substrate::create(EGLDisplay egl_display, wlr_allocator* allocator, wlr_renderer* renderer,
@@ -701,7 +954,14 @@ auto Substrate::create(EGLDisplay egl_display, wlr_allocator* allocator, wlr_ren
 Substrate::Substrate(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 Substrate::~Substrate() {
-    // Destroy surfaces (GL + scene nodes) then the shared bridge.
+    // Destroy previews (imported texture+EGLImage+dmabuf+URI registration) and
+    // surfaces (GL + scene nodes) before the shared bridge. A surviving Preview
+    // handle would dangle after this, but the contract (ui.hpp) is that the
+    // substrate outlives every Preview an extension holds (it is kernel-owned
+    // and torn down after extensions in Server::Impl::shutdown).
+    while (!impl_->previews.empty()) {
+        impl_->destroy_preview(&impl_->previews.front());
+    }
     while (!impl_->surfaces.empty()) {
         impl_->destroy_surface(&impl_->surfaces.front());
     }
@@ -770,6 +1030,47 @@ auto Substrate::create_surface(ExtensionId who, wlr_scene_tree* parent, const Ui
     impl_->gl.restore_current();
     return std::make_unique<SurfaceHandle>(this, &s);
 }
+
+auto Substrate::create_preview(wlr_scene_tree* source) -> std::unique_ptr<Preview> {
+    impl_->last_preview_dmabuf = false;
+    if (!impl_->available() || source == nullptr) {
+        return nullptr;
+    }
+
+    impl_->previews.emplace_back();
+    PreviewState& p = impl_->previews.back();
+    p.owner = impl_.get();
+    p.id = ++impl_->next_preview_id;
+    p.uri = "unbox-preview://" + std::to_string(p.id);
+    p.source = source;
+
+    // 1) Composite the subtree into our LINEAR ARGB8888 dmabuf via the WLR
+    //    renderer (its own EGL context). NO sibling context current here:
+    //    begin_buffer_pass drives the wlr renderer's GL.
+    if (!impl_->snapshot_into_buffer(p)) {
+        impl_->destroy_preview(&p);
+        return nullptr;
+    }
+
+    // 2) Import the dmabuf into the sibling RMLUi context as a sampled texture
+    //    and register the URI. The sibling context must be current for the
+    //    EGLImage/texture/RmlUi-registration work; save+restore the wlr context.
+    if (!impl_->gl.make_current()) {
+        impl_->destroy_preview(&p);
+        return nullptr;
+    }
+    const bool imported = impl_->import_snapshot(p);
+    impl_->gl.restore_current();
+    if (!imported) {
+        impl_->destroy_preview(&p);
+        return nullptr;
+    }
+
+    impl_->last_preview_dmabuf = p.dmabuf;
+    return std::make_unique<PreviewHandle>(this, &p);
+}
+
+auto Substrate::preview_import_is_dmabuf() const -> bool { return impl_->last_preview_dmabuf; }
 
 void Substrate::tick_all() {
     if (!impl_->available() || impl_->surfaces.empty()) {
@@ -937,6 +1238,35 @@ auto Substrate::fence_sync_active() const -> bool {
     return impl_->gl.fence_ok && impl_->gl.dmabuf_import_ok;
 }
 
+auto Substrate::surface_pixel(int x, int y) const -> std::uint32_t {
+    // Read the first rendered surface's current FBO at (x,y) via glReadPixels on
+    // the sibling context — works for BOTH the shm and dmabuf paths (the FBO's
+    // color attachment is the surface's submitted texture in either case), so
+    // this probe is independent of the per-surface path choice. row0 = GL
+    // bottom; the buffer is top-first (the renderer V-flips on composite), so
+    // map document-y -> GL-y = (h-1-y). R,G,B,A.
+    for (const Surface& s : impl_->surfaces) {
+        if (s.fbo == 0 || s.frame_count == 0) {
+            continue;
+        }
+        if (x < 0 || y < 0 || x >= s.width || y >= s.height) {
+            return 0;
+        }
+        const bool cur = impl_->gl.make_current();
+        std::uint8_t rgba[4] = {0, 0, 0, 0};
+        glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
+        glReadPixels(x, s.height - 1 - y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (cur) {
+            impl_->gl.restore_current();
+        }
+        return (static_cast<std::uint32_t>(rgba[0]) << 24) |
+               (static_cast<std::uint32_t>(rgba[1]) << 16) |
+               (static_cast<std::uint32_t>(rgba[2]) << 8) | static_cast<std::uint32_t>(rgba[3]);
+    }
+    return 0;
+}
+
 auto Substrate::orientation() const -> int {
     for (const Surface& s : impl_->surfaces) {
         if (s.dmabuf || s.shm == nullptr || s.frame_count == 0) {
@@ -1092,6 +1422,33 @@ void SurfaceHandle::dirty() {
     if (surface_->model) {
         surface_->model.DirtyAllVariables();
     }
+}
+
+// ---- PreviewHandle (public Preview impl) ------------------------------------
+
+PreviewHandle::~PreviewHandle() { substrate_->impl_->destroy_preview(state_); }
+
+auto PreviewHandle::source_uri() const -> std::string { return state_->uri; }
+auto PreviewHandle::source_width() const -> int { return state_->width; }
+auto PreviewHandle::source_height() const -> int { return state_->height; }
+
+void PreviewHandle::refresh() {
+    // Re-snapshot from the original source IF it is still valid. Borrow validity
+    // is the caller's concern (ui.hpp: refresh after source destruction is UB);
+    // we guard only against an obviously unusable substrate. A failed re-snapshot
+    // or re-import leaves the previous frozen snapshot + URI registration intact.
+    Substrate::Impl& impl = *substrate_->impl_;
+    if (!impl.available() || state_->source == nullptr) {
+        return;
+    }
+    if (!impl.snapshot_into_buffer(*state_)) {
+        return;
+    }
+    if (!impl.gl.make_current()) {
+        return;
+    }
+    impl.import_snapshot(*state_);
+    impl.gl.restore_current();
 }
 
 } // namespace unbox::kernel

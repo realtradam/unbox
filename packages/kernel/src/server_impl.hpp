@@ -184,6 +184,7 @@ public:
     PerExtensionUi(Server::Impl* server, ExtensionId id) : server_(server), id_(id) {}
 
     auto create_surface(const UiSurfaceSpec& spec) -> std::unique_ptr<UiSurface> override;
+    auto create_preview(wlr_scene_tree* source) -> std::unique_ptr<Preview> override;
     auto available() const -> bool override;
     auto touch_mode() const -> bool override;
     void set_touch_mode_override(TouchModeOverride ov) override;

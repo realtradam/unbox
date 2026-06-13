@@ -187,6 +187,145 @@ void pump(unbox::kernel::Server& s, int turns) {
     }
 }
 
+// ---- slice-10 / a1 preview spike: a known-color source buffer + an <img> ----
+//
+// A data-ptr wlr_buffer filled with one solid color, wrapped in a scene-buffer
+// node under a private tree. The preview snapshots THIS subtree; a ui surface's
+// <img src="unbox-preview://N"> samples it. Color is FourCC AR24 little-endian
+// {B,G,R,A} so the test color round-trips to RMLUi's RGBA after the snapshot.
+
+constexpr std::uint32_t kArgb8888 = 0x34325241; // 'AR24'
+
+struct TestSrcBuffer {
+    wlr_buffer base{};
+    std::vector<std::uint8_t> data;
+    std::size_t stride = 0;
+};
+
+void test_src_destroy(wlr_buffer* b) {
+    auto* buf = reinterpret_cast<TestSrcBuffer*>(b);
+    wlr_buffer_finish(&buf->base);
+    delete buf;
+}
+bool test_src_access(wlr_buffer* b, std::uint32_t, void** data, std::uint32_t* format,
+                     std::size_t* stride) {
+    auto* buf = reinterpret_cast<TestSrcBuffer*>(b);
+    *data = buf->data.data();
+    *format = kArgb8888;
+    *stride = buf->stride;
+    return true;
+}
+void test_src_end(wlr_buffer*) {}
+
+const wlr_buffer_impl kTestSrcImpl = {
+    .destroy = test_src_destroy,
+    .get_dmabuf = nullptr,
+    .get_shm = nullptr,
+    .begin_data_ptr_access = test_src_access,
+    .end_data_ptr_access = test_src_end,
+};
+
+// Build a w*h buffer of solid (r,g,b) opaque pixels (premultiplied; opaque so
+// premultiply is identity). Stored {B,G,R,A} per AR24.
+auto make_solid_buffer(int w, int h, std::uint8_t r, std::uint8_t g, std::uint8_t b)
+    -> TestSrcBuffer* {
+    auto* buf = new TestSrcBuffer();
+    buf->stride = static_cast<std::size_t>(w) * 4;
+    buf->data.assign(buf->stride * static_cast<std::size_t>(h), 0);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i) {
+        buf->data[i * 4 + 0] = b;
+        buf->data[i * 4 + 1] = g;
+        buf->data[i * 4 + 2] = r;
+        buf->data[i * 4 + 3] = 0xff;
+    }
+    wlr_buffer_init(&buf->base, &kTestSrcImpl, w, h);
+    return buf;
+}
+
+// A ui surface whose ONLY content is a full-bleed <img> of a preview. Sized to
+// the surface; the body has no margin so the image fills it. Distinct bg
+// (#101010) so a failed sample is obvious.
+const char* kPreviewRml = R"RML(<rml>
+<head>
+<style>
+body { background: #101010; width: 200px; height: 200px; }
+img { display: block; position: absolute; left: 0px; top: 0px;
+      width: 200px; height: 200px; }
+</style>
+</head>
+<body data-model="ui">
+<img src="PREVIEW_URI"/>
+</body>
+</rml>)RML";
+
+// Extension that builds a known-color source subtree, makes a Preview of it,
+// and shows it in a ui surface via <img>. Records whether each step succeeded.
+class PreviewTestExtension : public unbox::kernel::Extension {
+public:
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        if (!host.ui().available()) {
+            return; // no GL path: degrade (test skips)
+        }
+        // Build the source: a 64x64 solid #ff2060 buffer in its own tree under
+        // the background layer (off to the side so it does not overlap the ui
+        // surface; the preview snapshots the TREE, not the screen).
+        src_tree_ = wlr_scene_tree_create(host.scene_layer(unbox::kernel::SceneLayer::background));
+        if (src_tree_ == nullptr) {
+            return;
+        }
+        src_buf_ = make_solid_buffer(64, 64, 0xff, 0x20, 0x60);
+        src_node_ = wlr_scene_buffer_create(src_tree_, &src_buf_->base);
+        wlr_buffer_drop(&src_buf_->base); // scene_buffer took its own lock
+
+        preview_ = host.ui().create_preview(src_tree_);
+        if (preview_ == nullptr) {
+            return;
+        }
+
+        std::string rml = kPreviewRml;
+        const std::string token = "PREVIEW_URI";
+        rml.replace(rml.find(token), token.size(), preview_->source_uri());
+
+        UiSurfaceSpec spec;
+        spec.rml_inline = rml;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 200;
+        spec.height = 200;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+
+    void teardown() {
+        surface_.reset();
+        preview_.reset();
+        if (src_tree_ != nullptr) {
+            wlr_scene_node_destroy(&src_tree_->node);
+            src_tree_ = nullptr;
+        }
+    }
+
+    [[nodiscard]] auto has_preview() const -> bool { return preview_ != nullptr; }
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+    [[nodiscard]] auto preview_uri() const -> std::string {
+        return preview_ != nullptr ? preview_->source_uri() : std::string{};
+    }
+    [[nodiscard]] auto preview() -> unbox::kernel::Preview* { return preview_.get(); }
+    [[nodiscard]] auto preview_w() const -> int { return preview_ ? preview_->source_width() : 0; }
+    [[nodiscard]] auto preview_h() const -> int { return preview_ ? preview_->source_height() : 0; }
+
+private:
+    Manifest manifest_{"preview-test", Tier::standard, {}};
+    wlr_scene_tree* src_tree_ = nullptr;
+    TestSrcBuffer* src_buf_ = nullptr;
+    wlr_scene_buffer* src_node_ = nullptr;
+    std::unique_ptr<unbox::kernel::Preview> preview_;
+    std::unique_ptr<UiSurface> surface_;
+};
+
 } // namespace
 
 TEST_CASE("substrate: unavailable under pixman; create_surface degrades to null") {
@@ -349,6 +488,90 @@ TEST_CASE("substrate: a click over a ui surface is CONSUMED (no click-through)")
     // leaked through during rendering/hover).
     CHECK(ext->button_hits_via_bus == 0);
     unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+// ============================================================================
+// slice-10 / a1 PREVIEW SPIKE (Fork-B gate). A known-color source subtree is
+// snapshotted into a dmabuf, imported into the RMLUi context as a sampled
+// texture, and shown via <img src="unbox-preview://N"> in a ui surface. The
+// suite proves: (1) the dmabuf->EGLImage->texture import engaged on this GPU
+// (Plan A — the go/no-go unknown), and (2) the known source color actually
+// composited into the surface at the expected spot (position-aware readback).
+// ============================================================================
+
+TEST_CASE("preview: dmabuf import as a sampled RMLUi texture engages (Fork-B GO)") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM"); // Plan A: dmabuf import path
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PreviewTestExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+
+    if (!ext->has_preview()) {
+        // No GL path on this box: the spike is moot here (recorded NO-GO would
+        // be reported from real hardware, not skipped CI). Nothing to assert.
+        return;
+    }
+    // The preview reports the source's natural size and a stable URI.
+    CHECK(ext->preview_w() == 64);
+    CHECK(ext->preview_h() == 64);
+    CHECK(ext->preview_uri().rfind("unbox-preview://", 0) == 0);
+    // The GO criterion: the snapshot imported via dmabuf -> EGLImage -> texture.
+    CHECK(server->ui_preview_import_is_dmabuf());
+
+    pump(*server, 60); // let the <img> surface load + sample the preview texture
+    CHECK(ext->has_surface());
+    CHECK(server->ui_frame_count() > 0);
+
+    ext->teardown(); // drop preview + surface + source while the server lives
+}
+
+TEST_CASE("preview: known source color composites into an <img> (position-aware)") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    // Plan A throughout: the preview snapshots into a dmabuf and imports as a
+    // sampled texture; the surface composites it into its own (dmabuf) FBO. The
+    // ui_pixel probe reads that FBO back via glReadPixels (path-independent), so
+    // no FORCE_SHM is needed — this exercises the real Fork-B pipeline.
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PreviewTestExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+
+    if (!ext->has_preview() || !ext->has_surface()) {
+        return; // no GL path: skip
+    }
+
+    for (int i = 0; i < 80; ++i) {
+        server->dispatch(10);
+    }
+    if (server->ui_frame_count() == 0) {
+        return; // no frame submitted on this box
+    }
+
+    // The <img> fills the 200x200 surface with the 64x64 #ff2060 source scaled
+    // up. Sample the center: it must be the source color, NOT the #101010 bg —
+    // proof the imported preview texture was sampled and composited upright.
+    const unsigned int px = server->ui_pixel(100, 100);
+    INFO("center pixel (RRGGBBAA) = ", px);
+    const int r = static_cast<int>((px >> 24) & 0xff);
+    const int g = static_cast<int>((px >> 16) & 0xff);
+    const int b = static_cast<int>((px >> 8) & 0xff);
+    // Tolerant match for #ff2060 (bilinear edges + premultiply rounding).
+    CHECK(r > 180);
+    CHECK(g < 90);
+    CHECK(b > 60);
+    CHECK(b < 160);
+    // And definitely not the dark background (a missed sample would be ~#101010).
+    CHECK(r + g + b > 200);
+
+    ext->teardown();
 }
 
 // ============================================================================

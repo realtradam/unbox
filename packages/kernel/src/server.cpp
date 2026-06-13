@@ -81,6 +81,14 @@ auto Server::ui_fence_sync_active() const -> bool {
     return impl_->substrate != nullptr && impl_->substrate->fence_sync_active();
 }
 
+auto Server::ui_preview_import_is_dmabuf() const -> bool {
+    return impl_->substrate != nullptr && impl_->substrate->preview_import_is_dmabuf();
+}
+
+auto Server::ui_pixel(int x, int y) const -> unsigned int {
+    return impl_->substrate != nullptr ? impl_->substrate->surface_pixel(x, y) : 0U;
+}
+
 void Server::ui_set_touch_override(UiTouchOverride ov) {
     if (impl_->substrate == nullptr) {
         return;
@@ -102,6 +110,13 @@ auto PerExtensionUi::create_surface(const UiSurfaceSpec& spec) -> std::unique_pt
     }
     wlr_scene_tree* parent = server_->scene_layers[static_cast<std::size_t>(spec.layer)];
     return server_->substrate->create_surface(id_, parent, spec);
+}
+
+auto PerExtensionUi::create_preview(wlr_scene_tree* source) -> std::unique_ptr<Preview> {
+    if (server_->substrate == nullptr) {
+        return nullptr;
+    }
+    return server_->substrate->create_preview(source);
 }
 
 auto PerExtensionUi::available() const -> bool {

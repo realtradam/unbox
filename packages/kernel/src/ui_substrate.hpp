@@ -49,6 +49,32 @@ class Substrate; // the concrete UiSubstrate, defined in ui_substrate.cpp
 // list of them and the public SurfaceHandle can borrow one.
 struct Surface;
 
+// One preview's private state (snapshot dmabuf + imported EGLImage/texture +
+// RmlUi URI registration). Defined in ui_substrate.cpp; declared here so the
+// public PreviewHandle can borrow one out of the Substrate's list.
+struct PreviewState;
+
+// Concrete Preview handed to an extension. A thin, owning handle over a
+// PreviewState that lives in the Substrate's list; destruction frees the GL
+// texture + EGLImage + dmabuf and unregisters the URI.
+class PreviewHandle final : public Preview {
+public:
+    PreviewHandle(Substrate* substrate, PreviewState* state)
+        : substrate_(substrate), state_(state) {}
+    ~PreviewHandle() override;
+    PreviewHandle(const PreviewHandle&) = delete;
+    auto operator=(const PreviewHandle&) -> PreviewHandle& = delete;
+
+    [[nodiscard]] auto source_uri() const -> std::string override;
+    [[nodiscard]] auto source_width() const -> int override;
+    [[nodiscard]] auto source_height() const -> int override;
+    void refresh() override;
+
+private:
+    Substrate* substrate_;
+    PreviewState* state_;
+};
+
 // Concrete UiSurface handed to an extension. A thin, owning handle over a
 // Surface that lives in the Substrate's list; destruction removes the Surface
 // (document + scene node). Per-extension (carries no id itself — its Surface
@@ -103,6 +129,12 @@ public:
     auto create_surface(ExtensionId who, wlr_scene_tree* parent, const UiSurfaceSpec& spec)
         -> std::unique_ptr<UiSurface>;
 
+    // Snapshot the pixels under `source` into a dmabuf imported as a sampled GL
+    // texture in the RMLUi context, registered under an "unbox-preview://N"
+    // URI. Returns nullptr if unavailable or the snapshot/import failed. Never
+    // throws. (See ui.hpp UiSubstrate::create_preview for the public contract.)
+    auto create_preview(wlr_scene_tree* source) -> std::unique_ptr<Preview>;
+
     // Render every dirty surface (called from the output frame handler).
     void tick_all();
 
@@ -136,6 +168,17 @@ public:
     // (no glFinish on the hot path) — lets the suite assert the production sync.
     [[nodiscard]] auto fence_sync_active() const -> bool;
 
+    // ---- preview test instrumentation (kernel suite only) ----
+    // Whether the last create_preview imported the snapshot via the dmabuf ->
+    // EGLImage -> sampled texture path (Plan A) rather than failing. Lets the
+    // suite assert the spike's GO path engaged on hardware that supports it.
+    [[nodiscard]] auto preview_import_is_dmabuf() const -> bool;
+    // Packed 0xRRGGBBAA of the first shm-path surface's submitted buffer at
+    // layout pixel (x,y) (readback row 0 = top). 0 if no shm surface / no frame
+    // / out of bounds. A position-aware probe (like orientation()) so the suite
+    // can assert a preview's known source color landed at the expected spot.
+    [[nodiscard]] auto surface_pixel(int x, int y) const -> std::uint32_t;
+
     struct Impl;
 
 private:
@@ -143,6 +186,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     friend class SurfaceHandle;
+    friend class PreviewHandle;
 };
 
 } // namespace unbox::kernel

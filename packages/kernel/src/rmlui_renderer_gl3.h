@@ -3,6 +3,8 @@
 #include <RmlUi/Core/RenderInterface.h>
 #include <RmlUi/Core/Types.h>
 #include <bitset>
+#include <unordered_map>
+#include <unordered_set>
 
 enum class ProgramId;
 enum class UniformId;
@@ -87,6 +89,17 @@ public:
 
 	const Rml::Matrix4f& GetTransform() const;
 	void ResetProgram();
+
+	// unbox (slice-10 preview spike): register an externally-OWNED GL texture
+	// under a "source" string (the "unbox-preview://N" URI). LoadTexture()
+	// resolves that exact source to `texture_id` + `dimensions`, so an
+	// <img src="unbox-preview://N"> samples it. The texture's GL lifetime is the
+	// CALLER's (the substrate's Preview): ReleaseTexture() must NOT delete it
+	// when RmlUi drops its handle, so registered ids are tracked and skipped
+	// there. unregister_preview_texture() removes the mapping on Preview
+	// destruction (the caller deletes the GL texture itself, after).
+	void register_preview_texture(const Rml::String& source, unsigned int texture_id, Rml::Vector2i dimensions);
+	void unregister_preview_texture(const Rml::String& source);
 
 private:
 	void UseProgram(ProgramId program_id);
@@ -174,6 +187,17 @@ private:
 	};
 
 	RenderLayerStack render_layers;
+
+	// unbox (slice-10 preview spike): externally-owned preview textures, keyed
+	// by their "unbox-preview://N" source string. LoadTexture() resolves a hit
+	// here; ReleaseTexture() skips any id present in preview_texture_ids so the
+	// substrate's Preview keeps sole ownership of the GL texture's lifetime.
+	struct PreviewTexture {
+		unsigned int texture_id;
+		Rml::Vector2i dimensions;
+	};
+	std::unordered_map<Rml::String, PreviewTexture> preview_textures;
+	std::unordered_set<unsigned int> preview_texture_ids;
 
 	struct GLStateBackup {
 		bool enable_cull_face;
