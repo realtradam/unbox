@@ -4,6 +4,7 @@
 #include "focus_ring.hpp"
 #include "policy.hpp"
 
+#include <unbox/ext-stage-dock/ext_stage_dock.hpp>
 #include <unbox/ext-xdg-shell/ext_xdg_shell.hpp>
 #include <unbox/kernel/host.hpp>
 #include <unbox/kernel/wlr.hpp>
@@ -155,14 +156,21 @@ public:
     void activate(Host& host) override {
         host_ = &host;
 
-        // The ONLY fatal: a missing ext-xdg-shell Service (our focus ring + the
-        // window-targeting actions are meaningless without it; depends_on
-        // guarantees it activated first, so absence is a broken core session).
+        // The ONLY fatals: missing ext-xdg-shell Service (actions that target
+        // windows — focus, close — are meaningless without it), and missing
+        // ext-stage-dock Service (dock-toggle-visible is a no-op without docks).
+        // depends_on guarantees both activate first, so absence is a broken core.
         shell_ = host.service<ext_xdg_shell::Service>();
         if (shell_ == nullptr) {
             throw std::runtime_error(
                 "ext-keybindings: ext-xdg-shell Service unavailable (depends_on "
                 "\"xdg-shell\" not satisfied)");
+        }
+        dock_ = host.service<ext_stage_dock::Service>();
+        if (dock_ == nullptr) {
+            throw std::runtime_error(
+                "ext-keybindings: ext-stage-dock Service unavailable (depends_on "
+                "\"stage-dock\" not satisfied)");
         }
 
         // Input path: thread every key through the Matcher. Non-matching keys
@@ -278,6 +286,9 @@ private:
         case policy::Action::quit:
             wl_display_terminate(host_->display());
             return;
+        case policy::Action::dock_toggle_visible:
+            dock_->toggle_visible();
+            return;
         }
     }
 
@@ -308,7 +319,7 @@ private:
     const kernel::Manifest manifest_{
         .id = "keybindings",
         .tier = kernel::Tier::core,
-        .depends_on = {"xdg-shell"},
+        .depends_on = {"xdg-shell", "stage-dock"},
     };
 
     std::optional<std::string> config_path_;
@@ -327,7 +338,8 @@ private:
     policy::FocusRing<Toplevel*> ring_;
 
     Host* host_ = nullptr;
-    ext_xdg_shell::Service* shell_ = nullptr; // borrow; fetched in activate()
+    ext_xdg_shell::Service* shell_ = nullptr;  // borrow; fetched in activate()
+    ext_stage_dock::Service* dock_ = nullptr;  // borrow; fetched in activate()
 
     // RAII subscriptions + the file watch — destruction unsubscribes / stops the
     // watch (listener-lifetime). Last members so they release FIRST at teardown,

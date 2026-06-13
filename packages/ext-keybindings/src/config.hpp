@@ -34,6 +34,7 @@ struct LoadResult {
 // USER-APPROVED schema:
 //   keys    = "Mod+...+Key" | "Mod"   (required, string)
 //   action  = "spawn" | "focus-next" | "focus-prev" | "close-active" | "quit"
+//            | "dock-toggle-visible"
 //   command = "..."                    (required for action="spawn")
 // Each entry is validated independently: a malformed combo, unknown action,
 // missing/empty keys, missing command for spawn, or wrong value types skip that

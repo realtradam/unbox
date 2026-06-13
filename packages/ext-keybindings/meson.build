@@ -16,23 +16,25 @@ ext_keybindings_inc = include_directories('include')
 tomlplusplus_dep = dependency('tomlplusplus')
 
 # Glue library. Needs the kernel ABI, ext-xdg-shell's public contract (the glue
-# includes its header to consume the Service + Toplevel), xkbcommon (the combo
+# includes its header to consume the Service + Toplevel), ext-stage-dock's public
+# contract (the dock Service for dock-toggle-visible), xkbcommon (the combo
 # parser resolves keysym names), and toml++ (the config loader).
 ext_keybindings_lib = static_library(
   'unbox-ext-keybindings',
   'src/extension.cpp',
   'src/config.cpp',
   include_directories: ext_keybindings_inc,
-  dependencies: [kernel_dep, ext_xdg_shell_dep, xkbcommon_dep, tomlplusplus_dep],
+  dependencies: [kernel_dep, ext_xdg_shell_dep, ext_stage_dock_dep,
+                 xkbcommon_dep, tomlplusplus_dep],
 )
 
 # What host-bin links against: the factory. kernel_dep rides through for the
-# Extension ABI the factory returns. ext-xdg-shell stays a build-time dep of OUR
-# lib only (consumers of the factory do not need it).
+# Extension ABI the factory returns. ext_stage_dock_dep rides so consumers
+# (including host-bin and the glue test) can resolve the dock Service type.
 ext_keybindings_dep = declare_dependency(
   link_with: ext_keybindings_lib,
   include_directories: ext_keybindings_inc,
-  dependencies: [kernel_dep],
+  dependencies: [kernel_dep, ext_stage_dock_dep],
 )
 
 # Tests, asymmetric: the pure decision cores doctest-hard (combo parser, toml

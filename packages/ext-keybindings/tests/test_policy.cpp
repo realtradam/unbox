@@ -165,7 +165,7 @@ TEST_CASE("empty / keybind-less document yields zero bindings, not an error") {
 
 TEST_CASE("compiled defaults match the documented out-of-the-box set") {
     auto d = pol::default_bindings();
-    REQUIRE(d.size() == 5);
+    REQUIRE(d.size() == 6);
     CHECK(d[0].combo.is_tap);
     CHECK(d[0].combo.modifiers == pol::mod_logo);
     CHECK(d[0].action == Action::spawn);
@@ -178,6 +178,8 @@ TEST_CASE("compiled defaults match the documented out-of-the-box set") {
     CHECK(d[3].action == Action::focus_next);
     CHECK(d[4].combo == parse_combo("Ctrl+Alt+BackSpace").value());
     CHECK(d[4].action == Action::quit);
+    CHECK(d[5].combo == parse_combo("Super+d").value());
+    CHECK(d[5].action == Action::dock_toggle_visible);
 }
 
 // ============================================================================
@@ -236,11 +238,11 @@ TEST_CASE("reload: a valid-but-empty doc keeps the old table (never drops workin
     // mid-edit with the [[keybind]] block deleted, or every entry malformed)
     // must NOT swap — the user's live keys survive.
     std::vector<Binding> live = pol::default_bindings();
-    REQUIRE(live.size() == 5);
+    REQUIRE(live.size() == 6);
 
     auto empty = cfg::reload_bindings(live, "title = \"unrelated\"\n");
     CHECK_FALSE(empty.swapped);
-    REQUIRE(empty.bindings.size() == 5);
+    REQUIRE(empty.bindings.size() == 6);
     CHECK(empty.bindings == live); // kept
 
     // Same for a doc where every entry is individually skipped (all malformed).

@@ -22,6 +22,28 @@
 
 namespace unbox::ext_stage_dock {
 
+// ---- Exported Service (cross-extension typed coupling) -----------------------
+//
+// Other extensions (ext-keybindings) fetch this via Host::service<T>() to drive
+// dock policy (hiding/showing the dock, minimizing windows, etc.). Registered
+// by this extension in activate(). See <unbox/kernel/host.hpp> for the service
+// registry contract — single-responder, type-keyed, no strings.
+class Service {
+public:
+    virtual ~Service() = default;
+
+    // Toggle the dock's visibility: if the dock is currently shown (slid into
+    // the visible area), hide it with the slide-out transition; if hidden, show
+    // it with the slide-in. Works regardless of whether the dock has slots
+    // (minimized windows) — showing an empty dock is valid. The auto-reveal on
+    // minimize (refresh_slots) is independent: minimizing a window also shows
+    // the dock.
+    virtual void toggle_visible() = 0;
+
+protected:
+    Service() = default;
+};
+
 // Construct the extension (ownership transfer to the caller; host-bin installs
 // it via Server::install at c2). Construction is cheap and side-effect free per
 // the Extension contract; ALL wiring — once it exists — happens in activate().

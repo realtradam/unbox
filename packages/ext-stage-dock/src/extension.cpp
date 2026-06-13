@@ -96,7 +96,8 @@ struct Slot {
 // -2dp thumb overscan clipped by the rounded overflow; d1 slot-enter animation;
 // transform-origin 0% 0%).
 
-class StageDockExtension final : public kernel::Extension, public TestProbe {
+class StageDockExtension final : public kernel::Extension, public TestProbe,
+                                  public ext_stage_dock::Service {
 public:
     auto manifest() const -> const kernel::Manifest& override { return manifest_; }
 
@@ -162,6 +163,11 @@ public:
         // (e.g. headless pixman) — create_surface returns nullptr; we degrade
         // gracefully (model still tracked, hide/show still works, no visual).
         create_dock_surface();
+
+        // Register the Service so ext-keybindings (or any extension) can drive
+        // dock policy — toggle_visible, and future minimize/restore — through
+        // the typed cross-extension coupling (no strings, link-time safety).
+        host.provide_service<ext_stage_dock::Service>(this);
 
         activated_ = true;
     }
@@ -241,6 +247,32 @@ private:
             focused_ = nullptr;
         }
         refresh_slots();
+    }
+
+    // ---- Service: toggle_visible -------------------------------------------
+    void toggle_visible() override { do_toggle_visible(); }
+
+    void do_toggle_visible() {
+        if (dock_surface_ == nullptr) {
+            return;
+        }
+        if (open_) {
+            // Close: slide out. Keep the surface compositing so the animation
+            // plays; on_dock_settled won't hide it (closing_ is false), so a
+            // subsequent toggle re-opens instantly without delay.
+            open_ = false;
+            closing_ = false;
+            dock_surface_->dirty("open");
+        } else {
+            // Open: make the surface visible (may already be from slots), then
+            // slide in. If the dock was fully hidden (surface invisible), the
+            // set_visible(true) begins compositing; the dirty("open")
+            // transitions the body to translateX(0).
+            open_ = true;
+            closing_ = false;
+            dock_surface_->set_visible(true);
+            dock_surface_->dirty("open");
+        }
     }
 
     // ---- helpers ------------------------------------------------------------

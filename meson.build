@@ -60,6 +60,6 @@ add_test_setup(
 subdir('packages/kernel')
 subdir('packages/ext-xdg-shell')
 subdir('packages/ext-layer-shell')
-subdir('packages/ext-keybindings')
 subdir('packages/ext-stage-dock')
+subdir('packages/ext-keybindings')
 subdir('packages/host-bin')

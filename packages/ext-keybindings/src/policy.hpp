@@ -45,11 +45,12 @@ inline constexpr std::uint32_t keysym_super_r = 0xffec; // XKB_KEY_Super_R
 // ---- Action vocabulary ------------------------------------------------------
 
 enum class Action {
-    spawn,        // run `command` via `sh -c`
-    focus_next,   // rotate focus forward across mapped windows (wrapping)
-    focus_prev,   // rotate focus backward (wrapping)
-    close_active, // close the focused toplevel (no-op if none)
-    quit,         // wl_display_terminate
+    spawn,              // run `command` via `sh -c`
+    focus_next,         // rotate focus forward across mapped windows (wrapping)
+    focus_prev,         // rotate focus backward (wrapping)
+    close_active,       // close the focused toplevel (no-op if none)
+    quit,               // wl_display_terminate
+    dock_toggle_visible, // show/hide the stage dock sidebar
 };
 
 // Map an action token (lowercased) to the enum; nullopt = unknown action.
@@ -68,6 +69,9 @@ enum class Action {
     }
     if (s == "quit") {
         return Action::quit;
+    }
+    if (s == "dock-toggle-visible") {
+        return Action::dock_toggle_visible;
     }
     return std::nullopt;
 }
@@ -338,6 +342,7 @@ private:
     add("Alt+Shift+Tab", Action::focus_prev, {});
     add("Alt+F1", Action::focus_next, {});
     add("Ctrl+Alt+BackSpace", Action::quit, {});
+    add("Super+d", Action::dock_toggle_visible, {});
     return out;
 }
 

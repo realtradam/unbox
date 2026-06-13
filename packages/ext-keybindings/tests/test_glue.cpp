@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include <unbox/ext-keybindings/ext_keybindings.hpp>
+#include <unbox/ext-stage-dock/ext_stage_dock.hpp>
 #include <unbox/ext-xdg-shell/ext_xdg_shell.hpp>
 #include <unbox/kernel/server.hpp>
 
@@ -25,12 +26,13 @@ auto make_headless_server() -> std::unique_ptr<unbox::kernel::Server> {
 
 } // namespace
 
-TEST_CASE("ext-keybindings installs and activates atop ext-xdg-shell") {
+TEST_CASE("ext-keybindings installs and activates atop ext-xdg-shell + ext-stage-dock") {
     auto server = make_headless_server();
     server->install(unbox::ext_xdg_shell::create());
+    server->install(unbox::ext_stage_dock::create());
     server->install(unbox::ext_keybindings::create());
-    // Topological activation runs xdg-shell first (keybindings depends_on it),
-    // so keybindings finds the Service. A missing-Service throw would propagate.
+    // Topological activation runs xdg-shell first, then stage-dock, then
+    // keybindings (depends_on both). A missing-Service throw would propagate.
     server->activate_extensions();
     CHECK(!server->socket_name().empty());
 }
@@ -38,18 +40,20 @@ TEST_CASE("ext-keybindings installs and activates atop ext-xdg-shell") {
 TEST_CASE("ext-keybindings dispatches and shuts down cleanly") {
     auto server = make_headless_server();
     server->install(unbox::ext_xdg_shell::create());
+    server->install(unbox::ext_stage_dock::create());
     server->install(unbox::ext_keybindings::create());
     server->activate_extensions();
     for (int i = 0; i < 5; ++i) {
         CHECK(server->dispatch(10));
     }
-    // Destruction tears down the key_filter link + the three xdg-shell event
-    // subscriptions in reverse declaration order with no leaked listeners.
+    // Destruction tears down the key_filter link + the xdg-shell event
+    // subscriptions + the stage-dock Service in reverse declaration order.
 }
 
 TEST_CASE("ext-keybindings degrades to defaults for a bad explicit config path") {
     auto server = make_headless_server();
     server->install(unbox::ext_xdg_shell::create());
+    server->install(unbox::ext_stage_dock::create());
     // A non-existent --config path must NOT throw out of activate(); the
     // extension logs and uses compiled defaults.
     server->install(unbox::ext_keybindings::create(
