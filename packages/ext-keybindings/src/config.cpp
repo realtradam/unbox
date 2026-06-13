@@ -101,4 +101,25 @@ auto load_from_string(std::string_view toml_text) -> LoadResult {
     return result;
 }
 
+auto reload_bindings(const std::vector<policy::Binding>& current, std::string_view toml_text)
+    -> ReloadDecision {
+    ReloadDecision decision;
+    LoadResult loaded = load_from_string(toml_text);
+    decision.warnings = std::move(loaded.warnings);
+
+    // KEEP-OLD on a syntax error or on a parse that produced no usable bindings
+    // (an empty file, a [[keybind]]-less doc, or one where every entry was
+    // skipped). Either way the live table must remain the user's working keys.
+    if (loaded.parse_error || loaded.bindings.empty()) {
+        decision.bindings = current; // unchanged copy
+        decision.swapped = false;
+        return decision;
+    }
+
+    // SUCCESS: the new table replaces the live one (the swap).
+    decision.bindings = std::move(loaded.bindings);
+    decision.swapped = true;
+    return decision;
+}
+
 } // namespace unbox::ext_keybindings::config

@@ -147,6 +147,7 @@ class KeybindingsExt final : public kernel::Extension {
 public:
     explicit KeybindingsExt(std::optional<std::string> config_path)
         : config_path_(std::move(config_path)),
+          effective_path_(discover_config_path(config_path_)),
           matcher_(load_bindings(config_path_)) {}
 
     auto manifest() const -> const kernel::Manifest& override { return manifest_; }
@@ -202,9 +203,64 @@ public:
                 // continues from wherever focus ACTUALLY is.
                 ring_.note_focused(e.toplevel);
             });
+
+        // Config hot-reload: watch the EFFECTIVE config path so editing
+        // unbox.toml re-applies keybindings live, with no restart. We watch even
+        // if the file does not exist yet — the kernel fires on_change when a
+        // not-yet-existing file is CREATED, so a user who later writes the config
+        // gets it picked up. The FileWatch is a member (config_watch_) so the
+        // watch lives exactly as long as this extension; on_change is coalesced
+        // and error-isolated by the kernel. No path -> no watch (defaults stand).
+        if (effective_path_) {
+            config_watch_ = host.watch_file(*effective_path_, [this] { reload_config(); });
+        }
     }
 
 private:
+    // Re-read + re-parse the EFFECTIVE config file and SWAP the live binding
+    // table the key_filter link matches against. Runs on the event-loop thread
+    // from the FileWatch callback. ROBUST by construction: an unreadable file, a
+    // toml parse error, or a parse that yields zero usable bindings KEEPS the
+    // currently-active bindings and logs exactly ONE warning — a half-saved /
+    // broken-mid-edit file never drops the user's working keys, and nothing
+    // throws out of this callback (toml::parse_error is caught inside the pure
+    // config loader). On success the new table replaces matcher_ in place; the
+    // key_filter lambda reads matcher_ through `this`, so the swap takes effect
+    // immediately with NO re-subscribe.
+    void reload_config() {
+        if (!effective_path_) {
+            return; // defensive: only registered when a path exists
+        }
+
+        std::string text;
+        if (!read_file(*effective_path_, text)) {
+            // File vanished or became unreadable mid-edit (e.g. an editor's
+            // unlink+rename window). Keep the working keys; the watch stays
+            // armed for the next write.
+            wlr_log(WLR_ERROR,
+                    "ext-keybindings: config '%s' not readable on reload; keeping current bindings",
+                    effective_path_->c_str());
+            return;
+        }
+
+        // Pure swap-or-keep-old decision over the CURRENTLY-LIVE table.
+        config::ReloadDecision decision =
+            config::reload_bindings(matcher_.bindings(), text);
+        if (!decision.swapped) {
+            // Parse error or zero usable bindings: keep current, ONE warning.
+            wlr_log(WLR_ERROR,
+                    "ext-keybindings: reload of '%s' failed (%zu issue(s)); keeping current bindings",
+                    effective_path_->c_str(), decision.warnings.size());
+            return;
+        }
+
+        // SUCCESS: swap the live matcher (and thus its binding table) in place.
+        const std::size_t n = decision.bindings.size();
+        matcher_ = policy::Matcher(std::move(decision.bindings));
+        wlr_log(WLR_INFO, "ext-keybindings: config reloaded (%zu binding(s)) from '%s'",
+                n, effective_path_->c_str());
+    }
+
     void run_action(const policy::Binding& b) {
         switch (b.action) {
         case policy::Action::spawn:
@@ -256,23 +312,32 @@ private:
     };
 
     std::optional<std::string> config_path_;
+    // The EFFECTIVE config path (explicit --config, else the discovered XDG /
+    // ~/.config path), resolved ONCE in the ctor. Drives both the initial load
+    // and the hot-reload watch + re-read. nullopt only when no HOME/XDG exists.
+    // Declared before matcher_ so it is initialized first (ctor init order).
+    std::optional<std::string> effective_path_;
 
     // Decision cores (constructed before any wiring; matcher_ owns the parsed
-    // bindings). Declared before the subscriptions so they outlive callbacks
-    // that capture `this` (members tear down in reverse declaration order:
-    // subscriptions drop first, then the cores).
+    // bindings). matcher_ is the LIVE binding table the key_filter link reads
+    // through `this`; reload_config() swaps it in place. Declared before the
+    // subscriptions so they outlive callbacks that capture `this` (members tear
+    // down in reverse declaration order: subscriptions drop first, then cores).
     policy::Matcher matcher_;
     policy::FocusRing<Toplevel*> ring_;
 
     Host* host_ = nullptr;
     ext_xdg_shell::Service* shell_ = nullptr; // borrow; fetched in activate()
 
-    // RAII subscriptions — destruction unsubscribes (listener-lifetime). Last
-    // members so they release FIRST at teardown, before the cores they touch.
+    // RAII subscriptions + the file watch — destruction unsubscribes / stops the
+    // watch (listener-lifetime). Last members so they release FIRST at teardown,
+    // before the cores their callbacks touch (matcher_, ring_). config_watch_'s
+    // on_change reads matcher_ + effective_path_, so it must die before them.
     kernel::Subscription key_filter_;
     kernel::Subscription mapped_;
     kernel::Subscription unmapped_;
     kernel::Subscription focused_;
+    kernel::FileWatch config_watch_;
 };
 
 } // namespace

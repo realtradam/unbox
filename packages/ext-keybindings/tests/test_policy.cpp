@@ -181,6 +181,104 @@ TEST_CASE("compiled defaults match the documented out-of-the-box set") {
 }
 
 // ============================================================================
+// config hot-reload semantics (the swap-or-keep-old reload decision)
+// ============================================================================
+// Pure proof of the live-reload logic WITHOUT inotify or the event loop: the
+// kernel already tests the watcher; here we test only what reload_config() does
+// with the file's TEXT once it has been read. config A -> bindings A; reload
+// with config B -> bindings B (the swap); reload with MALFORMED text -> bindings
+// unchanged (still B) and NO throw. This is exactly the keep-old-on-bad +
+// swap-on-good contract the glue's reload_config() relies on.
+
+TEST_CASE("reload: config A -> A, reload B -> B (swap), reload malformed -> unchanged") {
+    // --- Initial load: config A (one binding: Alt+Tab -> focus-next). ---
+    const std::string config_a = R"(
+[[keybind]]
+keys   = "Alt+Tab"
+action = "focus-next"
+)";
+    auto a = cfg::load_from_string(config_a);
+    REQUIRE_FALSE(a.parse_error);
+    REQUIRE(a.bindings.size() == 1);
+    std::vector<Binding> live = a.bindings; // the live table the glue holds
+
+    // --- Reload with config B (two bindings: Super tap + Ctrl+Alt+BackSpace). ---
+    const std::string config_b = R"(
+[[keybind]]
+keys    = "Super"
+action  = "spawn"
+command = "wofi"
+
+[[keybind]]
+keys   = "Ctrl+Alt+BackSpace"
+action = "quit"
+)";
+    auto dec_b = cfg::reload_bindings(live, config_b);
+    REQUIRE(dec_b.swapped);                 // a usable parse -> SWAP
+    REQUIRE(dec_b.bindings.size() == 2);
+    CHECK(dec_b.bindings[0].combo.is_tap);
+    CHECK(dec_b.bindings[0].action == Action::spawn);
+    CHECK(dec_b.bindings[0].command == "wofi"); // command change rides the swap
+    CHECK(dec_b.bindings[1].action == Action::quit);
+    live = dec_b.bindings; // glue installs the new table
+
+    // --- Reload with MALFORMED text: keep-old, swapped == false, no throw. ---
+    cfg::ReloadDecision dec_bad; // (default-constructed; assigned below)
+    CHECK_NOTHROW(dec_bad = cfg::reload_bindings(live, "this = = not valid toml [[["));
+    CHECK_FALSE(dec_bad.swapped);                // parse error -> KEEP OLD
+    CHECK_FALSE(dec_bad.warnings.empty());       // and a diagnostic is surfaced
+    REQUIRE(dec_bad.bindings.size() == 2);       // STILL config B, untouched
+    CHECK(dec_bad.bindings == live);             // byte-for-byte the working keys
+}
+
+TEST_CASE("reload: a valid-but-empty doc keeps the old table (never drops working keys)") {
+    // A file that parses cleanly but yields ZERO usable bindings (e.g. saved
+    // mid-edit with the [[keybind]] block deleted, or every entry malformed)
+    // must NOT swap — the user's live keys survive.
+    std::vector<Binding> live = pol::default_bindings();
+    REQUIRE(live.size() == 5);
+
+    auto empty = cfg::reload_bindings(live, "title = \"unrelated\"\n");
+    CHECK_FALSE(empty.swapped);
+    REQUIRE(empty.bindings.size() == 5);
+    CHECK(empty.bindings == live); // kept
+
+    // Same for a doc where every entry is individually skipped (all malformed).
+    const std::string all_bad = R"(
+[[keybind]]
+keys   = "Alt+Bogus"
+action = "focus-next"
+
+[[keybind]]
+keys   = "Super"
+action = "spawn"
+)";
+    auto bad = cfg::reload_bindings(live, all_bad); // bad combo + spawn w/o command
+    CHECK_FALSE(bad.swapped);
+    CHECK(bad.bindings == live); // STILL the defaults, no throw
+}
+
+TEST_CASE("reload: a partial save with at least ONE usable binding swaps to it") {
+    // The reload contract is "swap on >=1 usable binding": even if some entries
+    // are skipped, as long as one survives, that becomes the new live table.
+    std::vector<Binding> live = pol::default_bindings();
+    const std::string partial = R"(
+[[keybind]]
+keys   = "Alt+Bogus"
+action = "focus-next"
+
+[[keybind]]
+keys   = "Alt+Tab"
+action = "focus-next"
+)";
+    auto dec = cfg::reload_bindings(live, partial);
+    REQUIRE(dec.swapped);
+    REQUIRE(dec.bindings.size() == 1); // the one usable binding
+    CHECK(dec.bindings[0].action == Action::focus_next);
+    CHECK_FALSE(dec.warnings.empty()); // the skipped entry was reported
+}
+
+// ============================================================================
 // matcher + tap state machine
 // ============================================================================
 
