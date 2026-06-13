@@ -1,0 +1,37 @@
+# unbox.toml — sample configuration
+#
+# Copy to $XDG_CONFIG_HOME/unbox/unbox.toml (i.e. ~/.config/unbox/unbox.toml)
+# and edit. If no config file is found, unbox uses these exact defaults.
+#
+# Keybindings -------------------------------------------------------------------
+# Each [[keybind]] maps a key combo to one action.
+#
+#   keys    "Mod+...+Key" — modifiers (Super, Alt, Ctrl, Shift; order/case
+#           insensitive) then an xkb key name (Tab, F1, Return, space,
+#           BackSpace, d, ...). A BARE modifier with no "+Key" (e.g. "Super")
+#           is a TAP binding: it fires only when that modifier is pressed and
+#           released with nothing pressed in between.
+#   action  one of: spawn (needs `command`) · focus-next · focus-prev ·
+#           close-active · quit
+#   command (spawn only) shell line, run via `sh -c`, so args/quoting work.
+
+[[keybind]]
+keys    = "Super"             # tap the Windows key
+action  = "spawn"
+command = "fuzzel"
+
+[[keybind]]
+keys   = "Alt+Tab"           # next window (all windows, wraps around)
+action = "focus-next"
+
+[[keybind]]
+keys   = "Alt+Shift+Tab"     # previous window
+action = "focus-prev"
+
+[[keybind]]
+keys   = "Alt+F1"            # legacy focus cycle (kept from the tinywl port)
+action = "focus-next"
+
+[[keybind]]
+keys   = "Ctrl+Alt+Backspace" # quit the unbox session
+action = "quit"

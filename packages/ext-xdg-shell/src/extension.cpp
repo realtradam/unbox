@@ -8,8 +8,6 @@
 #include <unbox/kernel/wlr.hpp>
 
 #include <cstdint>
-#include <iterator>
-#include <list>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -149,12 +147,7 @@ public:
                                                process_touch_cancel(e);
                                            });
         sub_touch_frame_ = host.subscribe(host.on_touch_frame(),
-                                          [this] { wlr_seat_touch_notify_frame(host_->seat()); });
-
-        // Keyboard policy: consume Ctrl+Alt+Backspace / Alt+F1, pass the rest.
-        sub_key_ = host.subscribe(host.key_filter(), [this](kernel::KeyEvent ev) {
-            return filter_key(ev);
-        });
+                                           [this] { wlr_seat_touch_notify_frame(host_->seat()); });
 
         // Register the typed service so downstream slices link against us.
         host.provide_service<Service>(&service_);
@@ -190,10 +183,6 @@ public:
         }
         wlr_scene_node_raise_to_top(&entry->scene_tree->node);
 
-        // Move to front of focus order (front = focused).
-        focus_order_.remove(entry);
-        focus_order_.push_front(entry);
-
         wlr_xdg_toplevel_set_activated(entry->xdg_toplevel, true);
         if (wlr_keyboard* kb = wlr_seat_get_keyboard(seat)) {
             wlr_seat_keyboard_notify_enter(seat, surface, kb->keycodes, kb->num_keycodes,
@@ -224,7 +213,6 @@ private:
 
         entry->map.connect(xdg_toplevel->base->surface->events.map, [this, entry](void*) {
             entry->mapped = true;
-            focus_order_.push_front(entry);
             focus_toplevel(entry);
             emit(on_mapped_, entry);
         });
@@ -235,7 +223,6 @@ private:
                 end_grab();
             }
             entry->mapped = false;
-            focus_order_.remove(entry);
         });
         entry->commit.connect(xdg_toplevel->base->surface->events.commit, [entry](void*) {
             if (entry->xdg_toplevel->base->initial_commit) {
@@ -584,32 +571,6 @@ private:
         }
     }
 
-    // ---- keyboard policy (consume-or-pass filter) ----
-    auto filter_key(kernel::KeyEvent ev) -> kernel::KeyEvent {
-        if (ev.handled) {
-            return ev; // an earlier link already consumed it
-        }
-        switch (policy::match_keybinding(ev.keysym, ev.modifiers, ev.pressed)) {
-        case policy::KeyAction::terminate:
-            wl_display_terminate(host_->display());
-            ev.handled = true;
-            break;
-        case policy::KeyAction::cycle_focus: {
-            const std::size_t idx = policy::cycle_next(focus_order_.size());
-            if (idx != policy::no_selection) {
-                auto it = focus_order_.begin();
-                std::advance(it, idx);
-                focus_toplevel(*it);
-            }
-            ev.handled = true; // consume the binding key even with <2 windows
-            break;
-        }
-        case policy::KeyAction::none:
-            break;
-        }
-        return ev;
-    }
-
     void emit(kernel::Event<const ToplevelEvent&>& ev, ToplevelEntry* entry) {
         const ToplevelEvent payload{entry};
         ev.emit(payload);
@@ -652,8 +613,6 @@ private:
     // Window/popup ownership.
     std::unordered_map<wlr_xdg_toplevel*, std::unique_ptr<ToplevelEntry>> toplevels_;
     std::unordered_map<wlr_xdg_popup*, std::unique_ptr<PopupEntry>> popups_;
-    // Focus order: front = focused; MAPPED toplevels only.
-    std::list<ToplevelEntry*> focus_order_;
 
     // Grab state (one at a time). The pure machine owns the move/resize/none
     // mode + button-down tracking; these hold the geometry for the active grab.
@@ -685,7 +644,6 @@ private:
     Subscription sub_touch_up_;
     Subscription sub_touch_cancel_;
     Subscription sub_touch_frame_;
-    Subscription sub_key_;
 
     friend struct ServiceImpl;
 };

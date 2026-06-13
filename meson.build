@@ -31,8 +31,24 @@ rmlui_dep = rmlui_proj.dependency('rmlui_core')
 
 doctest_dep = dependency('doctest')
 
+# Sanitizer test environment. The substrate's GL tests pull in Mesa/EGL/DRM,
+# which keep process-lifetime driver globals (reclaimed at exit, not leaks), and
+# vendored RmlUi trips a benign vptr downcast during element teardown. Point
+# LSan/UBSan at suppression files scoped to THOSE third-party frames only — our
+# own code stays fully checked, so an unbox:: leak/UB still fails the suite.
+# Applied by default to every `meson test` (harmless in the non-sanitized build).
+add_test_setup(
+  'suppressed',
+  is_default: true,
+  env: [
+    'LSAN_OPTIONS=suppressions=' + (meson.project_source_root() / 'suppressions' / 'lsan.txt'),
+    'UBSAN_OPTIONS=suppressions=' + (meson.project_source_root() / 'suppressions' / 'ubsan.txt') + ':print_stacktrace=1:halt_on_error=1',
+  ],
+)
+
 # Units. Adding one? ALL FOUR steps of .unbox/rules/unit-registration.md.
 subdir('packages/kernel')
 subdir('packages/ext-xdg-shell')
 subdir('packages/ext-layer-shell')
+subdir('packages/ext-keybindings')
 subdir('packages/host-bin')

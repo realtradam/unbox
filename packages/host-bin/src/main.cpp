@@ -1,5 +1,6 @@
 #include "demo_ui.hpp"
 
+#include <unbox/ext-keybindings/ext_keybindings.hpp>
 #include <unbox/ext-layer-shell/ext_layer_shell.hpp>
 #include <unbox/ext-xdg-shell/ext_xdg_shell.hpp>
 #include <unbox/kernel/kernel.hpp>
@@ -7,12 +8,14 @@
 
 #include <cstdio>
 #include <exception>
+#include <optional>
+#include <string>
 #include <string_view>
 
 namespace {
 
 void print_usage(const char* argv0) {
-    std::printf("usage: %s [-s <startup command>] [--ui-demo]\n", argv0);
+    std::printf("usage: %s [-s <startup command>] [--config <path>] [--ui-demo]\n", argv0);
 }
 
 } // namespace
@@ -20,13 +23,18 @@ void print_usage(const char* argv0) {
 auto main(int argc, char* argv[]) -> int {
     unbox::kernel::Server::Options options;
     bool ui_demo = false;
+    std::optional<std::string> config_path;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "-s" && i + 1 < argc) {
             options.startup_cmd = argv[++i];
+        } else if (arg == "--config" && i + 1 < argc) {
+            // Explicit unbox.toml for ext-keybindings; if omitted it discovers
+            // the XDG path, then falls back to compiled-in defaults.
+            config_path = argv[++i];
         } else if (arg == "--ui-demo") {
-            // Slice-5 acceptance demo (temporary until slice 6's real UI
-            // extensions): a ui surface via the public substrate contract.
+            // Slice-5 acceptance demo (temporary until the real UI extensions):
+            // a ui surface via the public substrate contract.
             ui_demo = true;
         } else {
             print_usage(argv[0]);
@@ -38,9 +46,11 @@ auto main(int argc, char* argv[]) -> int {
         auto server = unbox::kernel::Server::create(std::move(options));
 
         // The composition root: the ONLY place that names every extension.
-        // install() transfers ownership; run() activates in dependency order.
+        // install() transfers ownership; run() activates in dependency order
+        // (ext-keybindings depends_on xdg-shell, resolved topologically).
         server->install(unbox::ext_xdg_shell::create());
         server->install(unbox::ext_layer_shell::create());
+        server->install(unbox::ext_keybindings::create(config_path));
         if (ui_demo) {
             server->install(unbox::host_bin::create_demo_ui());
         }

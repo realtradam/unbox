@@ -34,12 +34,46 @@ TEST_CASE("server boots and shuts down on the headless backend") {
     setenv("WLR_BACKENDS", "headless", 1);
     setenv("WLR_RENDERER", "pixman", 1);
 
+    // Simulate the inherited-parent value (labwc's wayland-0) the real bug left
+    // in place. The startup setenv must OVERWRITE this with our own socket.
+    setenv("WAYLAND_DISPLAY", "wayland-stale-parent", 1);
+
     auto server = unbox::kernel::Server::create({});
     CHECK(!server->socket_name().empty());
+
+    // Regression guard for the real bug: after startup the PROCESS environment's
+    // WAYLAND_DISPLAY must name OUR socket (not the inherited parent value), so
+    // every child — the -s startup spawn AND any extension's spawn — connects to
+    // unbox by default instead of the wrong compositor ("no monitors").
+    const char* env_display = getenv("WAYLAND_DISPLAY");
+    REQUIRE(env_display != nullptr);
+    CHECK(std::string(env_display) == server->socket_name());
+
     for (int i = 0; i < 3; ++i) {
         CHECK(server->dispatch(10));
     }
     // Destruction runs the full tinywl shutdown sequence.
+}
+
+TEST_CASE("server boots with a headless output present and advertised") {
+    // The headless backend creates its output during wlr_backend_start (inside
+    // Server::create), so it is enabled + committed + globalled before this
+    // returns. We assert the boot path survives an output being present and the
+    // event loop pumps cleanly — the headless analogue of the DRM advertise the
+    // wl_output-global guarantee (the layout auto-advertises the global for an
+    // output with a committed size).
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "pixman", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    CHECK(!server->socket_name().empty());
+    server->activate_extensions();
+    for (int i = 0; i < 5; ++i) {
+        CHECK(server->dispatch(10));
+    }
+
+    unsetenv("WLR_HEADLESS_OUTPUTS");
 }
 
 // ============================================================================

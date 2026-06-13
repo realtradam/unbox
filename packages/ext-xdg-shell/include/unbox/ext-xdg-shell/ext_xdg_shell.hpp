@@ -10,14 +10,18 @@
 //
 // Recreates the kernel's former tinywl-shape shell against the kernel ABI
 // alone: the wlr_xdg_shell v3 global, toplevel/popup lifecycle, click/tap-to-
-// focus, pointer/touch routing to clients, Alt+F1 focus-cycle, Alt+Escape
-// terminate, client-requested interactive move/resize, and maximize/
-// fullscreen configure replies. Tier: core. depends_on: none.
+// focus, pointer/touch routing to clients, client-requested interactive
+// move/resize, and maximize/fullscreen configure replies. Tier: core.
+// depends_on: none.
+//
+// Compositor keybindings (focus-cycle, terminate) are NOT handled here; they
+// live in ext-keybindings, which subscribes to the kernel's key_filter and
+// calls Toplevel::focus() on this extension's Service.
 //
 // This header is the unit's CONTRACT — the only surface downstream slices
-// (taskbar, tiling) couple to. It is intentionally minimal: future consumers
-// change-request exactly what they need. Everything here runs on the single
-// wl_event_loop thread.
+// (taskbar, tiling, ext-keybindings) couple to. It is intentionally minimal:
+// future consumers change-request exactly what they need. Everything here runs
+// on the single wl_event_loop thread.
 
 namespace unbox::ext_xdg_shell {
 
@@ -90,7 +94,9 @@ public:
         -> unbox::kernel::Event<const ToplevelEvent&>& = 0;
 
     // Keyboard focus moved to this toplevel (map-focus, click/tap-to-focus, or
-    // Alt+F1 cycle). Payload borrow valid for the call.
+    // programmatic Toplevel::focus() call). Payload borrow valid for the call.
+    // NOTE: ext-keybindings' Alt+Tab cycle calls Toplevel::focus(), which
+    // produces this event — callers may rely on that guarantee.
     [[nodiscard]] virtual auto on_toplevel_focused()
         -> unbox::kernel::Event<const ToplevelEvent&>& = 0;
 

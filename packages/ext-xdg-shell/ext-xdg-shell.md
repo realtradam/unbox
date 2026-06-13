@@ -8,9 +8,9 @@ extension-creates-the-global split), not by the kernel.
 ## Why it exists
 The slice-4 kernel boots featureless: it owns input/output/scene/seat glue and
 emits a typed catalogue, but names no shell policy. This unit is the minimal
-shell that makes a session usable: toplevels appear, focus follows
-click/tap/cycle, pointers and touch route to clients, windows move/resize on
-request, and the dev keybindings (Ctrl+Alt+Backspace / Alt+F1) live here.
+shell that makes a session usable: toplevels appear, focus follows click/tap,
+pointers and touch route to clients, and windows move/resize on request.
+Compositor keybindings (focus-cycle, terminate) now live in ext-keybindings.
 
 ## Side-effect graph
 - **Creates:** the `wlr_xdg_shell` v3 global on `host.display()`.
@@ -19,8 +19,8 @@ request, and the dev keybindings (Ctrl+Alt+Backspace / Alt+F1) live here.
   (forward `notify_button` + click-to-focus + grab begin/reset),
   `on_pointer_axis` (forward `notify_axis`), `on_pointer_frame` (notify_frame),
   `on_touch_down/motion/up` (tap-to-focus + down/up/motion notify),
-  `on_touch_frame` (notify_frame), and `key_filter` (consume
-  Ctrl+Alt+Backspace→terminate / Alt+F1→cycle, pass everything else).
+  `on_touch_frame` (notify_frame). `key_filter` is NOT subscribed here;
+  ext-keybindings owns all compositor keybindings.
 - **Binds (raw xdg-shell signals, RAII `Listener`):** `new_toplevel`,
   `new_popup`, and per-entity map/unmap/commit/destroy/request_move/
   request_resize/request_maximize/request_fullscreen.
@@ -56,11 +56,6 @@ it is never read by another unit.
   grab: during a grab we suppress the client touch-motion notify entirely (the
   compositor consumes the drag) and drive the window from the raw layout
   coords, so the moving-surface origin never fights the grab.
-- **Terminate is `Ctrl+Alt+Backspace`** (the canonical X11 kill-the-server
-  chord). It deliberately shares NO key with labwc's defaults — no Escape at all
-  — after the user vetoed any overlap (even Alt+Shift+Escape was too close to
-  labwc's `A-Escape` "Exit labwc"). Every Escape combo now passes THROUGH
-  unconsumed; pure-core tests guard both that and the new chord.
 - **Interactive move/resize grab is a pure state machine** (`policy::
   GrabMachine`), NOT an ad-hoc cursor-mode flag. The grab is a deterministic
   function of (which inputs are down, client-requested-move/resize): it engages
@@ -88,10 +83,6 @@ it is never read by another unit.
   pure sequence tests pass clean; the bug was the missing seat notify.) Touch
   grabs stay balanced because `process_touch_up`/`_cancel` always send the
   matching `wlr_seat_touch_notify_up`/`_cancel`.
-- **Alt+F1 cycle focuses the back of the focus order** (least-recently
-  focused), matching the former kernel; the picked window then moves to front,
-  so repeated presses walk the stack. The binding key is consumed even with
-  fewer than two windows (no client should see a half-handled compositor combo).
 - Teardown is pure RAII (reverse declaration order); there is no manual
   cleanup. The `wlr_xdg_shell` global and scene nodes are display/scene-owned
   and outlive nothing of ours improperly.

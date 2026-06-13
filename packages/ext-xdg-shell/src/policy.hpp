@@ -1,61 +1,16 @@
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
-#include <vector>
 
 // Pure decision core (no wlroots / GL / RMLUi). The glue translates wlroots
 // input into these calls and acts on the results. Heavily doctest-covered in
 // tests/test_policy.cpp without the kernel present. This file calls nothing in
 // the glue — it only computes.
+//
+// Compositor keybindings (Ctrl+Alt+Backspace terminate, Alt+F1 focus-cycle)
+// have been removed from this unit; they now live in ext-keybindings.
 
 namespace unbox::ext_xdg_shell::policy {
-
-// What a matched compositor keybinding asks the glue to do. `none` means the
-// key was not a binding and must pass through to the focused client.
-enum class KeyAction {
-    none,            // not a binding; do not consume
-    terminate,       // Ctrl+Alt+Backspace: wl_display_terminate
-    cycle_focus,     // Alt+F1: focus the next mapped toplevel
-};
-
-// xkb keysym values we care about (kept as plain constants so the core needs
-// no xkbcommon include; the glue passes xkb_keysym_t straight through). These
-// are the stable XKB_KEY_* numeric values.
-inline constexpr std::uint32_t keysym_backspace = 0xff08; // XKB_KEY_BackSpace
-inline constexpr std::uint32_t keysym_f1 = 0xffbe;        // XKB_KEY_F1
-
-// WLR_MODIFIER_* bits. Defined here (not pulled from wlr.hpp) so the core
-// stays wlroots-free; the glue masks the live modifier state against these.
-inline constexpr std::uint32_t modifier_ctrl = 1 << 2; // WLR_MODIFIER_CTRL
-inline constexpr std::uint32_t modifier_alt = 8;        // WLR_MODIFIER_ALT
-
-// Decide what a key press maps to. Only PRESSES match; everything else is
-// `none` (pass-through).
-//
-// Bindings (settled):
-//   Ctrl+Alt+Backspace -> terminate. The canonical X11 kill-the-server chord;
-//     it shares NO key with the parent labwc session's defaults (no Escape at
-//     all), per the user veto on any overlap (.skills/nested-run.md). Any
-//     Escape combo — plain Alt+Escape AND Alt+Shift+Escape — now passes
-//     THROUGH unconsumed.
-//   Alt+F1             -> cycle focus.
-[[nodiscard]] inline auto match_keybinding(std::uint32_t keysym, std::uint32_t modifiers,
-                                           bool pressed) -> KeyAction {
-    if (!pressed) {
-        return KeyAction::none;
-    }
-    // Terminate needs BOTH Ctrl and Alt with Backspace.
-    if (keysym == keysym_backspace &&
-        (modifiers & modifier_ctrl) != 0 && (modifiers & modifier_alt) != 0) {
-        return KeyAction::terminate;
-    }
-    // Cycle needs Alt held with F1.
-    if (keysym == keysym_f1 && (modifiers & modifier_alt) != 0) {
-        return KeyAction::cycle_focus;
-    }
-    return KeyAction::none;
-}
 
 // ---- Interactive move/resize grab state machine (pure) ----------------------
 //
@@ -220,28 +175,5 @@ private:
     std::int32_t last_touch_id_ = 0;
     std::int32_t origin_touch_id_ = 0;
 };
-
-// Choose the toplevel to focus next when cycling, given the current
-// focus-ordered list (front = currently focused, as the glue maintains it).
-// Returns an INDEX into `order`, or a sentinel meaning "do nothing".
-//
-// Semantics mirror the slice-2 kernel: cycling focuses the LAST entry in the
-// focus order (the least-recently-focused mapped toplevel), and only when
-// there are at least two windows — so repeated Alt+F1 walks the stack. With
-// fewer than two windows there is nothing to cycle to.
-inline constexpr std::size_t no_selection = static_cast<std::size_t>(-1);
-
-[[nodiscard]] inline auto cycle_next(std::size_t count) -> std::size_t {
-    if (count < 2) {
-        return no_selection;
-    }
-    return count - 1; // the back of the focus order
-}
-
-// Convenience overload taking the list directly (tests read more clearly).
-template <typename T>
-[[nodiscard]] auto cycle_next(const std::vector<T>& order) -> std::size_t {
-    return cycle_next(order.size());
-}
 
 } // namespace unbox::ext_xdg_shell::policy

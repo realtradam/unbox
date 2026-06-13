@@ -168,6 +168,18 @@ TEST_CASE("a real client's nil-output layer surface receives a configure") {
     if (c.surface != nullptr) {
         wl_surface_destroy(c.surface);
     }
+    if (c.layer_shell != nullptr) {
+        zwlr_layer_shell_v1_destroy(c.layer_shell);
+    }
+    if (c.output != nullptr) {
+        wl_output_destroy(c.output);
+    }
+    if (c.compositor != nullptr) {
+        wl_compositor_destroy(c.compositor);
+    }
+    if (c.registry != nullptr) {
+        wl_registry_destroy(c.registry);
+    }
     wl_display_flush(c.display);
     pump(*server, c.display);
     wl_display_disconnect(c.display);

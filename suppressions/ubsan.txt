@@ -1,0 +1,8 @@
+# UBSan suppressions — vendored RmlUi only.
+#
+# RmlUi performs a downcast on a Rml::Element while it is mid-destruction, which
+# trips -fsanitize=vptr (the vptr no longer resolves to ElementDocument). It is
+# benign and lives in vendored third-party sources we do not edit. Our own code
+# is not listed here, so real UB in unbox:: still fails.
+vptr:Element.cpp
+vptr:ElementDocument.cpp

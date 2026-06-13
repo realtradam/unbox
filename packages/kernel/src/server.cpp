@@ -206,6 +206,15 @@ void Server::Impl::init() {
     }
     socket = socket_cstr;
 
+    // Advertise OUR socket in the PROCESS environment. The process inherited
+    // WAYLAND_DISPLAY from its parent (e.g. labwc's wayland-0), but our real
+    // socket is whatever wl_display_add_socket_auto just picked. Without this,
+    // children spawned by extensions (ext-keybindings forks fuzzel) inherit the
+    // stale parent value and connect to the WRONG compositor -> "no monitors".
+    // setenv here makes every child (the -s startup spawn AND extension spawns)
+    // reach unbox by default. tinywl/sway do exactly this.
+    setenv("WAYLAND_DISPLAY", socket.c_str(), 1);
+
     if (!wlr_backend_start(backend)) {
         throw std::runtime_error("failed to start the wlr_backend");
     }
@@ -406,14 +415,50 @@ void Server::Impl::shutdown() {
 void Server::Impl::handle_new_output(wlr_output* wlr_output) {
     wlr_output_init_render(wlr_output, allocator, renderer);
 
-    wlr_output_state state;
-    wlr_output_state_init(&state);
-    wlr_output_state_set_enabled(&state, true);
-    if (wlr_output_mode* mode = wlr_output_preferred_mode(wlr_output)) {
-        wlr_output_state_set_mode(&state, mode);
+    // Enable + set a mode, then commit. The committed mode is what gives the
+    // output a non-zero width/height — and wlr_output_layout (below) advertises
+    // the client-facing wl_output global ONLY for an output whose width/height
+    // are > 0 (see output_update_global in wlroots' wlr_output_layout.c). So a
+    // FAILED modeset leaves size 0 and the output silently global-less: clients
+    // that need an output (layer-shell: fuzzel et al.) see "no monitors".
+    //
+    // Headless commits trivially succeed; the DRM modeset can fail for the
+    // preferred mode. tinywl ignores the commit result (single-mode demo); we
+    // must not. Try the preferred mode, then any other reported mode, then a
+    // mode-less enable, so every backend ends up with a committed, advertisable
+    // output where the hardware allows one at all.
+    auto try_commit = [&](wlr_output_mode* mode) -> bool {
+        wlr_output_state state;
+        wlr_output_state_init(&state);
+        wlr_output_state_set_enabled(&state, true);
+        if (mode != nullptr) {
+            wlr_output_state_set_mode(&state, mode);
+        }
+        const bool ok = wlr_output_commit_state(wlr_output, &state);
+        wlr_output_state_finish(&state);
+        return ok;
+    };
+
+    bool committed = try_commit(wlr_output_preferred_mode(wlr_output));
+    if (!committed) {
+        wlr_output_mode* mode = nullptr;
+        wl_list_for_each(mode, &wlr_output->modes, link) {
+            if (try_commit(mode)) {
+                committed = true;
+                break;
+            }
+        }
     }
-    wlr_output_commit_state(wlr_output, &state);
-    wlr_output_state_finish(&state);
+    if (!committed) {
+        // Mode-less enable (modeless backends, or hardware that rejected every
+        // mode). On a modeful backend this generally won't yield a usable size,
+        // but it is the last resort and keeps the output enabled.
+        committed = try_commit(nullptr);
+    }
+    if (!committed) {
+        wlr_log(WLR_ERROR, "output %s: every commit failed; no wl_output global",
+                wlr_output->name);
+    }
 
     auto owned = std::make_unique<Output>();
     Output* output = owned.get();
@@ -443,11 +488,12 @@ void Server::Impl::handle_new_output(wlr_output* wlr_output) {
         outputs.remove_if([output](const auto& owned) { return owned.get() == output; });
     });
 
+    // Adding to the layout auto-advertises the wl_output global for an output
+    // with a committed size (output_update_global in wlr_output_layout.c).
     wlr_output_layout_output* layout_output = wlr_output_layout_add_auto(output_layout, wlr_output);
     wlr_scene_output* scene_output = wlr_scene_output_create(scene, wlr_output);
     wlr_scene_output_layout_add_output(scene_layout, layout_output, scene_output);
 
-    wlr_log(WLR_INFO, "new output %s", wlr_output->name);
     const OutputEvent ev{wlr_output};
     ev_output_added.emit(ev);
 }

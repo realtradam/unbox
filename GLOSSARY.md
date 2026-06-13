@@ -47,6 +47,14 @@
 | **data binding** | RMLUi's model↔document binding; the ONLY way extension state reaches RML. | — |
 | **touch-mode** | The substrate state signalling finger input (auto-flipped, debounced). NO automatic visual scaling (user decision, slice 5) — extensions may adapt affordances via the change notification (spacing, invisible hit zones, OSK auto-show). | tablet mode |
 
+## Input & keybindings
+
+| Term | Meaning | Aliases to avoid |
+|---|---|---|
+| **keybinding** | A key-combo → action mapping declared in `unbox.toml` (`[[keybind]]`), matched on the kernel's `key_filter`. Owned by ext-keybindings. | shortcut, hotkey, accelerator |
+| **action** | The verb a keybinding triggers: `spawn`, `focus-next`, `focus-prev`, `close-active`, `quit`. | command (reserved for the `spawn` shell string) |
+| **tap binding** | A keybinding on a bare modifier (e.g. `"Super"`) that fires on release only if it was pressed and released with nothing in between. | — |
+
 ## Workflow
 
 | Term | Meaning | Aliases to avoid |
