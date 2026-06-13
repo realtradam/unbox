@@ -18,6 +18,16 @@ wlroots_dep = dependency('wlroots-0.20')
 wayland_server_dep = dependency('wayland-server')
 xkbcommon_dep = dependency('xkbcommon')
 
+# UI assets (RML/RCSS documents) live under assets/<unit>/ and install to
+# <datadir>/unbox/<unit>/…. The substrate resolves a RELATIVE UiSurfaceSpec::
+# rml_path against $UNBOX_ASSET_DIR (dev: the source assets/ tree) or, when that
+# env is unset, this compiled-in default (production install). The dev launch also
+# sets UNBOX_DEV=1 to arm the inotify hot-reload watcher. Must precede the unit
+# subdir() calls so the kernel compiles with the define.
+unbox_asset_dir = get_option('prefix') / get_option('datadir') / 'unbox'
+add_project_arguments('-DUNBOX_ASSET_DIR_DEFAULT="' + unbox_asset_dir + '"', language: 'cpp')
+install_subdir('assets', install_dir: get_option('datadir') / 'unbox', strip_directory: true)
+
 # RMLUi: CMake-only upstream, vendored as a wrap-file tarball (NO git
 # submodules — settled decision, notes/plan.md §2) built via the cmake module.
 cmake = import('cmake')

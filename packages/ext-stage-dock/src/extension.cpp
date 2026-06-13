@@ -96,187 +96,28 @@ struct Slot {
     std::string app_id;                           // copied; for // TODO favicon
 };
 
-// Inline RML for the dock document. A vertical stack of preview cards, dark/
-// rounded like the Stage-Manager reference. d1 ADDS the RCSS animation on top of
-// c2's static document — without touching the data model (same "slots" list,
-// same per-row preview/title/restore bindings). data-model "ui" (the substrate
-// default).
+// The dock document now lives in EXTERNAL ASSET FILES (loaded via
+// UiSurfaceSpec::rml_path so design changes need no recompile + dev hot-reload):
+//   assets/ext-stage-dock/dock.rml   — the RML STRUCTURE (data-model "ui",
+//     data-for="row : slots", the rounded overflow:hidden div.slot, the
+//     full-bleed div.thumb with data-style-decorator image(...), the display:none
+//     title + its {{ row.title }} binding, data-event-click restore, the d1
+//     transform/translateX reveal body). It links the styles via
+//     <link type="text/rcss" href="dock.rcss"/> (RmlUi resolves href relative to
+//     the document's own dir, which the kernel asset root sets up).
+//   assets/ext-stage-dock/dock.rcss  — ALL the RCSS (body.dock, div.slot,
+//     div.thumb, span.title, @keyframes slot-enter, …).
+// The C++ binding setup (bind_list*/bind_string/bind_event in create_dock_surface)
+// is UNCHANGED — the substrate re-applies the bindings across hot-reloads.
 //
-// TRANSPARENT STRIP (per-pixel alpha). The substrate composites this surface
-// with per-pixel alpha (ui.hpp UiSurface §PER-PIXEL ALPHA): any pixel body.dock
-// does not paint is fully transparent and the windows BELOW show through. So
-// `body.dock` paints NO background (`background-color: transparent`) — only the
-// `div.slot` CARDS paint, reading as cards floating over the window with the
-// empty strip see-through. The card corners are ROUNDED (border-radius), so the
-// pixels OUTSIDE the rounded corners are unpainted and show the window through —
-// that is correct/intended. NOTE the substrate still consumes pointer/touch over
-// the whole surface RECT regardless of visual transparency (slice-5 consumption
-// model), so the surface is sized to HUG the card stack (see content_height in
-// create/refresh) — the rest of the screen stays interactive. A real
-// input-transparent strip needs a deferred UiSurfaceSpec flag (report
-// change-req).
-//
-// CARD = PREVIEW (the card IS the image). The card structure is a ROUNDED CLIP
-// CONTAINER holding a FULL-BLEED preview child plus a title overlay:
-//
-//   <div class="slot">                                   -- rounded clip box
-//     <div class="thumb" data-style-decorator="..."/>    -- full-bleed preview
-//     <span class="title">{{ row.title }}</span>         -- bottom scrim overlay
-//   </div>
-//
-// WHY a child carries the decorator (not div.slot itself): an element's OWN
-// image() decorator is NOT clipped to its OWN border-radius — a background-color
-// rounds via geometry, but a decorator needs the clip MASK, which an element's
-// self-render never sets (RmlUi-core behaviour, confirmed by the kernel owner's
-// substrate-renderer investigation: its scissor+stencil clip is correct and
-// DOES clip a CHILD's image() decorator to a parent's rounded overflow:hidden
-// corners — even with a transform and across set_size). So `div.slot` is the
-// rounded clip container (`border-radius: 10dp; overflow: hidden;`) and the
-// preview rides on a full-bleed child `div.thumb` (position:absolute, all four
-// insets 0) whose decorator content is clipped to the rounded corners by the
-// parent. Putting the decorator on the rounded slot directly produced SQUARE
-// corners — that was the bug.
-//
-// The decorator is bound per row via the "style" data view (RmlUi 6.2 registers
-// the "style" data view, Factory.cpp:242; same runtime-property-string pattern
-// as the vendored data-style-transform samples):
-//   data-style-decorator="'image( ' + row.preview + ' cover center center )'"
-// SHORTHAND ORDER (verified in vendored DecoratorTiled.cpp:220-251,
-// RegisterTileProperty("image", true)): the `image` shorthand is FallThrough
-// over  image-src, image-orientation, image-fit, image-align-x, image-align-y.
-// FallThrough is not strictly positional — a value that fails one property's
-// parser falls through to the next (PropertySpecification.cpp:384-398). So after
-// the URI (image-src, "string" parser), `cover` fails image-orientation
-// (keywords none|flip-*|rotate-180) and falls through to image-fit (keywords
-// fill|contain|cover|scale-none|scale-down|repeat*) -> cover; `center` ->
-// image-align-x (left|center|right); `center` -> image-align-y (top|center|
-// bottom). Net: COVER fit, CENTER/CENTER align — the preview fills the whole
-// card centered, cropping overflow, undistorted for any source aspect. The
-// `unbox-preview://N` URI resolves the SAME imported texture an <img src> would:
-// both Decorator and ElementImage go through RenderManager::LoadTexture (vendored
-// Decorator.cpp:61-69 + ElementImage.cpp:251).
-//
-// EMPTY / not-yet-previewed slot: `div.slot { background-color: #2e2e32ff; }` is
-// a dark PLACEHOLDER fill (a background-color DOES round by geometry, so it stays
-// rounded). A slot can exist before its Preview texture is ready (or on a no-GL
-// backend) — then row.preview is "" and `image(  cover center center )` fails to
-// instance a decorator on the thumb child (returns nullptr, no crash), leaving
-// the rounded dark fill visible so the card is never invisible. The fixed box
-// keeps it min-height/tappable; data-event-click="restore(it_index)" on the slot
-// is unchanged.
-//
-// TITLE OVERLAY: the title sits ON the preview as the LAST child (drawn above the
-// thumb), `position:absolute` pinned to the card bottom (left:0/right:0/bottom:0,
-// width auto) with a translucent dark scrim (`background-color: #00000099`)
-// behind the text so it stays legible over any preview; the parent's
-// overflow:hidden + border-radius clips the scrim's bottom corners to match the
-// card. The title is TEXT, so {{ row.title }} is correct there.
-//
-// d1 animation (RCSS, RMLUi 6.2; verified against the vendored source):
-//
-//  1. DOCK REVEAL SLIDE. body.dock starts translated fully off the left edge
-//     (transform: translateX(-100%)); adding the `open` class translates it back
-//     to 0. A `transition: transform 180ms ...` on body.dock makes that flip
-//     SLIDE rather than jump. The `open` class is driven by the bound bool
-//     `open` via data-class-open (RmlUi DataViewClass). The glue makes the
-//     surface visible BEFORE setting open=true (slide-in), and on close keeps it
-//     visible until the slide-OUT finishes — sequenced off the body's
-//     `transitionend`, routed to bind_event("dock_settled") (the existing event
-//     binding carries RmlUi's transitionend; no kernel change — see report).
-//
-//  2. PER-SLOT ENTER/SETTLE. Each freshly created `div.slot` plays the
-//     `slot-enter` @keyframes ONCE on creation (animation: ... 1 normal): it
-//     starts smaller + transparent + nudged up-left ("scaling down into a spot")
-//     and settles to full size/opacity in place. RmlUi runs the animation when
-//     the element is instanced, which is exactly when dirty("slots") grows the
-//     list — so a new minimize animates its card in with no extra binding.
-//
-// transform-origin keeps the slot scaling toward its own top-left so the grow
-// reads as "into the dock", within what a left-strip surface can convey (the
-// literal cross-screen flight needs an input-transparent overlay — report
-// change-req). RmlUi 6.2's `transform-origin` is an X-then-Y-then-Z shorthand
-// whose X axis takes only {left,center,right} (or length/percent) — so the
-// CSS-style `top left` is a parse error (top is not a valid X keyword). We use
-// the unambiguous percentage form `0% 0%` (= top-left); `left top` also parses.
-constexpr const char* kDockRml = R"RML(<rml>
-<head>
-<style>
-body.dock {
-    background-color: transparent;
-    padding: 8dp;
-    font-family: Noto Sans;
-    transform: translateX(-100%);
-    transition: transform 0.18s cubic-in-out;
-}
-body.dock.open {
-    transform: translateX(0px);
-}
-@keyframes slot-enter {
-    from {
-        opacity: 0;
-        transform: translateX(-12dp) scale(0.72);
-    }
-    to {
-        opacity: 1;
-        transform: translateX(0px) scale(1.0);
-    }
-}
-div.slot {
-    display: block;
-    position: relative;
-    width: 224dp;
-    height: 140dp;
-    min-height: 140dp;
-    margin-bottom: 8dp;
-    background-color: #2e2e32ff;
-    border-radius: 10dp;
-    overflow: hidden;
-    transform-origin: 0% 0%;
-    animation: slot-enter 0.16s cubic-out 1 normal;
-}
-div.slot div.thumb {
-    /* OVERSCAN the slot by 2dp on every side: RmlUi resolves the inset/percent
-       box anchored top-left, leaving the thumb ~2px short on the RIGHT so the
-       #2e2e32 slot placeholder peeked through there (diagnosed real-seat: the
-       sliver sampled as the placeholder, not the thumb). A negative inset makes
-       the thumb a few dp LARGER than the slot; the slot's rounded overflow:hidden
-       clips the overscan to the rounded card, so every edge is fully covered with
-       no placeholder peek and the corners stay rounded. cover/center keeps the
-       slightly-larger box fully covered + centered. */
-    display: block;
-    position: absolute;
-    left: -2dp;
-    top: -2dp;
-    right: -2dp;
-    bottom: -2dp;
-}
-div.slot span.title {
-    /* Title overlay INTENTIONALLY NOT RENDERED (user decision): the card is
-       thumbnail-only for now. display:none keeps the {{ row.title }} binding +
-       the bind_list_string("slots","title", …) getter LIVE and compiling so the
-       overlay can be re-enabled later by restoring `display: block`. The scrim
-       squared off the thumbnail's rounded bottom corners + protruded on the
-       right; hiding it lets all four corners round cleanly. */
-    display: none;
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    padding: 4dp 6dp;
-    background-color: #00000099;
-    color: #f2f2f2ff;
-    font-size: 13dp;
-    text-align: center;
-}
-</style>
-</head>
-<body data-model="ui" class="dock" data-class-open="open" data-event-transitionend="dock_settled()">
-<div data-for="row : slots" class="slot" data-event-click="restore(it_index)">
-<div class="thumb" data-style-decorator="'image( ' + row.preview + ' cover center center )'"/>
-<span class="title">{{ row.title }}</span>
-</div>
-</body>
-</rml>)RML";
+// The design rationale that was inlined here is preserved in the asset files'
+// own comments + the report (transparent per-pixel-alpha strip; the card is a
+// rounded overflow:hidden clip container with a full-bleed child carrying the
+// image() decorator — an element's OWN decorator is not clipped to its OWN
+// border-radius, so the preview rides on a child; image( <uri> cover center
+// center ) fit/align verified against vendored DecoratorTiled.cpp:220-251; the
+// -2dp thumb overscan clipped by the rounded overflow; d1 slot-enter animation;
+// transform-origin 0% 0%).
 
 class StageDockExtension final : public kernel::Extension, public TestProbe {
 public:
@@ -537,7 +378,9 @@ private:
         const layout::Box frame = layout::dock_box(m, 1.0); // fully revealed (c2)
 
         kernel::UiSurfaceSpec spec;
-        spec.rml_inline = kDockRml;
+        // External asset (RELATIVE to the asset root the orchestrator wires) so
+        // the dock document is editable without recompiling + dev hot-reloads.
+        spec.rml_path = "ext-stage-dock/dock.rml";
         spec.model = "ui";
         spec.x = frame.x;
         spec.y = frame.y;

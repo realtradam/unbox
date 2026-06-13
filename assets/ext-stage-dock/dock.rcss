@@ -1,0 +1,67 @@
+body.dock {
+    background-color: transparent;
+    padding: 8dp;
+    font-family: Noto Sans;
+    transform: translateX(-100%);
+    transition: transform 0.18s cubic-in-out;
+}
+body.dock.open {
+    transform: translateX(0px);
+}
+@keyframes slot-enter {
+    from {
+        opacity: 0;
+        transform: translateX(-12dp) scale(0.72);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0px) scale(1.0);
+    }
+}
+div.slot {
+    display: block;
+    position: relative;
+    width: 224dp;
+    height: 140dp;
+    min-height: 140dp;
+    margin-bottom: 8dp;
+    background-color: #2e2e32ff;
+    border-radius: 10dp;
+    overflow: hidden;
+    transform-origin: 0% 0%;
+    animation: slot-enter 0.16s cubic-out 1 normal;
+}
+div.slot div.thumb {
+    /* OVERSCAN the slot by 2dp on every side: RmlUi resolves the inset/percent
+       box anchored top-left, leaving the thumb ~2px short on the RIGHT so the
+       #2e2e32 slot placeholder peeked through there (diagnosed real-seat: the
+       sliver sampled as the placeholder, not the thumb). A negative inset makes
+       the thumb a few dp LARGER than the slot; the slot's rounded overflow:hidden
+       clips the overscan to the rounded card, so every edge is fully covered with
+       no placeholder peek and the corners stay rounded. cover/center keeps the
+       slightly-larger box fully covered + centered. */
+    display: block;
+    position: absolute;
+    left: -2dp;
+    top: -2dp;
+    right: -2dp;
+    bottom: -2dp;
+}
+div.slot span.title {
+    /* Title overlay INTENTIONALLY NOT RENDERED (user decision): the card is
+       thumbnail-only for now. display:none keeps the {{ row.title }} binding +
+       the bind_list_string("slots","title", …) getter LIVE and compiling so the
+       overlay can be re-enabled later by restoring `display: block`. The scrim
+       squared off the thumbnail's rounded bottom corners + protruded on the
+       right; hiding it lets all four corners round cleanly. */
+    display: none;
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 4dp 6dp;
+    background-color: #00000099;
+    color: #f2f2f2ff;
+    font-size: 13dp;
+    text-align: center;
+}

@@ -1,0 +1,11 @@
+<rml>
+<head>
+<link type="text/rcss" href="dock.rcss"/>
+</head>
+<body data-model="ui" class="dock" data-class-open="open" data-event-transitionend="dock_settled()">
+<div data-for="row : slots" class="slot" data-event-click="restore(it_index)">
+<div class="thumb" data-style-decorator="'image( ' + row.preview + ' cover center center )'"/>
+<span class="title">{{ row.title }}</span>
+</div>
+</body>
+</rml>
