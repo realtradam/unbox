@@ -14,6 +14,13 @@ recompile, NO restart (bindings/geometry preserved; a broken file keeps the old 
 Real-seat verified. Installed builds find assets via `-DUNBOX_ASSET_DIR_DEFAULT`.
 (9c0c0bf kernel, f852141 dock+build)
 
+**CONFIG HOT-RELOAD (always-on, user feature):** editing `~/.config/unbox/unbox.toml`
+re-applies keybindings LIVE — no restart. Backed by a general kernel primitive
+`Host::watch_file(path, cb) -> FileWatch` (RAII, coalesced, editor-save/create-safe,
+error-isolated; ONE session inotify also backs the UI hot-reload above). A
+malformed/mid-edit file keeps the current bindings + logs a warning (keys never
+drop). Real-seat verified. (3c1bde9 kernel watch_file, 9f7dc09 ext-keybindings)
+
 **Just landed — usability slice (user-driven, real-seat verified on the CF-AX3):**
 `ext-keybindings` (new core ext) reads keybindings from `unbox.toml`: tap-Super →
 spawn fuzzel, Alt+Tab / Alt+Shift+Tab → stable focus rotation over all toplevels,
