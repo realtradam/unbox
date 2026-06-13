@@ -235,12 +235,20 @@ div.slot {
     animation: slot-enter 0.16s cubic-out 1 normal;
 }
 div.slot div.thumb {
+    /* OVERSCAN the slot by 2dp on every side: RmlUi resolves the inset/percent
+       box anchored top-left, leaving the thumb ~2px short on the RIGHT so the
+       #2e2e32 slot placeholder peeked through there (diagnosed real-seat: the
+       sliver sampled as the placeholder, not the thumb). A negative inset makes
+       the thumb a few dp LARGER than the slot; the slot's rounded overflow:hidden
+       clips the overscan to the rounded card, so every edge is fully covered with
+       no placeholder peek and the corners stay rounded. cover/center keeps the
+       slightly-larger box fully covered + centered. */
     display: block;
     position: absolute;
-    left: 0;
-    top: 0;
-    right: 0;
-    bottom: 0;
+    left: -2dp;
+    top: -2dp;
+    right: -2dp;
+    bottom: -2dp;
 }
 div.slot span.title {
     /* Title overlay INTENTIONALLY NOT RENDERED (user decision): the card is

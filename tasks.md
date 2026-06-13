@@ -40,6 +40,13 @@ real-seat feel pending):**
   through; cards keep their panel), surface hugs the card stack (no full-height
   input capture), and re-minimize-after-empty fixed (stale `focused_`: restore now
   sets it directly since a non-defocused window's `focus()` is a seat no-op). (661166a)
+- CARD = ROUNDED THUMBNAIL (REAL-SEAT VERIFIED): the card IS the window preview,
+  rounded on all four corners — a full-bleed `image(... cover center)` decorator on
+  a child of a rounded `overflow:hidden` slot (RmlUi won't clip an element's OWN
+  decorator to its OWN radius → decorator lives on the clipped child). First use of
+  the substrate's RmlUi clipping path (scissor + stencil clip-mask); kernel verified
+  it correct + added 4 regression tests (6519ebf). Title overlay parked
+  (`display:none`, binding kept) for a later text redesign — user's call. (a743f44)
 
 **NEXT (needs user):**
 1. REAL-SEAT feel check (covers c2+d1): `~/start-unbox.sh -s foot`, Super+M minimizes
