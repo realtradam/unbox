@@ -1,5 +1,5 @@
 body.dock {
-    background-color: transparent;
+    background-color: #00000080;
     padding: 8dp;
     font-family: Noto Sans;
     transform: translateX(-100%);
