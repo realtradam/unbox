@@ -33,6 +33,13 @@ real-seat feel pending):**
   attrs, not `{{}}`) + font `Noto Sans` + valid `transform-origin`. REAL-SEAT
   VERIFIED: minimizing 2 foot windows shows 2 live preview snapshots in the dock;
   Super+M repeats with >1 window. (5ebd45a)
+- TRANSPARENCY + usability pass (REAL-SEAT VERIFIED): kernel — ui surfaces now
+  composite per-pixel alpha (stray opaque `Clear()` removed) AND `set_size` resizes
+  the render target (was logical-only; the slice-5 change-request) so a surface can
+  grow. (f1e12a3). ext-stage-dock — strip background transparent (windows show
+  through; cards keep their panel), surface hugs the card stack (no full-height
+  input capture), and re-minimize-after-empty fixed (stale `focused_`: restore now
+  sets it directly since a non-defocused window's `focus()` is a seat no-op). (661166a)
 
 **NEXT (needs user):**
 1. REAL-SEAT feel check (covers c2+d1): `~/start-unbox.sh -s foot`, Super+M minimizes
