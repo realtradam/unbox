@@ -20,23 +20,27 @@ revealed by a left-edge **swipe**. **Fork B** (see plan.md §2): previews are
 toplevel snapshots imported as textures into the RMLUi context, shown as `<img>`
 in one RML document. Waves (a number per wave runs in parallel = disjoint units):
 
-- **a1** — kernel/ui-substrate SPIKE (opus), Fork-B gate: snapshot a toplevel →
-  import into the RMLUi context → show as `<img>` in a ui surface, scaled, on
-  crocus (nested + headless render-node). New public surface: `Preview` +
-  `UiSubstrate::create_preview(...)`. If cross-context import fails → fall back to
-  Fork A before building further.
-- **b1** ext-xdg-shell: `Toplevel::hide()/show()` (≠ unmap) + `geometry()` +
-  `scene_tree()`. · **b2** kernel: UiSurface list/container bindings (the deferred
-  slice-6 list shape). · **b4** ext-stage-dock (new unit): skeleton + pure cores
-  (gesture recognizer + dock layout), doctest.
-- **c1** kernel (opus): gesture-claim input path (intercept edge-origin
-  pointer/touch before client+substrate; drag stream; client touch-cancel). ·
-  **c2** ext-stage-dock + host-bin: static integration — key-trigger minimize →
-  snapshot→slot→hide; tap slot→restore. (real-seat)
-- **d1** ext-stage-dock: animated minimize/restore via RCSS transitions. (real-seat)
+**Landed a1–d1 (committed; code-complete, all green build + build-asan 10/10 suites;
+real-seat feel pending):**
+- a1 kernel SPIKE — Fork-B GO on crocus: `Preview` + `create_preview(wlr_scene_tree*)`,
+  wlr pixels → dmabuf → EGLImage → sampled RMLUi texture → `<img>`. (7fed564)
+- b1 ext-xdg-shell — `Toplevel::hide()/show()` (≠ unmap) + `geometry()` + `scene_tree()`. (bdce81a)
+- b2 kernel — UiSurface list bindings (`bind_list`/`bind_list_string`/`bind_list_event`). (74c8071)
+- b4 ext-stage-dock (new unit) — skeleton + pure cores (reveal recognizer, dock layout). (d6535e8)
+- c2 ext-stage-dock + host-bin — Super+M minimize → preview slot → hide; tap → restore. (3376100)
+- d1 ext-stage-dock — RCSS dock slide-in + per-slot settle; restore instant. (b578327)
 
-Then e1 (gestural reveal + drag-out) and the config-driven keybinding migration
-(stage-dock triggers → ext-keybindings actions + ext-stage-dock Service) follow d1.
+**NEXT (needs user):**
+1. REAL-SEAT feel check (covers c2+d1): `~/start-unbox.sh -s foot`, Super+M minimizes
+   foot → its preview card slides into the 240px left dock; tap the card → foot
+   restores; minimizing the last window slides the dock out.
+2. BOUNDARY DECISION — the full cross-screen "window flies into the dock" flight (and
+   e1's drag-out grow-back) needs exactly ONE new kernel primitive: an
+   **input-transparent UiSurface flag** on `UiSurfaceSpec` (d1 proved animation-end is
+   already observable via `bind_event`; no timer/frame-tick needed). Approve it →
+   then c1 gesture-claim + e1 (edge reveal + drag-out), the config-driven
+   minimize-keybind migration (ext-keybindings action + a stage-dock Service), and
+   favicon (needs an XDG icon-theme dep) follow.
 
 Slice 6 (ext-taskbar + ext-launcher) is paused; the stage dock matures the same
 ui-substrate gaps it would have (list bindings, first real interactive consumer).
@@ -58,7 +62,7 @@ deprecated no-op `Options::ui_spike`, retiring host-bin's demo ui.
 | 7 | ext-window-tiling: pure layout core + thin scene glue | pending | layout math 100% doctest-covered, zero wlroots types in core |
 | 8 | ext-osk: RML keyboard ui surface injecting via wlr_seat | pending | type into foot via touch only; auto-show on text-input focus |
 | 9 | Session hardening: s6 user service, TTY launch on seat0, layout persistence (append-only state + pure reconcile on boot) | pending | survives `kill -9` + s6 restart with workspaces restored |
-| 10 | **Stage dock** (ext-stage-dock): minimized-window previews on a left-edge swipe (Fork B) | **in progress** | minimize→preview in dock→restore round-trips real-seat; previews are RMLUi-imported toplevel snapshots; gesture reveal follows the finger |
+| 10 | **Stage dock** (ext-stage-dock): minimized-window previews on a left-edge swipe (Fork B) | **a1–d1 landed** (real-seat pending) | DONE: Super+M minimize→RMLUi-imported preview snapshot→dock slot→hide; tap→restore; RCSS dock slide-in + slot settle. NEXT: real-seat feel + 1 boundary call (input-transparent UiSurface flag) → e1 gesture reveal/drag-out |
 
 ## Deferred decisions (decide when reached — see notes/plan.md §7)
 
