@@ -5,6 +5,7 @@
 #include <unbox/kernel/ui.hpp>
 #include <unbox/kernel/wlr.hpp>
 
+#include "file_watcher.hpp"
 #include "listener.hpp"
 #include "ui_substrate.hpp"
 
@@ -92,6 +93,16 @@ struct Server::Impl : detail::DisableSink {
     // Kernel-owned; torn down in shutdown() BEFORE scene/renderer/allocator. Its
     // per-extension facades (PerExtensionUi, one per HostImpl) borrow it.
     std::unique_ptr<Substrate> substrate;
+
+    // The ONE inotify-on-the-wl_event_loop file watcher for the session, shared
+    // by Host::watch_file (config + extensions) AND the substrate's asset
+    // hot-reload. Created lazily on the first watch (asset or watch_file) via
+    // file_watcher(); torn down in shutdown() BEFORE the display/loop dies (so
+    // its event source is removed while the loop is still alive).
+    std::unique_ptr<FileWatcher> watcher;
+    // Get-or-create the shared watcher (lazy). Returns nullptr only if there is
+    // no wl_event_loop (never in practice — the display always has one).
+    auto file_watcher() -> FileWatcher*;
 
     std::list<std::unique_ptr<Output>> outputs;
     std::list<std::unique_ptr<Keyboard>> keyboards;
@@ -256,6 +267,14 @@ protected:
     }
     void adopt_hook(detail::HookBase& hook) override { server_->register_hook(hook); }
     auto surface_store() -> detail::PointerAssoc& override { return server_->surface_assoc; }
+    auto register_file_watch(std::string path, std::function<void()> on_change)
+        -> FileWatch override {
+        FileWatcher* w = server_->file_watcher();
+        if (w == nullptr) {
+            return FileWatch{};
+        }
+        return w->add(path, std::move(on_change), id_);
+    }
 
 private:
     Server::Impl* server_;

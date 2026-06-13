@@ -376,11 +376,23 @@ void Server::Impl::start_substrate() {
     }
     // A data-event/getter throw disables the owning extension via the same
     // isolation path the bus uses (Server::Impl is the DisableSink). The
-    // wl_event_loop lets the substrate poll the dev hot-reload inotify fd
-    // (UNBOX_DEV-gated) without ever blocking the loop.
-    substrate = Substrate::create(display_egl, allocator, renderer,
-                                  wl_display_get_event_loop(display),
+    // substrate uses the kernel's ONE shared FileWatcher for (UNBOX_DEV-gated)
+    // asset hot-reload — the same watcher Host::watch_file uses for config.
+    substrate = Substrate::create(display_egl, allocator, renderer, file_watcher(),
                                   [this](ExtensionId who) { disable(who); });
+}
+
+auto Server::Impl::file_watcher() -> FileWatcher* {
+    // Lazily create the ONE shared inotify watcher on first use (config watch or
+    // asset hot-reload), carrying the kernel's disable sink for error isolation.
+    if (watcher == nullptr) {
+        if (display == nullptr) {
+            return nullptr;
+        }
+        watcher = std::make_unique<FileWatcher>(wl_display_get_event_loop(display),
+                                                [this](ExtensionId who) { disable(who); });
+    }
+    return watcher.get();
 }
 
 void Server::Impl::shutdown() {
@@ -396,8 +408,15 @@ void Server::Impl::shutdown() {
     extensions.clear();
 
     // The ui substrate owns scene nodes + GL objects on a sibling context and
-    // borrows scene/renderer/allocator: tear it down before they die.
+    // borrows scene/renderer/allocator: tear it down before they die. (Its asset
+    // FileWatch handles release here, removing those watches from the watcher.)
     substrate.reset();
+
+    // The shared file watcher removes its wl_event_loop source + closes the
+    // inotify fd here — AFTER every FileWatch holder (extensions, substrate) is
+    // gone, and while the display/loop is still alive (the source must be
+    // removed before wl_display_destroy).
+    watcher.reset();
 
     if (display != nullptr) {
         wl_display_destroy_clients(display);

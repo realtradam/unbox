@@ -36,6 +36,11 @@ class RenderInterface_GL3;
 
 namespace unbox::kernel {
 
+// The kernel's shared file watcher (src/file_watcher.hpp); the substrate borrows
+// it for (UNBOX_DEV-gated) asset hot-reload. Forward-declared to keep the header
+// free of inotify internals.
+class FileWatcher;
+
 // Callback the substrate invokes to disable an extension whose data-event
 // callback threw — injected by the kernel (Server::Impl). Mirrors the bus's
 // detail::DisableSink but scoped to the substrate so ui.hpp carries no kernel
@@ -124,11 +129,11 @@ class Substrate {
 public:
     // Build the substrate on the wlr renderer's EGLDisplay. `egl_display` may
     // be EGL_NO_DISPLAY (no gles2 renderer) — then available() is false and
-    // create_surface yields nullptr. `loop` is the kernel's wl_event_loop, used
-    // (dev only, UNBOX_DEV-gated) to poll the hot-reload inotify fd without ever
-    // blocking; pass nullptr to disable watching. Never throws.
+    // create_surface yields nullptr. `watcher` is the kernel's ONE shared
+    // FileWatcher, used (dev only, UNBOX_DEV-gated) for asset hot-reload; pass
+    // nullptr to disable watching. Never throws.
     static auto create(EGLDisplay egl_display, wlr_allocator* allocator,
-                       wlr_renderer* renderer, wl_event_loop* loop,
+                       wlr_renderer* renderer, FileWatcher* watcher,
                        SubstrateDisableFn disable) -> std::unique_ptr<Substrate>;
 
     ~Substrate();

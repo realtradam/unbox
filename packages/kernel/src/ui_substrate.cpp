@@ -1,5 +1,6 @@
 #include "ui_substrate.hpp"
 
+#include "file_watcher.hpp"
 #include "rmlui_renderer_gl3.h"
 
 #include <RmlUi/Core/Context.h>
@@ -19,12 +20,6 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2ext.h> // glEGLImageTargetTexture2DOES
 #include <GLES3/gl32.h>
-
-// inotify is libc (not wlroots), so it does NOT go through wlr.hpp. Integrated
-// into the kernel's wl_event_loop via wl_event_loop_add_fd so the fd is polled,
-// never blocking the loop.
-#include <sys/inotify.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -384,6 +379,10 @@ struct Surface {
     std::string rml_path;        // the spec's path (as the extension passed it)
     std::string resolved_path;   // absolute path actually loaded (file-backed only)
     bool doc_loaded = false;
+    // Dev asset hot-reload (UNBOX_DEV): a watch on resolved_path's dir whose
+    // callback flags this surface for reload. Released when the Surface dies
+    // (stops the underlying inotify watch). Inactive for inline/non-dev surfaces.
+    FileWatch asset_watch;
 
     // Data bindings. Each bound scalar pairs a getter with a stable slot the
     // getter writes into; RmlUi binds to the slot's address. Bound BEFORE the
@@ -605,36 +604,21 @@ struct Substrate::Impl {
 
     std::list<Surface> surfaces; // stable addresses (handles borrow Surface*)
 
-    // ---- Dev hot-reload watcher (UNBOX_DEV-gated; see top-of-file helpers) ----
-    // ONE inotify fd integrated into the wl_event_loop. We watch DIRECTORIES (not
-    // inodes) because editors save via temp-file + rename — IN_CLOSE_WRITE /
-    // IN_MOVED_TO on the dir, matched by filename, catches that reliably. Each
-    // watched dir maps to the file basenames in it that back a surface. Reloads
-    // are coalesced and applied at the next tick_all (debounce within a frame).
-    wl_event_loop* loop = nullptr;
-    int inotify_fd = -1;
-    wl_event_source* inotify_source = nullptr;
-    // inotify watch descriptor (one per watched directory) -> directory path.
-    std::unordered_map<int, std::string> watch_dirs;
-    // directory path -> the surfaces whose document (or same-dir RCSS/assets)
-    // live there. A change to ANY file in the dir reloads them (covers the .rml
-    // AND a sibling .rcss the document <link>s, with no need to parse links).
-    std::unordered_map<std::string, std::vector<Surface*>> dir_surfaces;
+    // ---- Dev asset hot-reload (UNBOX_DEV-gated) ----
+    // The substrate does NOT own an inotify fd: it borrows the kernel's ONE
+    // shared FileWatcher (injected at create). Each file-backed surface holds a
+    // FileWatch whose callback flags the surface in `pending_reloads`; the
+    // reload itself is applied (coalesced) at the next tick_all so it happens
+    // inside the frame, on the GL context, like every other render step. Only
+    // the DECISION to watch UI assets is UNBOX_DEV-gated — the watcher infra is
+    // always available (config watching via Host::watch_file is ungated).
+    FileWatcher* watcher = nullptr; // kernel-owned borrow (may be null: no loop)
     // surfaces flagged dirty by a file event, drained (coalesced) at tick_all.
     std::vector<Surface*> pending_reloads;
 
-    // Bring up the inotify fd + its wl_event_loop source (dev only). Idempotent;
-    // a failure leaves inotify_fd < 0 (watching simply disabled, no error).
-    void init_watcher(wl_event_loop* event_loop);
-    // Remove the event source + close the inotify fd (teardown / no surfaces).
-    void teardown_watcher();
-    // Watch the directory of `abs_file` and remember that `s` depends on it.
-    // No-op if hot-reload is disabled or the fd is unusable.
-    void watch_file_for(Surface* s, const std::string& abs_file);
-    // Stop tracking `s` across all watched dirs (on destroy / before re-watch).
+    // Stop flagging `s` for reload (on destroy). The FileWatch on the Surface
+    // itself stops the inotify watch when the Surface is erased.
     void unwatch_surface(Surface* s);
-    // Drain the inotify fd; flag dependent surfaces for reload (coalesced).
-    void on_inotify_readable();
     // Reload `s`'s document from its file, preserving context/model/bindings/
     // geometry/visibility/previews; error-isolated (keeps the old doc on a bad
     // parse). Returns true if a NEW document was installed. Caller holds nothing;
@@ -812,50 +796,7 @@ bool Substrate::Impl::init_surface_gl(Surface& s) {
     return true;
 }
 
-// ---- Document load (first) + dev hot-reload --------------------------------
-
-namespace {
-// wl_event_loop fd callback: just drains inotify (never blocks the loop).
-auto inotify_dispatch(int /*fd*/, std::uint32_t /*mask*/, void* data) -> int {
-    static_cast<Substrate::Impl*>(data)->on_inotify_readable();
-    return 0;
-}
-} // namespace
-
-void Substrate::Impl::init_watcher(wl_event_loop* event_loop) {
-    loop = event_loop;
-    if (!hot_reload_enabled() || loop == nullptr || inotify_fd >= 0) {
-        return;
-    }
-    inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (inotify_fd < 0) {
-        wlr_log(WLR_ERROR, "ui-substrate: inotify_init1 failed; hot-reload disabled");
-        return;
-    }
-    inotify_source = wl_event_loop_add_fd(loop, inotify_fd, WL_EVENT_READABLE,
-                                          inotify_dispatch, this);
-    if (inotify_source == nullptr) {
-        close(inotify_fd);
-        inotify_fd = -1;
-        wlr_log(WLR_ERROR, "ui-substrate: wl_event_loop_add_fd failed; hot-reload disabled");
-        return;
-    }
-    wlr_log(WLR_INFO, "ui-substrate: dev hot-reload ON (inotify watching asset dirs)");
-}
-
-void Substrate::Impl::teardown_watcher() {
-    if (inotify_source != nullptr) {
-        wl_event_source_remove(inotify_source);
-        inotify_source = nullptr;
-    }
-    if (inotify_fd >= 0) {
-        close(inotify_fd); // also drops all inotify watches
-        inotify_fd = -1;
-    }
-    watch_dirs.clear();
-    dir_surfaces.clear();
-    pending_reloads.clear();
-}
+// ---- Document load (first) + dev asset hot-reload --------------------------
 
 Rml::ElementDocument* Substrate::Impl::load_document_first(Surface& s) {
     Rml::ElementDocument* doc = nullptr;
@@ -867,9 +808,22 @@ Rml::ElementDocument* Substrate::Impl::load_document_first(Surface& s) {
                     s.rml_path.c_str(), s.resolved_path.c_str());
             return nullptr;
         }
-        // Dev-only: watch the document's directory for editor saves.
-        if (hot_reload_enabled()) {
-            watch_file_for(&s, s.resolved_path);
+        // Dev-only: register an asset hot-reload watch on the kernel's SHARED
+        // file watcher (the same machinery Host::watch_file uses). The callback
+        // flags this surface for reload, applied (coalesced) at the next
+        // tick_all on the GL context. Only this DECISION is UNBOX_DEV-gated; the
+        // watcher infra itself is always available.
+        if (hot_reload_enabled() && watcher != nullptr) {
+            Surface* sp = &s;
+            s.asset_watch = watcher->add(
+                s.resolved_path,
+                [this, sp] {
+                    if (std::find(pending_reloads.begin(), pending_reloads.end(), sp) ==
+                        pending_reloads.end()) {
+                        pending_reloads.push_back(sp);
+                    }
+                },
+                s.who);
         }
     } else {
         doc = s.context->LoadDocumentFromMemory(s.rml_inline);
@@ -882,72 +836,12 @@ Rml::ElementDocument* Substrate::Impl::load_document_first(Surface& s) {
     return doc;
 }
 
-void Substrate::Impl::watch_file_for(Surface* s, const std::string& abs_file) {
-    if (inotify_fd < 0) {
-        return;
-    }
-    std::error_code ec;
-    const std::string dir = std::filesystem::path(abs_file).parent_path().string();
-    if (dir.empty()) {
-        return;
-    }
-    auto& deps = dir_surfaces[dir];
-    if (std::find(deps.begin(), deps.end(), s) == deps.end()) {
-        deps.push_back(s);
-    }
-    // Add the dir watch once (inotify_add_watch on the same path returns the
-    // SAME wd, so this is idempotent — re-arming after a watched file is
-    // replaced is automatic since we watch the directory, not the inode).
-    const int wd = inotify_add_watch(inotify_fd, dir.c_str(),
-                                     IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
-    if (wd >= 0) {
-        watch_dirs[wd] = dir;
-    }
-}
-
 void Substrate::Impl::unwatch_surface(Surface* s) {
-    for (auto it = dir_surfaces.begin(); it != dir_surfaces.end();) {
-        auto& deps = it->second;
-        deps.erase(std::remove(deps.begin(), deps.end(), s), deps.end());
-        if (deps.empty()) {
-            it = dir_surfaces.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    // The Surface's own FileWatch (asset_watch) stops the inotify watch when the
+    // Surface is erased; here we just drop any queued reload so a destroyed
+    // surface is never reloaded.
     pending_reloads.erase(std::remove(pending_reloads.begin(), pending_reloads.end(), s),
                           pending_reloads.end());
-}
-
-void Substrate::Impl::on_inotify_readable() {
-    // Drain ALL queued inotify events (the fd is non-blocking; one readable
-    // notification may carry many). Flag every surface in a changed directory
-    // for reload — coalesced into pending_reloads (dedup) and applied once at
-    // the next tick_all, so a temp+rename burst causes a single reload.
-    alignas(struct inotify_event) char buf[4096];
-    for (;;) {
-        const ssize_t n = read(inotify_fd, buf, sizeof(buf));
-        if (n <= 0) {
-            break; // EAGAIN (drained) or closed
-        }
-        std::size_t off = 0;
-        while (off + sizeof(struct inotify_event) <= static_cast<std::size_t>(n)) {
-            auto* ev = reinterpret_cast<struct inotify_event*>(buf + off);
-            auto wd_it = watch_dirs.find(ev->wd);
-            if (wd_it != watch_dirs.end()) {
-                auto deps_it = dir_surfaces.find(wd_it->second);
-                if (deps_it != dir_surfaces.end()) {
-                    for (Surface* s : deps_it->second) {
-                        if (std::find(pending_reloads.begin(), pending_reloads.end(), s) ==
-                            pending_reloads.end()) {
-                            pending_reloads.push_back(s);
-                        }
-                    }
-                }
-            }
-            off += sizeof(struct inotify_event) + ev->len;
-        }
-    }
 }
 
 bool Substrate::Impl::reload_surface(Surface& s) {
@@ -1192,10 +1086,11 @@ bool Substrate::Impl::resize_surface_gl(Surface& s, int w, int h) {
 }
 
 void Substrate::Impl::destroy_surface(Surface* s) {
-    // Drop the hot-reload watch tracking for this surface FIRST (so a queued
-    // file event can never reload a dying surface). The inotify dir watch itself
-    // is left armed (cheap) and is reaped at teardown_watcher.
+    // Drop any queued reload for this surface FIRST (so a coalesced file event
+    // can never reload a dying surface). The surface's FileWatch (asset_watch)
+    // stops the underlying inotify watch when the Surface is erased below.
     unwatch_surface(s);
+    s->asset_watch.reset();
     const bool cur = gl.make_current();
     if (s->scene_buffer != nullptr) {
         wlr_scene_node_destroy(&s->scene_buffer->node);
@@ -1457,14 +1352,14 @@ void Substrate::Impl::destroy_preview(PreviewState* p) {
 // ---- Substrate (private surface) --------------------------------------------
 
 auto Substrate::create(EGLDisplay egl_display, wlr_allocator* allocator, wlr_renderer* renderer,
-                       wl_event_loop* loop, SubstrateDisableFn disable)
+                       FileWatcher* watcher, SubstrateDisableFn disable)
     -> std::unique_ptr<Substrate> {
     auto impl = std::make_unique<Impl>();
     impl->allocator = allocator;
     impl->renderer = renderer;
     impl->disable = std::move(disable);
+    impl->watcher = watcher; // shared kernel-owned file watcher (asset hot-reload)
     impl->gl.init(egl_display); // sets gl.ok; failure => unavailable substrate
-    impl->init_watcher(loop);   // dev-only (UNBOX_DEV); no-op otherwise
     return std::unique_ptr<Substrate>(new Substrate(std::move(impl)));
 }
 
@@ -1482,7 +1377,8 @@ Substrate::~Substrate() {
     while (!impl_->surfaces.empty()) {
         impl_->destroy_surface(&impl_->surfaces.front());
     }
-    impl_->teardown_watcher(); // remove the wl_event_loop source + close the fd
+    // The shared FileWatcher is kernel-owned (NOT the substrate's): each
+    // surface's FileWatch released above already removed its asset watch.
     impl_->gl.teardown();
 }
 

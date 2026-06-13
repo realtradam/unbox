@@ -138,6 +138,18 @@ spike retired into this — same GL bridge mechanics, now per-surface + real):
 - **`Server::ui_*` probes are test instrumentation only** (frame_count,
   orientation, fence_sync_active, touch override, element width) — replaced the
   spike's `ui_spike_*`. Extensions drive the substrate via `Host::ui()`.
+- **The substrate does NOT own an inotify fd.** `UiSurfaceSpec::rml_path` asset
+  hot-reload (UNBOX_DEV-gated) is registered on the kernel's ONE shared
+  `FileWatcher` (`src/file_watcher.{hpp,cpp}`) — the same machinery that backs the
+  public `Host::watch_file`/`FileWatch` service (config hot-reload, UNGATED). Each
+  file-backed `Surface` holds a `FileWatch` whose callback flags it in
+  `pending_reloads`, applied (coalesced) at the next `tick_all` on the GL context.
+  ONE inotify instance per session, created lazily on the first watch (asset OR
+  watch_file). Only the *decision* to watch UI assets is UNBOX_DEV-gated; the
+  watcher infra is always available. Watches are dir-watches (editor temp+rename
+  safe) matched by basename; teardown order: extensions' FileWatch members →
+  substrate (surface FileWatches) → `Server::Impl::watcher.reset()` (removes the
+  wl_event_loop source while the loop is still alive) → display destroy.
 
 Shared GL/EGL/dmabuf lessons (carried from the spike, still load-bearing):
 

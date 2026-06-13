@@ -2,9 +2,13 @@
 
 #include <unbox/kernel/hooks.hpp>
 #include <unbox/kernel/surface_registry.hpp>
+#include <unbox/kernel/watch.hpp>
 #include <unbox/kernel/wlr.hpp>
 
 #include <cstdint>
+#include <functional>
+#include <string>
+#include <string_view>
 #include <typeindex>
 
 namespace unbox::kernel {
@@ -193,6 +197,29 @@ public:
     // present — UiSubstrate::available()/create_surface report that.)
     [[nodiscard]] virtual auto ui() -> UiSubstrate& = 0;
 
+    // ---- File watching (config / asset hot-reload) ----
+    // Watch `path` for content changes. `on_change()` is invoked on the
+    // event-loop thread, COALESCED/debounced (one save = one call even though an
+    // editor emits several inotify events per save), whenever the file is
+    // written. EDITOR-SAFE: editors save by writing a temp file then renaming it
+    // over the target (the inode changes), so the kernel watches the containing
+    // DIRECTORY for the basename — it also fires when the file is CREATED if it
+    // does not exist yet. The callback is ERROR-ISOLATED to YOUR extension: a
+    // throw out of it disables your extension (same boundary as a hook/getter),
+    // never the session. RE-ENTRANCY-SAFE: a callback may create or destroy
+    // watches (including its own). The watch lives until the returned FileWatch
+    // handle is destroyed/reset — hold it as a member of your extension.
+    //
+    // Works regardless of UNBOX_DEV (config hot-reload is a user feature); the
+    // kernel creates the single shared inotify watcher lazily on the first
+    // watch. `path` should be the path you want to track (resolve it yourself if
+    // relative — the kernel watches it verbatim). A backend with no event loop
+    // yields an inactive handle (active() == false).
+    [[nodiscard]] auto watch_file(std::string_view path, std::function<void()> on_change)
+        -> FileWatch {
+        return register_file_watch(std::string(path), std::move(on_change));
+    }
+
     // ---- Kernel event catalogue ----
     // Subscribe through these to react to kernel-owned input/output. Each
     // returns an Event/Filter you subscribe to with YOUR extension id (the
@@ -303,6 +330,12 @@ protected:
 
     // Bind an extension-exported hook to the isolation registry (see adopt()).
     virtual void adopt_hook(detail::HookBase& hook) = 0;
+
+    // Non-template file-watch core (the watch_file shim above injects YOUR id
+    // for error isolation). Registers on the kernel's shared inotify watcher.
+    [[nodiscard]] virtual auto register_file_watch(std::string path,
+                                                   std::function<void()> on_change)
+        -> FileWatch = 0;
 
     // The kernel-owned, session-wide surface->tree association store (shared by
     // ALL extensions; the host_surface/scene_tree_for shims above route here).

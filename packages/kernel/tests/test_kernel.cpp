@@ -1578,6 +1578,174 @@ TEST_CASE("substrate: a malformed hot-reload is isolated; old doc kept; recovers
 }
 
 // ============================================================================
+// slice-10 / watch_file SERVICE. The inotify-on-the-wl_event_loop machinery is
+// now a typed RAII kernel service (Host::watch_file -> FileWatch) backed by ONE
+// session inotify instance (shared with the substrate's asset hot-reload). Works
+// regardless of UNBOX_DEV. These run on the headless backend (no GL needed); we
+// pump the wl_event_loop in-test and use real temp files.
+// ============================================================================
+
+namespace {
+
+using unbox::kernel::FileWatch;
+
+// An extension that registers a watch_file on the path it is constructed with
+// and counts callbacks. Holds the FileWatch as a member (RAII).
+class WatchTestExtension : public unbox::kernel::Extension {
+public:
+    explicit WatchTestExtension(std::string path, bool throw_on_change = false)
+        : path_(std::move(path)), throw_(throw_on_change) {}
+    auto manifest() const -> const Manifest& override { return manifest_; }
+    void activate(Host& host) override {
+        watch_ = host.watch_file(path_, [this] {
+            ++hits;
+            if (throw_) {
+                throw std::runtime_error("watch callback boom");
+            }
+        });
+    }
+    [[nodiscard]] auto watch_active() const -> bool { return watch_.active(); }
+    void drop_watch() { watch_.reset(); }
+    int hits = 0;
+
+private:
+    std::string path_;
+    bool throw_;
+    Manifest manifest_{"watch-test", Tier::standard, {}};
+    FileWatch watch_;
+};
+
+// Pump the loop until `pred` is true or `max_turns` dispatches elapse.
+template <typename Pred>
+void pump_until(unbox::kernel::Server& s, Pred pred, int max_turns = 100) {
+    for (int i = 0; i < max_turns && !pred(); ++i) {
+        s.dispatch(20);
+    }
+}
+
+auto temp_path(const char* tag) -> std::filesystem::path {
+    auto dir = std::filesystem::temp_directory_path() / "unbox-kernel-tests";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir / (std::string("watch-") + tag + "-" + std::to_string(::getpid()) + ".txt");
+}
+
+} // namespace
+
+TEST_CASE("watch_file: fires on write, coalesced to one callback") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "pixman", 1); // no GL needed: this is the bare watcher
+
+    const auto path = temp_path("write");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    REQUIRE(write_file(path, "v1")); // exists before the watch
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new WatchTestExtension(path.string());
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    REQUIRE(ext->watch_active());
+
+    pump(*server, 3); // settle
+    CHECK(ext->hits == 0); // no write yet
+
+    REQUIRE(write_file(path, "v2"));              // one save
+    pump_until(*server, [&] { return ext->hits >= 1; });
+    CHECK(ext->hits == 1);                         // fired, coalesced to once
+
+    // A second save fires again (still one per save).
+    REQUIRE(write_file(path, "v3"));
+    pump_until(*server, [&] { return ext->hits >= 2; });
+    CHECK(ext->hits == 2);
+
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("watch_file: fires when a not-yet-existing file is CREATED") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "pixman", 1);
+
+    const auto path = temp_path("create");
+    std::error_code ec;
+    std::filesystem::remove(path, ec); // ensure it does NOT exist
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new WatchTestExtension(path.string());
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    REQUIRE(ext->watch_active()); // watch armed on the (existing) parent dir
+
+    pump(*server, 3);
+    CHECK(ext->hits == 0);
+
+    REQUIRE(write_file(path, "born")); // create the file
+    pump_until(*server, [&] { return ext->hits >= 1; });
+    CHECK(ext->hits >= 1); // fired on CREATE
+
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("watch_file: RAII — after the handle is destroyed, no more callbacks") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "pixman", 1);
+
+    const auto path = temp_path("raii");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    REQUIRE(write_file(path, "v1"));
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new WatchTestExtension(path.string());
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+
+    REQUIRE(write_file(path, "v2"));
+    pump_until(*server, [&] { return ext->hits >= 1; });
+    CHECK(ext->hits == 1);
+
+    // Drop the watch; a further write must NOT call back.
+    ext->drop_watch();
+    CHECK_FALSE(ext->watch_active());
+    REQUIRE(write_file(path, "v3"));
+    pump(*server, 10); // give inotify ample time
+    CHECK(ext->hits == 1); // unchanged
+
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("watch_file: a throwing on_change is isolated; the session survives") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "pixman", 1);
+
+    const auto path = temp_path("throw");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    REQUIRE(write_file(path, "v1"));
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new WatchTestExtension(path.string(), /*throw_on_change=*/true);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+
+    // The throwing callback must be caught at the watcher boundary: dispatch
+    // returns cleanly (no exception escapes the loop) and the server keeps
+    // running. (Its extension is disabled by the same isolation path as a
+    // throwing hook/getter; the session is unharmed.)
+    REQUIRE(write_file(path, "v2"));
+    bool dispatched_ok = true;
+    for (int i = 0; i < 100 && ext->hits == 0; ++i) {
+        dispatched_ok = server->dispatch(20) && dispatched_ok;
+    }
+    CHECK(ext->hits >= 1);      // the callback ran (and threw)
+    CHECK(dispatched_ok);       // the loop dispatched cleanly across the throw
+    // Session still alive: a further dispatch still succeeds.
+    CHECK(server->dispatch(5));
+
+    std::filesystem::remove(path, ec);
+}
+
+// ============================================================================
 // VT-switch escape hatch — PURE CORE (no wlroots): keysym -> VT number. The
 // glue (input.cpp) calls wlr_session_change_vt on a hit and consumes; this
 // helper decides the hit. Ctrl+Alt+Fn arrives as XF86Switch_VT_1..12.
