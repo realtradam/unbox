@@ -60,14 +60,26 @@ constexpr int kDockWidth = 240;
 // can be sized (via dock_layout::content_height) to hug the rendered card stack
 // rather than the full output height. dp == px (substrate dp-ratio is 1.0), so
 // these are the RCSS dp values:
-//   kCardHeight  — one div.slot's OUTER (border-box) height: padding 6dp*2 (=12)
-//     + img.preview 84dp + span.title (margin-top 4dp + ~one 13dp line). Rounded
-//     UP to 124 so RmlUi's exact line-box height never clips a card (over-sizing
-//     the transparent surface by a few px is harmless; clipping a card is not).
+//   kCardHeight  — one div.slot's OUTER (border-box) height. The card IS the
+//     preview now (a full-bleed `div.thumb` child carries the image() decorator
+//     and the rounded `overflow:hidden` slot clips it; the title is OVERLAID
+//     absolute at the bottom — neither child adds to the box height). The card is
+//     a FIXED EXPLICIT box: `div.slot { width: 224dp; height: 140dp; }`. Both
+//     dimensions MUST be explicit: the slot's only children are out-of-flow
+//     (absolute), so an auto/`width:100%` box has no in-flow content and
+//     COLLAPSED (decorators paint inside the box but contribute NO layout size) —
+//     only a ~10dp sliver of the rounded edge rendered. The explicit 224dp ×
+//     140dp box fixes that. 224 = the dock inner width (240 dock_width - 2*8dp
+//     body padding); 140 ≈ a 16:10 landscape card at 224 wide (224*10/16=140), a
+//     sane thumbnail aspect. A fixed box keeps the surface-hugging math
+//     deterministic; the thumb decorator's `cover center center` fit fills the
+//     box (centered) for any source aspect without distortion (cropping overflow).
 //   kCardGap     — the inter-card vertical space (div.slot margin-bottom: 8dp).
 //   kStripPad    — the strip's inner top/bottom margin (body.dock padding: 8dp).
 // content_height(count) = 2*kStripPad + count*kCardHeight + (count-1)*kCardGap.
-constexpr int kCardHeight = 124;
+// MUST stay in lockstep with the RCSS height/margin/padding AND with
+// tests/test_policy.cpp's expected hug heights.
+constexpr int kCardHeight = 140;
 constexpr int kCardGap = 8;
 constexpr int kStripPad = 8;
 
@@ -94,20 +106,71 @@ struct Slot {
 // with per-pixel alpha (ui.hpp UiSurface §PER-PIXEL ALPHA): any pixel body.dock
 // does not paint is fully transparent and the windows BELOW show through. So
 // `body.dock` paints NO background (`background-color: transparent`) — only the
-// `div.slot` CARDS paint (their `#2e2e32ff` panel), reading as cards floating
-// over the window with the empty strip see-through. NOTE the substrate still
-// consumes pointer/touch over the whole surface RECT regardless of visual
-// transparency (slice-5 consumption model), so the surface is sized to HUG the
-// card stack (see content_height in create/refresh) — the rest of the screen
-// stays interactive. A real input-transparent strip needs a deferred
-// UiSurfaceSpec flag (report change-req).
+// `div.slot` CARDS paint, reading as cards floating over the window with the
+// empty strip see-through. The card corners are ROUNDED (border-radius), so the
+// pixels OUTSIDE the rounded corners are unpainted and show the window through —
+// that is correct/intended. NOTE the substrate still consumes pointer/touch over
+// the whole surface RECT regardless of visual transparency (slice-5 consumption
+// model), so the surface is sized to HUG the card stack (see content_height in
+// create/refresh) — the rest of the screen stays interactive. A real
+// input-transparent strip needs a deferred UiSurfaceSpec flag (report
+// change-req).
 //
-// The img src is the Preview source_uri(), bound via
-// `data-attr-src="row.preview"` — RmlUi interpolates {{ }} only in TEXT, so an
-// element attribute must use the data-attr-<attr> attribute-binding form
-// (verified against vendored RmlUi 6.2: data_binding/options samples). The
-// title is TEXT, so {{ row.title }} is correct there. data-event-click delivers
-// the row index to restore().
+// CARD = PREVIEW (the card IS the image). The card structure is a ROUNDED CLIP
+// CONTAINER holding a FULL-BLEED preview child plus a title overlay:
+//
+//   <div class="slot">                                   -- rounded clip box
+//     <div class="thumb" data-style-decorator="..."/>    -- full-bleed preview
+//     <span class="title">{{ row.title }}</span>         -- bottom scrim overlay
+//   </div>
+//
+// WHY a child carries the decorator (not div.slot itself): an element's OWN
+// image() decorator is NOT clipped to its OWN border-radius — a background-color
+// rounds via geometry, but a decorator needs the clip MASK, which an element's
+// self-render never sets (RmlUi-core behaviour, confirmed by the kernel owner's
+// substrate-renderer investigation: its scissor+stencil clip is correct and
+// DOES clip a CHILD's image() decorator to a parent's rounded overflow:hidden
+// corners — even with a transform and across set_size). So `div.slot` is the
+// rounded clip container (`border-radius: 10dp; overflow: hidden;`) and the
+// preview rides on a full-bleed child `div.thumb` (position:absolute, all four
+// insets 0) whose decorator content is clipped to the rounded corners by the
+// parent. Putting the decorator on the rounded slot directly produced SQUARE
+// corners — that was the bug.
+//
+// The decorator is bound per row via the "style" data view (RmlUi 6.2 registers
+// the "style" data view, Factory.cpp:242; same runtime-property-string pattern
+// as the vendored data-style-transform samples):
+//   data-style-decorator="'image( ' + row.preview + ' cover center center )'"
+// SHORTHAND ORDER (verified in vendored DecoratorTiled.cpp:220-251,
+// RegisterTileProperty("image", true)): the `image` shorthand is FallThrough
+// over  image-src, image-orientation, image-fit, image-align-x, image-align-y.
+// FallThrough is not strictly positional — a value that fails one property's
+// parser falls through to the next (PropertySpecification.cpp:384-398). So after
+// the URI (image-src, "string" parser), `cover` fails image-orientation
+// (keywords none|flip-*|rotate-180) and falls through to image-fit (keywords
+// fill|contain|cover|scale-none|scale-down|repeat*) -> cover; `center` ->
+// image-align-x (left|center|right); `center` -> image-align-y (top|center|
+// bottom). Net: COVER fit, CENTER/CENTER align — the preview fills the whole
+// card centered, cropping overflow, undistorted for any source aspect. The
+// `unbox-preview://N` URI resolves the SAME imported texture an <img src> would:
+// both Decorator and ElementImage go through RenderManager::LoadTexture (vendored
+// Decorator.cpp:61-69 + ElementImage.cpp:251).
+//
+// EMPTY / not-yet-previewed slot: `div.slot { background-color: #2e2e32ff; }` is
+// a dark PLACEHOLDER fill (a background-color DOES round by geometry, so it stays
+// rounded). A slot can exist before its Preview texture is ready (or on a no-GL
+// backend) — then row.preview is "" and `image(  cover center center )` fails to
+// instance a decorator on the thumb child (returns nullptr, no crash), leaving
+// the rounded dark fill visible so the card is never invisible. The fixed box
+// keeps it min-height/tappable; data-event-click="restore(it_index)" on the slot
+// is unchanged.
+//
+// TITLE OVERLAY: the title sits ON the preview as the LAST child (drawn above the
+// thumb), `position:absolute` pinned to the card bottom (left:0/right:0/bottom:0,
+// width auto) with a translucent dark scrim (`background-color: #00000099`)
+// behind the text so it stays legible over any preview; the parent's
+// overflow:hidden + border-radius clips the scrim's bottom corners to match the
+// card. The title is TEXT, so {{ row.title }} is correct there.
 //
 // d1 animation (RCSS, RMLUi 6.2; verified against the vendored source):
 //
@@ -160,24 +223,40 @@ body.dock.open {
 }
 div.slot {
     display: block;
-    min-height: 40dp;
+    position: relative;
+    width: 224dp;
+    height: 140dp;
+    min-height: 140dp;
     margin-bottom: 8dp;
-    padding: 6dp;
     background-color: #2e2e32ff;
     border-radius: 10dp;
+    overflow: hidden;
     transform-origin: 0% 0%;
     animation: slot-enter 0.16s cubic-out 1 normal;
 }
-div.slot img.preview {
+div.slot div.thumb {
     display: block;
-    width: 100%;
-    height: 84dp;
-    border-radius: 6dp;
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
 }
 div.slot span.title {
-    display: block;
-    margin-top: 4dp;
-    color: #e6e6e6ff;
+    /* Title overlay INTENTIONALLY NOT RENDERED (user decision): the card is
+       thumbnail-only for now. display:none keeps the {{ row.title }} binding +
+       the bind_list_string("slots","title", …) getter LIVE and compiling so the
+       overlay can be re-enabled later by restoring `display: block`. The scrim
+       squared off the thumbnail's rounded bottom corners + protruded on the
+       right; hiding it lets all four corners round cleanly. */
+    display: none;
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 4dp 6dp;
+    background-color: #00000099;
+    color: #f2f2f2ff;
     font-size: 13dp;
     text-align: center;
 }
@@ -185,7 +264,7 @@ div.slot span.title {
 </head>
 <body data-model="ui" class="dock" data-class-open="open" data-event-transitionend="dock_settled()">
 <div data-for="row : slots" class="slot" data-event-click="restore(it_index)">
-<img class="preview" data-attr-src="row.preview"/>
+<div class="thumb" data-style-decorator="'image( ' + row.preview + ' cover center center )'"/>
 <span class="title">{{ row.title }}</span>
 </div>
 </body>

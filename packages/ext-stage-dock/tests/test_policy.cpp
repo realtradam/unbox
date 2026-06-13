@@ -192,22 +192,24 @@ TEST_CASE("content_height: 0/1/many slots") {
 // height — so the transparent strip captures input only over the cards (brief
 // §3: the substrate consumes input over the whole rect regardless of visual
 // transparency). These are the exact px values the surface height takes, with
-// the card-stack metrics that mirror the kDockRml RCSS (kCardHeight=124 outer
-// card height, kCardGap=8 inter-card margin, kStripPad=8 body padding). Keep in
-// lockstep with src/extension.cpp's kCard*/kStripPad constants + dock_metrics().
+// the card-stack metrics that mirror the kDockRml RCSS (kCardHeight=140 — the
+// card IS the preview now, a fixed 16:10-ish box with the title OVERLAID (the
+// title no longer adds to the box height); kCardGap=8 inter-card margin;
+// kStripPad=8 body padding). Keep in lockstep with src/extension.cpp's
+// kCard*/kStripPad constants + dock_metrics().
 TEST_CASE("dock surface height hugs the card stack (content_height with RCSS card metrics)") {
-    // Mirror src/extension.cpp: kCardHeight=124, kCardGap=8, kStripPad=8.
+    // Mirror src/extension.cpp: kCardHeight=140, kCardGap=8, kStripPad=8.
     lay::DockMetrics card{.output_w = 1920, .output_h = 1080, .dock_width = 240,
-                          .slot_height = 124, .gap = 8, .pad = 8};
+                          .slot_height = 140, .gap = 8, .pad = 8};
     // Empty dock -> 0 content (but the SURFACE is clamped positive, below).
     CHECK(lay::content_height(card, 0) == 0);
     // One card -> 2*pad + card (no trailing gap).
-    CHECK(lay::content_height(card, 1) == 2 * 8 + 124);                   // 140
+    CHECK(lay::content_height(card, 1) == 2 * 8 + 140);                   // 156
     // Two cards -> +gap between them.
-    CHECK(lay::content_height(card, 2) == 2 * 8 + 2 * 124 + 1 * 8);       // 272
+    CHECK(lay::content_height(card, 2) == 2 * 8 + 2 * 140 + 1 * 8);       // 304
     // Many cards grow linearly and stay FAR under the full output height, so the
     // surface never spans the whole left edge (the hug-the-cards property).
-    CHECK(lay::content_height(card, 4) == 2 * 8 + 4 * 124 + 3 * 8);       // 536
+    CHECK(lay::content_height(card, 4) == 2 * 8 + 4 * 140 + 3 * 8);       // 600
     CHECK(lay::content_height(card, 4) < card.output_h);                  // < 1080
 }
 
@@ -220,7 +222,7 @@ TEST_CASE("dock surface height hugs the card stack (content_height with RCSS car
 // case the headless test cannot distinguish from the substrate-null path.
 TEST_CASE("surface_height is ALWAYS positive (empty-dock 0-geometry guard)") {
     lay::DockMetrics card{.output_w = 1920, .output_h = 1080, .dock_width = 240,
-                          .slot_height = 124, .gap = 8, .pad = 8};
+                          .slot_height = 140, .gap = 8, .pad = 8};
     // The empty dock: content_height is 0, but the surface height is clamped to 1.
     CHECK(lay::content_height(card, 0) == 0);
     CHECK(lay::surface_height(card, 0) == 1);   // positive placeholder (hidden)
