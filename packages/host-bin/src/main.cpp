@@ -2,6 +2,7 @@
 
 #include <unbox/ext-keybindings/ext_keybindings.hpp>
 #include <unbox/ext-layer-shell/ext_layer_shell.hpp>
+#include <unbox/ext-stage-dock/ext_stage_dock.hpp>
 #include <unbox/ext-xdg-shell/ext_xdg_shell.hpp>
 #include <unbox/kernel/kernel.hpp>
 #include <unbox/kernel/server.hpp>
@@ -51,6 +52,10 @@ auto main(int argc, char* argv[]) -> int {
         server->install(unbox::ext_xdg_shell::create());
         server->install(unbox::ext_layer_shell::create());
         server->install(unbox::ext_keybindings::create(config_path));
+        // The stage dock: Super+M minimizes the focused window into a left-edge
+        // dock of previews; tap a preview to restore. Standard tier, hidden until
+        // it holds a minimized window (depends_on xdg-shell, topo-activated).
+        server->install(unbox::ext_stage_dock::create());
         if (ui_demo) {
             server->install(unbox::host_bin::create_demo_ui());
         }
