@@ -14,12 +14,34 @@ out. Kernel now exports `WAYLAND_DISPLAY` so extension-spawned clients reach unb
 Follow-up: Ctrl+Alt+F1..F12 VT switching is now kernel-hardwired (the session
 escape hatch).
 
-**Next action:** Slice 6 — ext-taskbar + ext-launcher (first standard
-extensions; prove the ui-substrate contract). Queued into it from
-slice 5: list/container data bindings (taskbar will change-request the
-shape), keyboard-into-ui-surfaces (launcher text input), kernel removes
-the deprecated no-op `Options::ui_spike` field, host-bin's demo ui
-extension retires (replaced by the real consumers).
+**Active — Slice 10: stage dock** (user-driven; supersedes slice 6 as the next
+UI work). The Stage-Manager-style left-edge dock of minimized-window **previews**,
+revealed by a left-edge **swipe**. **Fork B** (see plan.md §2): previews are
+toplevel snapshots imported as textures into the RMLUi context, shown as `<img>`
+in one RML document. Waves (a number per wave runs in parallel = disjoint units):
+
+- **a1** — kernel/ui-substrate SPIKE (opus), Fork-B gate: snapshot a toplevel →
+  import into the RMLUi context → show as `<img>` in a ui surface, scaled, on
+  crocus (nested + headless render-node). New public surface: `Preview` +
+  `UiSubstrate::create_preview(...)`. If cross-context import fails → fall back to
+  Fork A before building further.
+- **b1** ext-xdg-shell: `Toplevel::hide()/show()` (≠ unmap) + `geometry()` +
+  `scene_tree()`. · **b2** kernel: UiSurface list/container bindings (the deferred
+  slice-6 list shape). · **b4** ext-stage-dock (new unit): skeleton + pure cores
+  (gesture recognizer + dock layout), doctest.
+- **c1** kernel (opus): gesture-claim input path (intercept edge-origin
+  pointer/touch before client+substrate; drag stream; client touch-cancel). ·
+  **c2** ext-stage-dock + host-bin: static integration — key-trigger minimize →
+  snapshot→slot→hide; tap slot→restore. (real-seat)
+- **d1** ext-stage-dock: animated minimize/restore via RCSS transitions. (real-seat)
+
+Then e1 (gestural reveal + drag-out) and the config-driven keybinding migration
+(stage-dock triggers → ext-keybindings actions + ext-stage-dock Service) follow d1.
+
+Slice 6 (ext-taskbar + ext-launcher) is paused; the stage dock matures the same
+ui-substrate gaps it would have (list bindings, first real interactive consumer).
+Still queued whenever UI work resumes: keyboard-into-ui-surfaces, removing the
+deprecated no-op `Options::ui_spike`, retiring host-bin's demo ui.
 
 ## Slices
 
@@ -36,6 +58,7 @@ extension retires (replaced by the real consumers).
 | 7 | ext-window-tiling: pure layout core + thin scene glue | pending | layout math 100% doctest-covered, zero wlroots types in core |
 | 8 | ext-osk: RML keyboard ui surface injecting via wlr_seat | pending | type into foot via touch only; auto-show on text-input focus |
 | 9 | Session hardening: s6 user service, TTY launch on seat0, layout persistence (append-only state + pure reconcile on boot) | pending | survives `kill -9` + s6 restart with workspaces restored |
+| 10 | **Stage dock** (ext-stage-dock): minimized-window previews on a left-edge swipe (Fork B) | **in progress** | minimize→preview in dock→restore round-trips real-seat; previews are RMLUi-imported toplevel snapshots; gesture reveal follows the finger |
 
 ## Deferred decisions (decide when reached — see notes/plan.md §7)
 

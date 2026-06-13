@@ -54,6 +54,20 @@
 | **keybinding** | A key-combo → action mapping declared in `unbox.toml` (`[[keybind]]`), matched on the kernel's `key_filter`. Owned by ext-keybindings. | shortcut, hotkey, accelerator |
 | **action** | The verb a keybinding triggers: `spawn`, `focus-next`, `focus-prev`, `close-active`, `quit`. | command (reserved for the `spawn` shell string) |
 | **tap binding** | A keybinding on a bare modifier (e.g. `"Super"`) that fires on release only if it was pressed and released with nothing in between. | — |
+| **gesture** | A recognized touch/pointer motion pattern an extension CLAIMS before clients see it (the touch analogue of the key_filter consume-or-pass). Recognition is a pure core; the claim/intercept is a kernel mechanism. | — |
+| **swipe** | A straight-line gesture; e.g. the left-edge swipe that reveals the stage dock. | fling, drag (when meaning a recognized swipe) |
+
+## Stage dock (ext-stage-dock)
+
+| Term | Meaning | Aliases to avoid |
+|---|---|---|
+| **stage dock** | The left-edge ui surface holding window **previews**, revealed by an edge **swipe** (and, in a future slice, **stages**). One RML document in the overlay scene layer. Owned by ext-stage-dock (standard tier). | sidebar, shelf, dock (bare), taskbar, panel |
+| **stage** | RESERVED — a future workspace-like grouping shown in the stage dock. NOT implemented; do not use the word for anything else yet. | (reserved) |
+| **preview** | A frozen, graphically scaled image of a toplevel's pixels, snapshotted at minimize time and imported as a texture the ui substrate shows inside a ui surface (a stage-dock slot). NOT live. | thumbnail, snapshot, mini-window |
+| **favicon** | The application icon shown on a preview, resolved from the toplevel's `app_id` via the XDG icon theme. (User-chosen term, overriding the usual "app icon".) | app icon, icon (when meaning this) |
+| **minimize** | Compositor-side: hide a toplevel into the stage dock as a preview. The toplevel stays MAPPED (no xdg unmap); its scene node detaches and frame callbacks cease. The hide/show MECHANISM is ext-xdg-shell's `Toplevel::hide()/show()`; "minimized" STATE + dock placement are ext-stage-dock policy. | iconify, hide (bare) |
+| **restore** | Return a minimized toplevel to the normal layer at its prior geometry and focus it; its preview leaves the dock. | unminimize, unhide |
+| **reveal** | The proportional, finger-following show/hide of the stage dock driven by the edge swipe (fraction 0..1); release snaps fully open or closed. | slide, animate (bare) |
 
 ## Workflow
 
