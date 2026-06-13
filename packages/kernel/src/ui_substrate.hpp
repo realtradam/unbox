@@ -97,6 +97,17 @@ public:
     void bind_bool(std::string_view name, std::function<bool()> getter) override;
     void bind_string(std::string_view name, std::function<std::string()> getter) override;
     void bind_event(std::string_view name, std::function<void()> callback) override;
+    void bind_list(std::string_view name, std::function<std::size_t()> count) override;
+    void bind_list_string(std::string_view list, std::string_view field,
+                          std::function<std::string(std::size_t)> getter) override;
+    void bind_list_int(std::string_view list, std::string_view field,
+                       std::function<int(std::size_t)> getter) override;
+    void bind_list_double(std::string_view list, std::string_view field,
+                          std::function<double(std::size_t)> getter) override;
+    void bind_list_bool(std::string_view list, std::string_view field,
+                        std::function<bool(std::size_t)> getter) override;
+    void bind_list_event(std::string_view list, std::string_view event,
+                         std::function<void(std::size_t)> callback) override;
     void on_touch_mode_changed(std::function<void(bool)> callback) override;
     void dirty(std::string_view name) override;
     void dirty() override;
@@ -178,6 +189,12 @@ public:
     // / out of bounds. A position-aware probe (like orientation()) so the suite
     // can assert a preview's known source color landed at the expected spot.
     [[nodiscard]] auto surface_pixel(int x, int y) const -> std::uint32_t;
+    // Count elements with `tag` in the first surface's loaded document (0 if no
+    // surface / not loaded yet). Proves a data-for list rendered N rows.
+    [[nodiscard]] auto element_count(const char* tag) const -> int;
+    // Click the index-th `tag` element in the first surface's document (fires
+    // its data-event-click). False if no such element. Drives a row event.
+    auto click_element(const char* tag, int index) -> bool;
 
     struct Impl;
 

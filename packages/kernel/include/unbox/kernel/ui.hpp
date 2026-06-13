@@ -2,6 +2,7 @@
 
 #include <unbox/kernel/host.hpp> // SceneLayer (and, transitively, wlr.hpp-free types)
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -22,9 +23,10 @@
 // DEFERRED (documented, not built this slice):
 //  - Keyboard into ui surfaces (text input + focus): OUT of slice 5. OSK is
 //    slice 8, launcher text slice 6 — those slices add the keyboard path.
-//  - List / container data bindings: see UiSurface::bind_* notes. Slice 6's
-//    taskbar will change-request the exact list shape; only scalar + event
-//    bindings ship now.
+//  - Keyboard into ui surfaces only (text input + focus); see above. List /
+//    container data bindings now SHIP (slice 10's stage dock forced the shape):
+//    see UiSurface::bind_list / bind_list_<type> / bind_list_event. NESTED
+//    lists (a list field whose value is itself a list) remain unsupported.
 //
 // Everything runs on the single wl_event_loop thread. RML assets live under
 // assets/<unit>/ per the harness; pass either inline RML or an asset path.
@@ -91,9 +93,60 @@ public:
     // Ignoring it is fine — the surface simply looks the same in both modes.
     virtual void on_touch_mode_changed(std::function<void(bool touch)> callback) = 0;
 
+    // ---- List bindings (typed, RMLUi-free) ----
+    // A LIST is a runtime-sized, indexed sequence the document iterates with
+    //   <div data-for="row : <name>"> … {{ row.<field> }} … </div>
+    // (the iterator alias — "row" above — is the author's choice; the count and
+    // the per-field getters you register here drive what each row renders).
+    //
+    // bind_list(name, count): declare the list. `count()` is called by the
+    // substrate every time the list re-renders (after dirty(name) or dirty())
+    // to size the loop; rows are indexed 0..count()-1. It must be cheap and
+    // pure (no event-loop blocking). A count() that throws is caught and
+    // isolates your extension (the list then renders as empty for that frame).
+    //
+    // bind_list_<type>(list, field, getter): declare a per-row FIELD `<field>`
+    // of the named list, read in RML as {{ row.<field> }}. For each visible row
+    // the substrate calls getter(row_index) to produce that cell's value. Same
+    // contract as the scalar getters: cheap, pure, called for the surface's
+    // lifetime, capturing only state that outlives this surface; a throwing
+    // getter isolates your extension. Register a field before the first frame;
+    // re-registering the same (list, field) replaces the getter. string is the
+    // workhorse (preview/favicon URIs, titles); int/double/bool are provided
+    // for numeric/flag cells.
+    //
+    // bind_list_event(list, event, callback): declare a per-row EVENT. Author
+    // it on a row element as e.g. data-event-click="<event>(it_index)" — the
+    // `it_index` argument is the row index the document supplies, and the
+    // substrate delivers it to callback(row_index). (Omit the argument and you
+    // get row 0; always pass it_index for the real row.) Invoked on the
+    // event-loop thread; a throwing callback is caught at the substrate
+    // boundary and disables YOUR extension only — never the session. Register
+    // before the first frame; re-registering the same (list, event) replaces
+    // the callback.
+    //
+    // ALL of bind_list* must be called BEFORE the first frame (same rule as the
+    // scalar bind_*: RmlUi needs the data model complete before it parses the
+    // document). Binding a field/event/list after the first frame is a no-op.
+    // Row fields may be added in any order relative to bind_list for the same
+    // name. NESTED lists (a list field that is itself a list) are NOT supported.
+    virtual void bind_list(std::string_view name, std::function<std::size_t()> count) = 0;
+    virtual void bind_list_string(std::string_view list, std::string_view field,
+                                  std::function<std::string(std::size_t row)> getter) = 0;
+    virtual void bind_list_int(std::string_view list, std::string_view field,
+                               std::function<int(std::size_t row)> getter) = 0;
+    virtual void bind_list_double(std::string_view list, std::string_view field,
+                                  std::function<double(std::size_t row)> getter) = 0;
+    virtual void bind_list_bool(std::string_view list, std::string_view field,
+                                std::function<bool(std::size_t row)> getter) = 0;
+    virtual void bind_list_event(std::string_view list, std::string_view event,
+                                 std::function<void(std::size_t row)> callback) = 0;
+
     // Mark a bound scalar changed so the substrate re-reads its getter and
     // re-renders on the next frame. dirty() with no name marks ALL bound
-    // scalars dirty (use sparingly).
+    // scalars dirty (use sparingly). For a list, dirty(<list-name>) re-reads
+    // its count() and re-reads every visible row's field getters, growing or
+    // shrinking the rendered rows to match the new count on the next frame.
     virtual void dirty(std::string_view name) = 0;
     virtual void dirty() = 0;
 

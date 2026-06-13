@@ -575,6 +575,136 @@ TEST_CASE("preview: known source color composites into an <img> (position-aware)
 }
 
 // ============================================================================
+// slice-10 / b2 LIST BINDINGS. The stage dock is one document iterating a
+// VARIABLE list of slots with data-for; each row reads string fields and a
+// per-row click event delivers the row index back to the extension. The suite
+// proves through the PUBLIC Host::ui() path: (1) a list of N rows renders N row
+// elements, (2) mutating the backing vector + dirty(list) changes the rendered
+// row count on the next tick, and (3) clicking a row fires the per-row callback
+// with the correct index. Headless+gles2 exercises the GL bridge.
+// ============================================================================
+
+namespace {
+
+// The dock document: a row <p> per slot, each carrying the slot's title text
+// and a per-row click that calls restore(it_index). The row tag is <p> so the
+// element-count probe counts exactly the rows (no other <p> in the body).
+const char* kListRml = R"RML(<rml>
+<head>
+<style>
+body { font-family: "Noto Sans"; background: #1e2230; color: #e8ecff;
+       width: 320px; height: 240px; }
+p { display: block; width: 320px; height: 24px; }
+</style>
+</head>
+<body data-model="ui">
+<p data-for="row : slots" data-event-click="restore(it_index)"><span>{{ row.title }} {{ row.fav }}</span></p>
+</body>
+</rml>)RML";
+
+// A test extension owning a ui surface bound to a runtime-sized slot list.
+class ListTestExtension : public unbox::kernel::Extension {
+public:
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        titles = {"alpha", "beta", "gamma"};
+        UiSurfaceSpec spec;
+        spec.rml_inline = kListRml;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 320;
+        spec.height = 240;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+        if (surface_ != nullptr) {
+            surface_->bind_list("slots", [this] { return titles.size(); });
+            surface_->bind_list_string("slots", "title",
+                                       [this](std::size_t r) { return titles.at(r); });
+            // A second string field proves multiple per-row fields coexist.
+            surface_->bind_list_string("slots", "fav",
+                                       [](std::size_t r) { return "icon" + std::to_string(r); });
+            surface_->bind_list_event("slots", "restore",
+                                      [this](std::size_t r) {
+                                          last_restored = static_cast<int>(r);
+                                          ++restore_calls;
+                                      });
+        }
+    }
+
+    void set_rows(std::vector<std::string> rows) {
+        titles = std::move(rows);
+        if (surface_ != nullptr) {
+            surface_->dirty("slots");
+        }
+    }
+
+    std::vector<std::string> titles;
+    int last_restored = -1;
+    int restore_calls = 0;
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    Manifest manifest_{"list-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+} // namespace
+
+TEST_CASE("substrate: data-for list renders N rows, re-renders on dirty, routes row events") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new ListTestExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 60); // load the document + run the data-for loop
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM"); // no GL path on this box: skip
+        return;
+    }
+
+    // (1) Three rows in the backing vector => three rendered rows. Each
+    // rendered row carries a <span> (the data-for template <p> keeps no span
+    // child — its inner RML is extracted — so counting <span> counts exactly
+    // the rendered rows).
+    CHECK(server->ui_element_count("span") == 3);
+
+    // (2) Grow then shrink the list + dirty(list): the rendered row count tracks
+    // count() on the next tick.
+    ext->set_rows({"one", "two", "three", "four", "five"});
+    pump(*server, 5);
+    CHECK(server->ui_element_count("span") == 5);
+
+    ext->set_rows({"solo"});
+    pump(*server, 5);
+    CHECK(server->ui_element_count("span") == 1);
+
+    // (3) Restore three rows and click the middle one: the per-row callback
+    // fires with the right index (data-event-click="restore(it_index)"). The
+    // generated rows occupy <p> indices 0..N-1 (the hidden template <p> is last).
+    ext->set_rows({"r0", "r1", "r2"});
+    pump(*server, 5);
+    CHECK(server->ui_element_count("span") == 3);
+    const int before = ext->restore_calls;
+    REQUIRE(server->ui_click_element("p", 1));
+    CHECK(ext->restore_calls == before + 1);
+    CHECK(ext->last_restored == 1);
+
+    // Click row 0 and row 2 to prove the index is the real row, not a constant.
+    REQUIRE(server->ui_click_element("p", 0));
+    CHECK(ext->last_restored == 0);
+    REQUIRE(server->ui_click_element("p", 2));
+    CHECK(ext->last_restored == 2);
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+// ============================================================================
 // VT-switch escape hatch — PURE CORE (no wlroots): keysym -> VT number. The
 // glue (input.cpp) calls wlr_session_change_vt on a hit and consumes; this
 // helper decides the hit. Ctrl+Alt+Fn arrives as XF86Switch_VT_1..12.

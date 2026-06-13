@@ -5,9 +5,11 @@
 #include <RmlUi/Core/Context.h>
 #include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/DataModelHandle.h>
+#include <RmlUi/Core/DataVariable.h>
 #include <RmlUi/Core/Element.h>
 #include <RmlUi/Core/ElementDocument.h>
 #include <RmlUi/Core/SystemInterface.h>
+#include <RmlUi/Core/Variant.h>
 
 // The kernel owns GL; system EGL/GLES headers are allowed here (same as the
 // retired spike). wlr.hpp already pulled <EGL/egl.h>+<EGL/eglext.h> via
@@ -342,6 +344,26 @@ struct Surface {
     };
     std::list<EventBinding> event_bindings;
 
+    // List bindings (slice 10 / b2). A bound list is a runtime-sized indexed
+    // sequence the document iterates with data-for; each row exposes named
+    // string/int/double/bool FIELDS read as {{ row.<field> }}. The shape maps
+    // onto RmlUi's data-binding type system via three owned VariableDefinitions
+    // per list (Array -> row Struct -> per-field Scalar); the row index is
+    // smuggled through the DataVariable `void* ptr` (no per-row heap object).
+    // All getters/count follow the scalar contract (cheap, pure, lifetime =
+    // surface, throw => isolate). Stored in a std::list so addresses are stable
+    // (the VariableDefinitions hold a ListBinding*). Defined below the Surface.
+    struct ListBinding;
+    std::list<ListBinding> list_bindings;
+    // Per-list event callbacks (keyed by event name). A row event delivers the
+    // row index extracted from the data expression's first argument (it_index).
+    struct ListEventBinding {
+        std::function<void(std::size_t)> cb;
+        ExtensionId who;
+        Substrate::Impl* owner;
+    };
+    std::list<ListEventBinding> list_event_bindings;
+
     // touch-mode-changed notification (one per surface; see ui.hpp). Fired on a
     // transition, error-isolated to `who`. touch-mode does NO visual scaling
     // (user decision) — this is purely an opt-in signal for extensions.
@@ -351,6 +373,137 @@ struct Surface {
     wlr_scene_buffer* scene_buffer = nullptr;
 
     int frame_count = 0;
+};
+
+// ---- List bindings: the RMLUi-free list shape -> RmlUi data-binding types ---
+//
+// data-for="row : <name>" makes RmlUi ask the named variable for its Size() and
+// then a Child per index; {{ row.<field> }} asks that child (a row) for a Child
+// per field name; the field child is a scalar that yields a Variant. We satisfy
+// all three with custom VariableDefinitions (NonCopyMoveable, owned by the
+// Surface for its whole life — they outlive the RmlUi context, which is torn
+// down first in destroy_surface). The row index is carried through the
+// DataVariable's `void* ptr` as an encoded integer, so there is NO per-row heap
+// object and rows cost nothing until rendered. count()/getters are called
+// straight out of the ListBinding; a throw is isolated to the owning extension.
+namespace {
+// Encode/decode a row index in the opaque DataVariable ptr (index + 1 so the
+// encoded value is never the null we hand RmlUi for an out-of-range child).
+inline auto encode_row(std::size_t row) -> void* {
+    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(row) + 1);
+}
+inline auto decode_row(void* ptr) -> std::size_t {
+    return static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(ptr)) - 1;
+}
+} // namespace
+
+// One bound list's full state: the count getter, the per-field getters (by
+// name+type), and the three VariableDefinitions wired Array -> Struct -> Scalar.
+// `isolate` lets a getter throw without taking down the session (it calls the
+// substrate's DisableSink for `who`). Lives in Surface::list_bindings.
+struct Surface::ListBinding {
+    std::string name;
+    std::function<std::size_t()> count;
+    ExtensionId who{};
+    // A copy of the substrate's DisableSink so a throwing count/getter isolates
+    // the owning extension WITHOUT this struct (defined before Substrate::Impl)
+    // needing the complete Impl type.
+    SubstrateDisableFn disable;
+
+    std::unordered_map<std::string, std::function<bool(std::size_t, Rml::Variant&)>> fields;
+
+    // Run a field/count call, isolating a throw to the owning extension.
+    template <typename Fn>
+    auto isolate(Fn&& fn) -> bool {
+        try {
+            fn();
+            return true;
+        } catch (...) {
+            if (disable) {
+                disable(who);
+            }
+            return false;
+        }
+    }
+
+    // The scalar at (row, field): decode the row, call the field getter.
+    struct FieldDef final : Rml::VariableDefinition {
+        FieldDef(ListBinding* b, std::function<bool(std::size_t, Rml::Variant&)>* f)
+            : Rml::VariableDefinition(Rml::DataVariableType::Scalar), binding(b), field(f) {}
+        bool Get(void* ptr, Rml::Variant& variant) override {
+            const std::size_t row = decode_row(ptr);
+            bool got = false;
+            binding->isolate([&] { got = (*field)(row, variant); });
+            return got;
+        }
+        ListBinding* binding;
+        std::function<bool(std::size_t, Rml::Variant&)>* field;
+    };
+
+    // The row struct: a Child per field name (passing the encoded row through).
+    struct RowDef final : Rml::VariableDefinition {
+        explicit RowDef(ListBinding* b)
+            : Rml::VariableDefinition(Rml::DataVariableType::Struct), binding(b) {}
+        Rml::DataVariable Child(void* ptr, const Rml::DataAddressEntry& address) override {
+            auto it = binding->field_defs.find(address.name);
+            if (it == binding->field_defs.end()) {
+                return Rml::DataVariable();
+            }
+            return Rml::DataVariable(it->second.get(), ptr); // ptr already encodes the row
+        }
+        Rml::StringList ReflectMemberNames() override {
+            Rml::StringList names;
+            for (const auto& [n, def] : binding->field_defs) {
+                names.push_back(n);
+            }
+            return names;
+        }
+        ListBinding* binding;
+    };
+
+    // The array: Size() = count(); Child(i) = a row encoding index i.
+    struct ArrayDef final : Rml::VariableDefinition {
+        explicit ArrayDef(ListBinding* b)
+            : Rml::VariableDefinition(Rml::DataVariableType::Array), binding(b) {}
+        int Size(void* /*ptr*/) override {
+            std::size_t n = 0;
+            if (binding->count) {
+                binding->isolate([&] { n = binding->count(); });
+            }
+            return static_cast<int>(n);
+        }
+        Rml::DataVariable Child(void* /*ptr*/, const Rml::DataAddressEntry& address) override {
+            if (address.index < 0) {
+                return Rml::DataVariable();
+            }
+            return Rml::DataVariable(&binding->row_def, encode_row(static_cast<std::size_t>(address.index)));
+        }
+        ListBinding* binding;
+    };
+
+    // The owned definitions (constructed in init(); addresses stable thereafter
+    // because ListBinding lives in a std::list). field_defs maps field name ->
+    // its scalar definition; row_def/array_def are the single struct/array.
+    std::unordered_map<std::string, std::unique_ptr<FieldDef>> field_defs;
+    RowDef row_def{nullptr};
+    ArrayDef array_def{nullptr};
+
+    void init() {
+        // Re-seat the back-pointers now that the ListBinding has its final
+        // address (it was emplaced into the std::list before init()).
+        row_def.binding = this;
+        array_def.binding = this;
+    }
+    auto add_field(const std::string& field, std::function<bool(std::size_t, Rml::Variant&)> fn)
+        -> void {
+        auto [it, inserted] = fields.insert_or_assign(field, std::move(fn));
+        auto def_it = field_defs.find(field);
+        if (def_it == field_defs.end()) {
+            field_defs.emplace(field, std::make_unique<FieldDef>(this, &it->second));
+        } else {
+            def_it->second->field = &it->second; // re-seat after insert_or_assign
+        }
+    }
 };
 
 // ---- PreviewState -----------------------------------------------------------
@@ -1267,6 +1420,34 @@ auto Substrate::surface_pixel(int x, int y) const -> std::uint32_t {
     return 0;
 }
 
+auto Substrate::element_count(const char* tag) const -> int {
+    for (const Surface& s : impl_->surfaces) {
+        if (s.document == nullptr) {
+            continue;
+        }
+        Rml::ElementList elements;
+        s.document->GetElementsByTagName(elements, Rml::String(tag));
+        return static_cast<int>(elements.size());
+    }
+    return 0;
+}
+
+auto Substrate::click_element(const char* tag, int index) -> bool {
+    for (Surface& s : impl_->surfaces) {
+        if (s.document == nullptr) {
+            continue;
+        }
+        Rml::ElementList elements;
+        s.document->GetElementsByTagName(elements, Rml::String(tag));
+        if (index < 0 || index >= static_cast<int>(elements.size())) {
+            return false;
+        }
+        elements[static_cast<std::size_t>(index)]->Click();
+        return true;
+    }
+    return false;
+}
+
 auto Substrate::orientation() const -> int {
     for (const Surface& s : impl_->surfaces) {
         if (s.dmabuf || s.shm == nullptr || s.frame_count == 0) {
@@ -1400,6 +1581,115 @@ void SurfaceHandle::bind_event(std::string_view name, std::function<void()> call
             try {
                 if (binding->cb) {
                     binding->cb();
+                }
+            } catch (...) {
+                if (binding->owner->disable) {
+                    binding->owner->disable(binding->who);
+                }
+            }
+        });
+}
+
+namespace {
+// Find an existing list binding by name in the surface, or nullptr.
+auto find_list(Surface& s, std::string_view name) -> Surface::ListBinding* {
+    for (auto& b : s.list_bindings) {
+        if (b.name == name) {
+            return &b;
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
+void SurfaceHandle::bind_list(std::string_view name, std::function<std::size_t()> count) {
+    Surface& s = *surface_;
+    if (!s.ctor) {
+        return;
+    }
+    Surface::ListBinding* b = find_list(s, name);
+    if (b == nullptr) {
+        s.list_bindings.emplace_back();
+        b = &s.list_bindings.back();
+        b->name = std::string(name);
+        b->who = s.who;
+        b->disable = s.owner->disable;
+        b->init(); // stable address now -> seat the definition back-pointers
+        // Bind the array variable under the list name; data-for reads its
+        // Size()/Child() to iterate, and each row's Child() resolves the fields.
+        s.ctor.BindCustomDataVariable(b->name,
+                                      Rml::DataVariable(&b->array_def, nullptr));
+    }
+    b->count = std::move(count);
+}
+
+// One template for the four typed field binds: wrap the typed getter in a
+// Variant-producing closure (Variant's templated setter handles each type),
+// then register it on the list's row struct under `field`.
+namespace {
+template <typename T, typename Getter>
+void bind_list_field_impl(Surface& s, std::string_view list, std::string_view field,
+                          Getter getter) {
+    if (!s.ctor) {
+        return;
+    }
+    Surface::ListBinding* b = find_list(s, list);
+    if (b == nullptr) {
+        // The list must be declared first (bind_list); a field on an unknown
+        // list is dropped (documented: register the list before its fields...
+        // they may interleave, but the list name must exist).
+        wlr_log(WLR_INFO, "ui-substrate: bind_list field '%.*s' for unknown list '%.*s'",
+                static_cast<int>(field.size()), field.data(),
+                static_cast<int>(list.size()), list.data());
+        return;
+    }
+    b->add_field(std::string(field),
+                 [getter = std::move(getter)](std::size_t row, Rml::Variant& out) -> bool {
+                     out = static_cast<T>(getter(row));
+                     return true;
+                 });
+}
+} // namespace
+
+void SurfaceHandle::bind_list_string(std::string_view list, std::string_view field,
+                                     std::function<std::string(std::size_t)> getter) {
+    bind_list_field_impl<Rml::String>(*surface_, list, field, std::move(getter));
+}
+void SurfaceHandle::bind_list_int(std::string_view list, std::string_view field,
+                                  std::function<int(std::size_t)> getter) {
+    bind_list_field_impl<int>(*surface_, list, field, std::move(getter));
+}
+void SurfaceHandle::bind_list_double(std::string_view list, std::string_view field,
+                                     std::function<double(std::size_t)> getter) {
+    bind_list_field_impl<double>(*surface_, list, field, std::move(getter));
+}
+void SurfaceHandle::bind_list_bool(std::string_view list, std::string_view field,
+                                   std::function<bool(std::size_t)> getter) {
+    bind_list_field_impl<bool>(*surface_, list, field, std::move(getter));
+}
+
+void SurfaceHandle::bind_list_event(std::string_view /*list*/, std::string_view event,
+                                    std::function<void(std::size_t)> callback) {
+    // A row event is a normal data-event callback; the row index arrives as the
+    // first data-expression argument (author it as data-event-click="ev(it_index)").
+    // The event name is model-global (RmlUi has no per-list event namespace), so
+    // `list` is documentary only — keep names unique per surface.
+    Surface& s = *surface_;
+    if (!s.ctor) {
+        return;
+    }
+    s.list_event_bindings.push_back({std::move(callback), s.who, s.owner});
+    Surface::ListEventBinding* binding = &s.list_event_bindings.back();
+    s.ctor.BindEventCallback(
+        std::string(event),
+        [binding](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) {
+            try {
+                if (binding->cb) {
+                    std::size_t row = 0;
+                    if (!args.empty()) {
+                        row = static_cast<std::size_t>(args[0].Get<int>());
+                    }
+                    binding->cb(row);
                 }
             } catch (...) {
                 if (binding->owner->disable) {

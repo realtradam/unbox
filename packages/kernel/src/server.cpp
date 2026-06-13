@@ -89,6 +89,14 @@ auto Server::ui_pixel(int x, int y) const -> unsigned int {
     return impl_->substrate != nullptr ? impl_->substrate->surface_pixel(x, y) : 0U;
 }
 
+auto Server::ui_element_count(const char* tag) const -> int {
+    return impl_->substrate != nullptr ? impl_->substrate->element_count(tag) : 0;
+}
+
+auto Server::ui_click_element(const char* tag, int index) -> bool {
+    return impl_->substrate != nullptr && impl_->substrate->click_element(tag, index);
+}
+
 void Server::ui_set_touch_override(UiTouchOverride ov) {
     if (impl_->substrate == nullptr) {
         return;

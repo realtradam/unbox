@@ -103,6 +103,19 @@ public:
     // known source color reached the expected spot inside an <img>.
     [[nodiscard]] auto ui_pixel(int x, int y) const -> unsigned int;
 
+    // Count elements with the given tag name in the first ui surface's loaded
+    // document. 0 if no surface / no document yet. Lets the suite assert that a
+    // data-for list rendered the expected number of rows (slice 10 / b2 list
+    // bindings) without synthesizing input. Test instrumentation; single-thread.
+    [[nodiscard]] auto ui_element_count(const char* tag) const -> int;
+
+    // Dispatch a click on the `index`-th element with tag `tag` in the first ui
+    // surface's document (RmlUi Element::Click). Returns false if no such
+    // element. Lets the suite fire a list row's data-event-click and assert the
+    // per-row event callback got the right index — no real input device needed.
+    // Test instrumentation; single-thread only.
+    auto ui_click_element(const char* tag, int index) -> bool;
+
     // Pin the substrate's touch-mode for tests (none = automatic). Mirrors
     // UiSubstrate::TouchModeOverride; lets the suite drive the state machine and
     // its on_touch_mode_changed notification. Test instrumentation;
