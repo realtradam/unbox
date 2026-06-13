@@ -109,6 +109,19 @@ auto FileWatcher::add(const std::string& path, std::function<void()> on_change, 
     return FileWatch(this, token);
 }
 
+auto FileWatcher::add_dir(const std::string& dir, std::function<void()> on_change, ExtensionId who)
+    -> FileWatch {
+    if (!ensure_started()) {
+        return FileWatch{};
+    }
+    std::string d = dir.empty() ? std::string(".") : dir;
+    const Token token = ++next_token_;
+    // Empty basename => match ANY file change in `d`.
+    entries_.emplace(token, Entry{std::move(d), std::string{}, std::move(on_change), who});
+    arm_dir(entries_.at(token).dir);
+    return FileWatch(this, token);
+}
+
 void FileWatcher::remove_watch(Token token) noexcept {
     auto it = entries_.find(token);
     if (it == entries_.end()) {
@@ -164,7 +177,9 @@ void FileWatcher::on_readable() {
     std::vector<Token> to_fire;
     for (const auto& [token, e] : entries_) {
         for (const auto& [dir, name] : changed) {
-            if (e.dir == dir && e.basename == name) {
+            // A file-specific entry matches its basename; a directory entry
+            // (empty basename) matches ANY file change in its dir.
+            if (e.dir == dir && (e.basename.empty() || e.basename == name)) {
                 to_fire.push_back(token);
                 break;
             }

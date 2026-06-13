@@ -809,14 +809,22 @@ Rml::ElementDocument* Substrate::Impl::load_document_first(Surface& s) {
             return nullptr;
         }
         // Dev-only: register an asset hot-reload watch on the kernel's SHARED
-        // file watcher (the same machinery Host::watch_file uses). The callback
-        // flags this surface for reload, applied (coalesced) at the next
-        // tick_all on the GL context. Only this DECISION is UNBOX_DEV-gated; the
-        // watcher infra itself is always available.
+        // file watcher (the same machinery Host::watch_file uses). We watch the
+        // document's whole DIRECTORY (add_dir), NOT just the .rml basename:
+        // RmlUi resolves `<link href="x.rcss">` and image srcs relative to the
+        // document dir, and the dock keeps its dock.rcss BESIDE dock.rml — so a
+        // change to ANY file in that dir (the .rml OR a linked .rcss/asset) must
+        // reload. (Watching only the .rml basename was the regression: editing
+        // dock.rcss fired no reload.) The callback flags this surface for reload,
+        // applied (coalesced) at the next tick_all on the GL context. Only this
+        // DECISION is UNBOX_DEV-gated; the watcher infra itself is always
+        // available (Host::watch_file is ungated).
         if (hot_reload_enabled() && watcher != nullptr) {
             Surface* sp = &s;
-            s.asset_watch = watcher->add(
-                s.resolved_path,
+            const std::string dir =
+                std::filesystem::path(s.resolved_path).parent_path().string();
+            s.asset_watch = watcher->add_dir(
+                dir,
                 [this, sp] {
                     if (std::find(pending_reloads.begin(), pending_reloads.end(), sp) ==
                         pending_reloads.end()) {
@@ -824,6 +832,9 @@ Rml::ElementDocument* Substrate::Impl::load_document_first(Surface& s) {
                     }
                 },
                 s.who);
+            wlr_log(WLR_INFO,
+                    "ui-substrate: dev hot-reload ON (inotify watching asset dir '%s')",
+                    dir.c_str());
         }
     } else {
         doc = s.context->LoadDocumentFromMemory(s.rml_inline);

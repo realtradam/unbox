@@ -1448,6 +1448,70 @@ TEST_CASE("substrate: hot-reload re-parses RCSS (file change -> new color)") {
     unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
 }
 
+TEST_CASE("substrate: END-TO-END dev hot-reload (real inotify, not the seam)") {
+    // This exercises the REAL path the seam-based test does NOT: UNBOX_DEV on,
+    // the substrate arms its own asset watch on the kernel's shared FileWatcher,
+    // and a WRITE to a file on disk fires the real inotify event through the
+    // wl_event_loop, which must run the reload callback. (The ui_reload_surface
+    // seam passed even while this real path was broken — that gap is the bug.)
+    //
+    // It mirrors the STAGE DOCK exactly: dock.rml <link>s a SEPARATE dock.rcss
+    // in the same dir, and the user edits the RCSS. The regression watched only
+    // the .rml basename, so an RCSS edit fired no reload — this test catches it.
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+    setenv("UNBOX_DEV", "1", 1); // arm the substrate's asset watch
+
+    // A doc dir holding doc.rml (links style.rcss) + style.rcss (the body color).
+    const auto dir = std::filesystem::temp_directory_path() / "unbox-kernel-tests" /
+                     (std::string("e2e-") + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const auto rml = dir / "doc.rml";
+    const auto rcss = dir / "style.rcss";
+    REQUIRE(write_file(rml,
+                       "<rml><head><link type=\"text/rcss\" href=\"style.rcss\"/></head>"
+                       "<body data-model=\"ui\"><div id=\"fill\"></div></body></rml>"));
+    REQUIRE(write_file(rcss, "body{margin:0px;} #fill{display:block;position:absolute;"
+                             "left:0px;top:0px;width:4000px;height:4000px;"
+                             "background-color:#20c040;}")); // green
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PathSurfaceExtension(rml.string());
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 30); // first render: loads the doc + arms the asset-DIR watch
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_DEV");
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        std::filesystem::remove_all(dir, ec);
+        return; // no GL path: skip
+    }
+    REQUIRE(is_green(server->ui_pixel(40, 40)));
+
+    // Edit the LINKED RCSS on disk (the dock's real case). Do NOT call the seam —
+    // let the real inotify watch on the document's DIRECTORY fire through the
+    // loop and drive the reload. Pump until the pixel flips; on the buggy code
+    // (basename-only watch of doc.rml) the RCSS change never matched -> no flip.
+    REQUIRE(write_file(rcss, "body{margin:0px;} #fill{display:block;position:absolute;"
+                             "left:0px;top:0px;width:4000px;height:4000px;"
+                             "background-color:#d03020;}")); // red
+    bool reloaded = false;
+    for (int i = 0; i < 100 && !reloaded; ++i) {
+        server->dispatch(20); // pump the loop: delivers inotify + ticks surfaces
+        reloaded = is_red(server->ui_pixel(40, 40));
+    }
+    CHECK(reloaded);                                  // FAILS on the regression
+    CHECK_FALSE(is_green(server->ui_pixel(40, 40)));
+
+    unsetenv("UNBOX_DEV");
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+    std::filesystem::remove_all(dir, ec);
+}
+
 namespace {
 // A file-backed list document + an extension that binds a runtime-sized list.
 const char* kListReloadRml = R"RML(<rml>

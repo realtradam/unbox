@@ -55,13 +55,21 @@ public:
     [[nodiscard]] auto add(const std::string& path, std::function<void()> on_change,
                            ExtensionId who) -> FileWatch;
 
+    // Watch the DIRECTORY `dir` for a change to ANY file within it (not a single
+    // basename). Used by the ui-substrate's asset hot-reload: a document and its
+    // `<link>`ed RCSS/assets live in the same dir, and editing ANY of them must
+    // reload — without parsing the document's link set. Same coalescing / error
+    // isolation / RAII as add(). `dir` should be an absolute directory path.
+    [[nodiscard]] auto add_dir(const std::string& dir, std::function<void()> on_change,
+                               ExtensionId who) -> FileWatch;
+
     // detail::WatchRegistry — stop the watch with this token (FileWatch dtor).
     void remove_watch(Token token) noexcept override;
 
 private:
     struct Entry {
         std::string dir;       // watched directory (absolute)
-        std::string basename;  // file within `dir` to match
+        std::string basename;  // file within `dir` to match; EMPTY = any file
         std::function<void()> on_change;
         ExtensionId who{};
     };
