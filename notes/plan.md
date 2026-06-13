@@ -144,6 +144,7 @@ trusted.
 | Catch2 vs doctest revisit | doctest | doctest blocks something real |
 | dmabuf render-format negotiation (`wlr_renderer_get_render_formats` is private in wlroots 0.20) | hardcoded ARGB8888/LINEAR (verified on crocus) | wlroots bump slice or a GPU that rejects it |
 | window placement policy (new toplevels overlap at origin) | tinywl parity: no placement | slice 7 tiling (or earlier if it blocks testing) |
+| dock favicon decoders (vendor lunasvg+stb_image; wire RmlUi LoadTexture for PNG/SVG) | no favicon — preview+title only | favicon feature scheduled — full design in `notes/favicon-spec.md` |
 
 ## 8. References
 
