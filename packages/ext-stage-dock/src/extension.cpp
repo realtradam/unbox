@@ -70,11 +70,34 @@ struct Slot {
 };
 
 // Inline RML for the dock document. A vertical stack of preview cards, dark/
-// rounded like the Stage-Manager reference. Animation-ready (a `dock` class on
-// the body + a `slot` class per card) but STATIC now — d1 adds the RCSS
-// transitions. data-model "ui" (the substrate default); iterates the "slots"
-// list bound below. {{ row.preview }} is the Preview source_uri(); the
-// data-event-click delivers the row index to restore().
+// rounded like the Stage-Manager reference. d1 ADDS the RCSS animation on top of
+// c2's static document — without touching the data model (same "slots" list,
+// same per-row preview/title/restore bindings). data-model "ui" (the substrate
+// default). {{ row.preview }} is the Preview source_uri(); data-event-click
+// delivers the row index to restore().
+//
+// d1 animation (RCSS, RMLUi 6.2; verified against the vendored source):
+//
+//  1. DOCK REVEAL SLIDE. body.dock starts translated fully off the left edge
+//     (transform: translateX(-100%)); adding the `open` class translates it back
+//     to 0. A `transition: transform 180ms ...` on body.dock makes that flip
+//     SLIDE rather than jump. The `open` class is driven by the bound bool
+//     `open` via data-class-open (RmlUi DataViewClass). The glue makes the
+//     surface visible BEFORE setting open=true (slide-in), and on close keeps it
+//     visible until the slide-OUT finishes — sequenced off the body's
+//     `transitionend`, routed to bind_event("dock_settled") (the existing event
+//     binding carries RmlUi's transitionend; no kernel change — see report).
+//
+//  2. PER-SLOT ENTER/SETTLE. Each freshly created `div.slot` plays the
+//     `slot-enter` @keyframes ONCE on creation (animation: ... 1 normal): it
+//     starts smaller + transparent + nudged up-left ("scaling down into a spot")
+//     and settles to full size/opacity in place. RmlUi runs the animation when
+//     the element is instanced, which is exactly when dirty("slots") grows the
+//     list — so a new minimize animates its card in with no extra binding.
+//
+// transform-origin keeps the slot scaling toward its own top so the grow reads
+// as "into the dock", within what a left-strip surface can convey (the literal
+// cross-screen flight needs an input-transparent overlay — report change-req).
 constexpr const char* kDockRml = R"RML(<rml>
 <head>
 <style>
@@ -82,6 +105,21 @@ body.dock {
     background-color: #1c1c1ee6;
     padding: 8dp;
     font-family: sans-serif;
+    transform: translateX(-100%);
+    transition: transform 0.18s cubic-in-out;
+}
+body.dock.open {
+    transform: translateX(0px);
+}
+@keyframes slot-enter {
+    from {
+        opacity: 0;
+        transform: translateX(-12dp) scale(0.72);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0px) scale(1.0);
+    }
 }
 div.slot {
     display: block;
@@ -89,6 +127,8 @@ div.slot {
     padding: 6dp;
     background-color: #2e2e32ff;
     border-radius: 10dp;
+    transform-origin: top left;
+    animation: slot-enter 0.16s cubic-out 1 normal;
 }
 div.slot img.preview {
     display: block;
@@ -105,7 +145,7 @@ div.slot span.title {
 }
 </style>
 </head>
-<body data-model="ui" class="dock">
+<body data-model="ui" class="dock" data-class-open="open" data-event-transitionend="dock_settled()">
 <div data-for="row : slots" class="slot" data-event-click="restore(it_index)">
 <img class="preview" src="{{ row.preview }}"/>
 <span class="title">{{ row.title }}</span>
@@ -267,13 +307,56 @@ private:
         return false;
     }
 
-    // Re-render the dock list and toggle dock visibility (it shows iff there is
-    // at least one slot). No-op on the visual when the surface is null (no-GL).
+    // Re-render the dock list and ANIMATE the dock reveal (d1). The dock is
+    // revealed iff there is at least one slot. Where c2 toggled set_visible()
+    // instantly, d1 slides the body via the `open` class (data-class-open ->
+    // transition on transform):
+    //   empty -> non-empty: make the surface visible FIRST (a hidden surface is
+    //     not composited, so it can't animate), then flip open_=true and dirty
+    //     it -> the transition slides the body in from the left edge.
+    //   non-empty -> empty: keep the surface visible, flip open_=false and dirty
+    //     -> the body slides back out; we DEFER set_visible(false) until the
+    //     slide-out finishes (on_dock_settled, fired by RmlUi's transitionend
+    //     through the existing event binding) so the close animation is seen.
+    // No-op on the visual when the surface is null (no-GL backend); the model is
+    // still tracked, and slot_count()/the c2 invariants are unchanged.
     void refresh_slots() {
-        if (dock_surface_ != nullptr) {
-            dock_surface_->dirty("slots");
-            dock_surface_->set_visible(!slots_.empty());
+        if (dock_surface_ == nullptr) {
+            return;
         }
+        dock_surface_->dirty("slots");
+
+        const bool want_open = !slots_.empty();
+        if (want_open == open_) {
+            return; // reveal state unchanged (e.g. minimize a 2nd window)
+        }
+        open_ = want_open;
+        if (open_) {
+            // Reveal: composite before animating, then slide in.
+            closing_ = false;
+            dock_surface_->set_visible(true);
+            dock_surface_->dirty("open");
+        } else {
+            // Conceal: slide out now, hide once the slide-out transition ends.
+            closing_ = true;
+            dock_surface_->dirty("open");
+        }
+    }
+
+    // RmlUi fires `transitionend` on body.dock when the reveal-slide transition
+    // completes; the existing data-event binding routes it here (VERIFIED: the
+    // substrate's data-event controller binds any registered RmlUi event by
+    // name, and RmlUi dispatches transitionend from AdvanceAnimations() — no
+    // kernel change needed for this completion signal; see report). We only act
+    // on the CLOSE direction: once the slide-OUT has played, drop the surface
+    // from compositing. The open-direction transitionend is a no-op. Guarded so
+    // a stale end-event (e.g. a reveal that raced a conceal) cannot hide an
+    // again-open dock: we re-check open_.
+    void on_dock_settled() {
+        if (dock_surface_ != nullptr && closing_ && !open_) {
+            dock_surface_->set_visible(false);
+        }
+        closing_ = false;
     }
 
     // Create the dock UiSurface (overlay, left edge, full output height) and
@@ -317,6 +400,15 @@ private:
             });
         dock_surface_->bind_list_event(
             "slots", "restore", [this](std::size_t i) { do_restore(i); });
+
+        // d1 reveal-animation bindings (registered before the first frame, same
+        // rule as the list bindings; capture only `this`, whose members outlive
+        // the surface). `open` drives data-class-open on body.dock -> the slide
+        // transition; `dock_settled` is body.dock's transitionend -> hide after
+        // the slide-out. Initial open_ is false (the dock starts hidden, body
+        // un-`open` = translated off-screen), matching spec.visible=false.
+        dock_surface_->bind_bool("open", [this]() -> bool { return open_; });
+        dock_surface_->bind_event("dock_settled", [this]() { on_dock_settled(); });
     }
 
     // Dock metrics from the first output's size (queried via output_layout). On
@@ -365,6 +457,15 @@ private:
     // valid through the surface's teardown, then drop, all before host_'s borrow
     // ends. Each Slot owns a Preview (frees its texture on erase/destruction).
     std::vector<Slot> slots_;
+
+    // d1 reveal-animation state, read by the `open` bool getter + the
+    // transitionend handler. Declared BEFORE dock_surface_ (like slots_) so they
+    // stay alive while the surface — whose binding reads open_ — tears down.
+    // open_: is the dock currently revealed (body has the `open` class)? Starts
+    // false (hidden + slid off-screen, matching spec.visible=false). closing_:
+    // are we mid slide-OUT, waiting on transitionend to set_visible(false)?
+    bool open_ = false;
+    bool closing_ = false;
 
     // The dock ui surface. Destroyed before slots_ (declared after it) so any
     // getter invoked during its teardown still sees a live slots_; destroyed
