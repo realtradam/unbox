@@ -37,7 +37,7 @@ class XdgShellExtension;
 struct ToplevelEntry final : Toplevel {
     XdgShellExtension* ext = nullptr;
     wlr_xdg_toplevel* xdg_toplevel = nullptr;
-    wlr_scene_tree* scene_tree = nullptr;
+    wlr_scene_tree* scene = nullptr;
     bool mapped = false;
 
     // Typed surface->scene-tree association (replaces the old .data
@@ -66,6 +66,35 @@ struct ToplevelEntry final : Toplevel {
     void close() override {
         if (xdg_toplevel != nullptr) {
             wlr_xdg_toplevel_send_close(xdg_toplevel);
+        }
+    }
+
+    // ---- minimize mechanism (slice 10 / b1) ----
+    [[nodiscard]] auto geometry() const -> wlr_box override {
+        // Layout origin = scene-node position offset by the window-geometry
+        // origin (same decomposition begin_resize uses); size = current xdg
+        // window geometry (wlroots falls this back to the surface extent when
+        // the client set no explicit geometry).
+        wlr_box box{};
+        if (scene == nullptr || xdg_toplevel == nullptr) {
+            return box;
+        }
+        const wlr_box& geo = xdg_toplevel->base->geometry;
+        box.x = scene->node.x + geo.x;
+        box.y = scene->node.y + geo.y;
+        box.width = geo.width;
+        box.height = geo.height;
+        return box;
+    }
+    [[nodiscard]] auto scene_tree() -> wlr_scene_tree* override { return scene; }
+    void hide() override {
+        if (scene != nullptr) {
+            wlr_scene_node_set_enabled(&scene->node, false);
+        }
+    }
+    void show() override {
+        if (scene != nullptr) {
+            wlr_scene_node_set_enabled(&scene->node, true);
         }
     }
 };
@@ -181,7 +210,7 @@ public:
                 wlr_xdg_toplevel_set_activated(p, false);
             }
         }
-        wlr_scene_node_raise_to_top(&entry->scene_tree->node);
+        wlr_scene_node_raise_to_top(&entry->scene->node);
 
         wlr_xdg_toplevel_set_activated(entry->xdg_toplevel, true);
         if (wlr_keyboard* kb = wlr_seat_get_keyboard(seat)) {
@@ -198,17 +227,17 @@ private:
         ToplevelEntry* entry = owned.get();
         entry->ext = this;
         entry->xdg_toplevel = xdg_toplevel;
-        entry->scene_tree = wlr_scene_xdg_surface_create(
+        entry->scene = wlr_scene_xdg_surface_create(
             host_->scene_layer(kernel::SceneLayer::normal), xdg_toplevel->base);
         // PRIVATE bookkeeping: our own hit-test recovers the entry from the
         // tree node's data (an intra-unit use of .data, which the registry
         // contract explicitly still permits). The CROSS-UNIT surface->tree
         // coupling goes through the typed registry below, never .data.
-        entry->scene_tree->node.data = entry;
+        entry->scene->node.data = entry;
         // Typed surface->scene-tree association so popups (ours or descendants)
         // resolve this toplevel's tree via Host::scene_tree_for().
         entry->surface_reg =
-            host_->host_surface(xdg_toplevel->base->surface, entry->scene_tree);
+            host_->host_surface(xdg_toplevel->base->surface, entry->scene);
         toplevels_.emplace(xdg_toplevel, std::move(owned));
 
         entry->map.connect(xdg_toplevel->base->surface->events.map, [this, entry](void*) {
@@ -341,8 +370,8 @@ private:
         double ly = 0;
         grab_driver_layout(&lx, &ly);
         grabbed_ = entry;
-        grab_x_ = lx - entry->scene_tree->node.x;
-        grab_y_ = ly - entry->scene_tree->node.y;
+        grab_x_ = lx - entry->scene->node.x;
+        grab_y_ = ly - entry->scene->node.y;
     }
 
     void begin_resize(ToplevelEntry* entry, std::uint32_t edges) {
@@ -354,15 +383,15 @@ private:
         grab_driver_layout(&lx, &ly);
         grabbed_ = entry;
         wlr_box* geo = &entry->xdg_toplevel->base->geometry;
-        const double border_x = (entry->scene_tree->node.x + geo->x) +
+        const double border_x = (entry->scene->node.x + geo->x) +
                                 ((edges & WLR_EDGE_RIGHT) != 0 ? geo->width : 0);
-        const double border_y = (entry->scene_tree->node.y + geo->y) +
+        const double border_y = (entry->scene->node.y + geo->y) +
                                 ((edges & WLR_EDGE_BOTTOM) != 0 ? geo->height : 0);
         grab_x_ = lx - border_x;
         grab_y_ = ly - border_y;
         grab_geobox_ = *geo;
-        grab_geobox_.x += entry->scene_tree->node.x;
-        grab_geobox_.y += entry->scene_tree->node.y;
+        grab_geobox_.x += entry->scene->node.x;
+        grab_geobox_.y += entry->scene->node.y;
         resize_edges_ = edges;
     }
 
@@ -380,7 +409,7 @@ private:
     }
 
     void process_cursor_move(double lx, double ly) {
-        wlr_scene_node_set_position(&grabbed_->scene_tree->node,
+        wlr_scene_node_set_position(&grabbed_->scene->node,
                                     static_cast<int>(lx - grab_x_),
                                     static_cast<int>(ly - grab_y_));
     }
@@ -416,7 +445,7 @@ private:
             }
         }
         wlr_box* geo = &grabbed_->xdg_toplevel->base->geometry;
-        wlr_scene_node_set_position(&grabbed_->scene_tree->node, new_left - geo->x,
+        wlr_scene_node_set_position(&grabbed_->scene->node, new_left - geo->x,
                                     new_top - geo->y);
         wlr_xdg_toplevel_set_size(grabbed_->xdg_toplevel, new_right - new_left,
                                   new_bottom - new_top);

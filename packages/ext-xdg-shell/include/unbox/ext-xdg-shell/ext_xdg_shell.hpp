@@ -2,6 +2,7 @@
 
 #include <unbox/kernel/extension.hpp>
 #include <unbox/kernel/hooks.hpp>
+#include <unbox/kernel/wlr.hpp> // wlr_box, wlr_scene_tree (the mechanism types below)
 
 #include <memory>
 #include <string_view>
@@ -58,6 +59,43 @@ public:
     // client decides when/whether to honor it; the window stays valid until
     // its own unmap/destroy then fires normally.
     virtual void close() = 0;
+
+    // ---- Minimize mechanism (slice 10 / stage dock) ----------------------
+    //
+    // Neutral compositor-side mechanism the stage dock drives to minimize a
+    // window. The "minimized" STATE and dock placement are ext-stage-dock
+    // policy — none of it is tracked here; this surface only hides/shows the
+    // scene node and reports geometry.
+
+    // The window's current on-screen box in LAYOUT coordinates: its scene-node
+    // position plus the size of its current xdg window geometry. Valid only for
+    // the call. The dock uses it to size the preview snapshot and to restore
+    // the window to where it was. Returns sane values only for a MAPPED
+    // toplevel; for an unmapped one the box reflects the last committed
+    // geometry at the node's last position and should not be relied upon (call
+    // it while mapped, e.g. from on_toplevel_mapped onward and before unmap).
+    [[nodiscard]] virtual auto geometry() const -> wlr_box = 0;
+
+    // The scene tree hosting this toplevel's surfaces — the SAME tree this
+    // extension created and registered via Host::host_surface (so it equals
+    // Host::scene_tree_for(this toplevel's wl_surface)). A BORROW owned by THIS
+    // extension; valid only while the Toplevel borrow is live (drop it on
+    // unmap). Never destroy it. The dock feeds it to
+    // UiSubstrate::create_preview() to snapshot the window, and it is the node
+    // hide()/show() enable/disable.
+    [[nodiscard]] virtual auto scene_tree() -> wlr_scene_tree* = 0;
+
+    // Compositor-side HIDE / SHOW: disable / enable the toplevel's scene node
+    // so it is not composited and the client stops receiving frame callbacks
+    // (wlr_scene withholds them from a non-visible node), WITHOUT unmapping it
+    // — the client stays mapped and NO on_toplevel_unmapped fires. Idempotent
+    // (double hide/show is fine). Does NOT change keyboard focus or raise: if
+    // the focused window is hidden, the caller drives focus to whatever should
+    // be focused next (via focus() on that toplevel). "minimized" is the
+    // caller's concept, not tracked here. A hidden toplevel still unmaps /
+    // destroys normally (on_toplevel_unmapped fires) when its client closes it.
+    virtual void hide() = 0;
+    virtual void show() = 0;
 
 protected:
     Toplevel() = default;
