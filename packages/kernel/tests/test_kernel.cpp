@@ -326,7 +326,108 @@ private:
     std::unique_ptr<UiSurface> surface_;
 };
 
+// The dock card faithfully: a transformed (translateX body), rounded,
+// overflow:hidden 100x100 div whose preview is an image() DECORATOR (cover) —
+// the exact RmlUi path the dock hits. PREVIEW_URI substituted at runtime.
+const char* kDockCardRml = R"RML(<rml>
+<head>
+<style>
+body { margin: 0px; transform: translateX(0px); transform-origin: 0% 0%; }
+#card { display: block; position: absolute; left: 20px; top: 20px;
+        width: 100px; height: 100px; border-radius: 50px; overflow: hidden;
+        background-color: #2e2e32ff; }
+#fill { display: block; width: 100%; height: 100%;
+        decorator: image( PREVIEW_URI cover ); }
+</style>
+</head>
+<body data-model="ui">
+<div id="card"><div id="fill"></div></div>
+</body>
+</rml>)RML";
+
+class PreviewDecoratorExtension : public unbox::kernel::Extension {
+public:
+    auto manifest() const -> const Manifest& override { return manifest_; }
+    void activate(Host& host) override {
+        if (!host.ui().available()) return;
+        src_tree_ = wlr_scene_tree_create(host.scene_layer(unbox::kernel::SceneLayer::background));
+        if (src_tree_ == nullptr) return;
+        src_buf_ = make_solid_buffer(64, 64, 0xff, 0x20, 0x60); // #ff2060
+        src_node_ = wlr_scene_buffer_create(src_tree_, &src_buf_->base);
+        wlr_buffer_drop(&src_buf_->base);
+        preview_ = host.ui().create_preview(src_tree_);
+        if (preview_ == nullptr) return;
+        std::string rml = kDockCardRml;
+        const std::string token = "PREVIEW_URI";
+        rml.replace(rml.find(token), token.size(), preview_->source_uri());
+        UiSurfaceSpec spec;
+        spec.rml_inline = rml;
+        spec.width = 200;
+        spec.height = 200;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+    void teardown() {
+        surface_.reset();
+        preview_.reset();
+        if (src_tree_ != nullptr) { wlr_scene_node_destroy(&src_tree_->node); src_tree_ = nullptr; }
+    }
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+    [[nodiscard]] auto has_preview() const -> bool { return preview_ != nullptr; }
+private:
+    Manifest manifest_{"preview-decorator-test", Tier::standard, {}};
+    wlr_scene_tree* src_tree_ = nullptr;
+    TestSrcBuffer* src_buf_ = nullptr;
+    wlr_scene_buffer* src_node_ = nullptr;
+    std::unique_ptr<unbox::kernel::Preview> preview_;
+    std::unique_ptr<UiSurface> surface_;
+};
+
+// Alpha byte of a packed 0xRRGGBBAA ui_pixel readback (0 = transparent).
+auto opaque_alpha(unsigned int px) -> int { return static_cast<int>(px & 0xff); }
+
 } // namespace
+
+// An image() DECORATOR on a CHILD of a rounded overflow:hidden card clips to the
+// card's rounded shape (the corners read transparent). This is the structure the
+// stage dock must use: RmlUi does NOT clip an element's OWN decorator to its OWN
+// border-radius (only descendant content is clipped via the parent's clip mask),
+// so a decorator placed directly on the rounded card renders SQUARE. Putting the
+// decorator on a full-bleed child makes the kernel's stencil clip-mask round it.
+// (Failing-then-passing lives in ext-stage-dock's RCSS — see report change-req;
+// here we prove the SUBSTRATE clip-mask rounds a child decorator correctly.)
+TEST_CASE("substrate: image-decorator on a child of a rounded card clips to the rounded shape") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM"); // dmabuf path (the real-seat path)
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PreviewDecoratorExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    if (!ext->has_preview() || !ext->has_surface()) {
+        return; // no GL path: skip
+    }
+    pump(*server, 80);
+    if (server->ui_frame_count() == 0) {
+        ext->teardown();
+        return;
+    }
+    // The card is a 100x100 circle (border-radius:50px) at (20,20)..(120,120).
+    // Center reads the preview image (#ff2060, red-dominant).
+    const unsigned int center = server->ui_pixel(70, 70);
+    INFO("card center (70,70) = ", center);
+    CHECK(opaque_alpha(center) == 0xff);
+    CHECK(((center >> 24) & 0xff) > 150);          // red preview present at center
+    // The square corners of the card box fall OUTSIDE the inscribed circle => the
+    // child decorator is clipped away by the rounded stencil mask => transparent.
+    CHECK(server->ui_pixel(22, 22) == 0u);         // top-left card corner clipped
+    CHECK(server->ui_pixel(118, 22) == 0u);        // top-right
+    CHECK(server->ui_pixel(22, 118) == 0u);        // bottom-left
+    CHECK(server->ui_pixel(118, 118) == 0u);       // bottom-right
+    ext->teardown();
+}
 
 TEST_CASE("substrate: unavailable under pixman; create_surface degrades to null") {
     setenv("WLR_BACKENDS", "headless", 1);
@@ -804,6 +905,240 @@ TEST_CASE("substrate: un-painted pixels are transparent; painted box stays opaqu
     CHECK(bg > 140);            // strong green
 
     unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+// ============================================================================
+// slice-10 / RmlUi CLIPPING (scissor + stencil clip-mask). The stage dock draws
+// rounded cards with an overflowing preview image; the GLES-adapted render
+// interface's clip path was never exercised before. Two clip mechanisms:
+//   - rectangular: overflow:hidden -> EnableScissorRegion/SetScissorRegion ->
+//     glScissor (must clip to the element's ON-SCREEN box, not a flipped strip);
+//   - rounded: border-radius -> EnableClipMask/RenderToClipMask -> the STENCIL
+//     buffer (the offscreen render target must carry a stencil attachment).
+// Proven via the public Host::ui() path + position-aware ui_pixel readback.
+// ============================================================================
+
+namespace {
+
+// A 200x200 surface. A 60x60 #e03060 parent at top-left clips (overflow:hidden)
+// a 600x600 child that would otherwise overflow far past it. If scissor is
+// correct, only the top-left 60x60 is painted; everything outside is unpainted.
+const char* kScissorRml = R"RML(<rml>
+<head>
+<style>
+body { margin: 0px; }
+#clip { display: block; position: absolute; left: 0px; top: 0px;
+        width: 60px; height: 60px; overflow: hidden; }
+#big  { display: block; width: 600px; height: 600px; background-color: #e03060; }
+</style>
+</head>
+<body data-model="ui">
+<div id="clip"><div id="big"></div></div>
+</body>
+</rml>)RML";
+
+// Mirrors the stage dock card: a TRANSFORMED (scale) border-radius element
+// whose overflow clips a large child. A transform on the element forces RmlUi
+// to clip via the STENCIL clip-mask (not glScissor — a scissor rect can't
+// represent a transformed region), and the border-radius does too. This is the
+// path the dock actually hits and the simple scissor fixture does NOT.
+const char* kTransformClipRml = R"RML(<rml>
+<head>
+<style>
+body { margin: 0px; transform: translateX(0px); transform-origin: 0% 0%; }
+#card { display: block; position: absolute; left: 20px; top: 20px;
+        width: 100px; height: 100px; overflow: hidden; border-radius: 50px;
+        transform: scale(1.0); transform-origin: 0% 0%; }
+#big  { display: block; width: 600px; height: 600px; background-color: #c08020; }
+</style>
+</head>
+<body data-model="ui">
+<div id="card"><div id="big"></div></div>
+</body>
+</rml>)RML";
+
+// A 200x200 surface with a 200x200 element filled #30c0e0 and a huge
+// border-radius (100px => a full circle inscribed in the square). The four
+// square corners fall OUTSIDE the rounded mask -> must be clipped transparent;
+// the center is inside -> painted.
+const char* kRoundedRml = R"RML(<rml>
+<head>
+<style>
+body { margin: 0px; }
+#round { display: block; position: absolute; left: 0px; top: 0px;
+         width: 200px; height: 200px; border-radius: 100px;
+         background-color: #30c0e0; }
+</style>
+</head>
+<body data-model="ui">
+<div id="round"></div>
+</body>
+</rml>)RML";
+
+class ClipTestExtension : public unbox::kernel::Extension {
+public:
+    explicit ClipTestExtension(const char* rml) : rml_(rml) {}
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        UiSurfaceSpec spec;
+        spec.rml_inline = rml_;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 200;
+        spec.height = 200;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    const char* rml_;
+    Manifest manifest_{"clip-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+// Like ClipTestExtension but creates the surface at a 1px placeholder (as the
+// stage dock does) and grows it via set_size — to exercise clipping AFTER a
+// render-target realloc (does the layer stack / stencil follow the new size?).
+class ClipGrowTestExtension : public unbox::kernel::Extension {
+public:
+    explicit ClipGrowTestExtension(const char* rml) : rml_(rml) {}
+    auto manifest() const -> const Manifest& override { return manifest_; }
+    void activate(Host& host) override {
+        UiSurfaceSpec spec;
+        spec.rml_inline = rml_;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 1;
+        spec.height = 1;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+    void grow(int w, int h) {
+        if (surface_ != nullptr) surface_->set_size(w, h);
+    }
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    const char* rml_;
+    Manifest manifest_{"clip-grow-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+} // namespace
+
+TEST_CASE("substrate: overflow:hidden scissor clips a child to the parent box (correct band)") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new ClipTestExtension(kScissorRml);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 60);
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        return;
+    }
+
+    // Inside the 60x60 clip box (top-left): the child paints, reads #e03060.
+    const unsigned int inside = server->ui_pixel(20, 20);
+    INFO("inside-clip pixel (20,20) = ", inside);
+    CHECK(opaque_alpha(inside) == 0xff);
+    CHECK(((inside >> 24) & 0xff) > 150);  // red-dominant #e03060
+    CHECK(((inside >> 8) & 0xff) < 140);   // not much blue
+
+    // OUTSIDE the parent box, well below it (document y=150) and right
+    // (document x=150): the child would overflow here, but overflow:hidden must
+    // clip it away => transparent. A wrong scissor Y clips the OPPOSITE band, so
+    // (150,150) would read painted. This is the failing-then-passing assertion.
+    CHECK(server->ui_pixel(150, 150) == 0u); // far corner: unpainted
+    CHECK(server->ui_pixel(20, 150) == 0u);  // straight below the box: unpainted
+    CHECK(server->ui_pixel(150, 20) == 0u);  // straight right of the box: unpainted
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+TEST_CASE("substrate: border-radius clip-mask (stencil) rounds the corners") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new ClipTestExtension(kRoundedRml);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 60);
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        return;
+    }
+
+    // Center of the 200x200 circle: inside the rounded mask => painted #30c0e0.
+    const unsigned int center = server->ui_pixel(100, 100);
+    INFO("rounded center (100,100) = ", center);
+    CHECK(opaque_alpha(center) == 0xff);
+    CHECK(((center >> 8) & 0xff) > 150);   // blue-ish #30c0e0
+    CHECK(((center >> 16) & 0xff) > 120);  // strong green component
+
+    // The square's corners fall OUTSIDE the inscribed circle (a 100px radius on
+    // a 200px box => the corner at (2,2) is ~138px from center, well outside the
+    // 100px radius). With the stencil clip-mask working they are clipped away =>
+    // transparent. Before the fix (no stencil / wrong mask) the corner reads the
+    // opaque fill (square). Sample a few pixels into each corner to dodge AA.
+    INFO("corner (3,3) = ", server->ui_pixel(3, 3));
+    CHECK(server->ui_pixel(3, 3) == 0u);       // top-left corner clipped
+    CHECK(server->ui_pixel(196, 3) == 0u);     // top-right corner clipped
+    CHECK(server->ui_pixel(3, 196) == 0u);     // bottom-left corner clipped
+    CHECK(server->ui_pixel(196, 196) == 0u);   // bottom-right corner clipped
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+// The dock's actual clip path: a TRANSFORMED body + a transformed,
+// overflow:hidden, border-radius card clipping an overflowing child. A transform
+// forces RmlUi onto the stencil clip-mask (a scissor rect can't represent a
+// transformed region). This must still round correctly AFTER a set_size grow
+// (the layer stack + its shared stencil renderbuffer must follow the new size) —
+// the exact lifecycle the dock hits (create tiny -> grow on minimize).
+TEST_CASE("substrate: transformed rounded clip (stencil) survives a set_size grow") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM"); // dmabuf path (the real-seat path)
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new ClipGrowTestExtension(kTransformClipRml);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 20);     // render at the 1px create size first
+    ext->grow(200, 200);   // grow like the dock on minimize (realloc + new layers)
+    pump(*server, 40);
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        return; // no GL path: skip
+    }
+
+    // The card is a 100x100 circle at (20,20)..(120,120) filled #c08020 (orange).
+    const unsigned int center = server->ui_pixel(70, 70);
+    INFO("xform card center (70,70) = ", center);
+    CHECK(opaque_alpha(center) == 0xff);
+    CHECK(((center >> 24) & 0xff) > 150);  // red-dominant orange #c08020
+    CHECK(((center >> 8) & 0xff) < 120);   // little blue
+    // Card box corners fall outside the inscribed circle => clipped transparent.
+    CHECK(server->ui_pixel(22, 22) == 0u);
+    CHECK(server->ui_pixel(118, 22) == 0u);
+    CHECK(server->ui_pixel(22, 118) == 0u);
+    CHECK(server->ui_pixel(118, 118) == 0u);
 }
 
 // ============================================================================
