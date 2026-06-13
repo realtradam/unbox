@@ -103,6 +103,19 @@ public:
     // known source color reached the expected spot inside an <img>.
     [[nodiscard]] auto ui_pixel(int x, int y) const -> unsigned int;
 
+    // Whether the first ui surface's scene_buffer node carries a non-empty
+    // opaque region. The per-pixel-alpha contract requires FALSE: a forced
+    // opaque region would make wlr_scene skip alpha-blending the buffer, so the
+    // scene below would be occluded by un-painted pixels. Test instrumentation;
+    // single-thread only.
+    [[nodiscard]] auto ui_surface_has_opaque_region() const -> bool;
+
+    // Number of UiSurface::set_size GL-target reallocations performed so far.
+    // A same-size set_size is a no-op (does not bump this); a grow/shrink
+    // reallocates the FBO/swapchain/EGLImage/texture and bumps it. Lets the
+    // suite prove the only-on-change guard. Test instrumentation; single-thread.
+    [[nodiscard]] auto ui_resize_realloc_count() const -> int;
+
     // Count elements with the given tag name in the first ui surface's loaded
     // document. 0 if no surface / no document yet. Lets the suite assert that a
     // data-for list rendered the expected number of rows (slice 10 / b2 list

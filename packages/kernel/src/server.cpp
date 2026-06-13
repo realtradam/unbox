@@ -89,6 +89,14 @@ auto Server::ui_pixel(int x, int y) const -> unsigned int {
     return impl_->substrate != nullptr ? impl_->substrate->surface_pixel(x, y) : 0U;
 }
 
+auto Server::ui_surface_has_opaque_region() const -> bool {
+    return impl_->substrate != nullptr && impl_->substrate->surface_has_opaque_region();
+}
+
+auto Server::ui_resize_realloc_count() const -> int {
+    return impl_->substrate != nullptr ? impl_->substrate->resize_realloc_count() : 0;
+}
+
 auto Server::ui_element_count(const char* tag) const -> int {
     return impl_->substrate != nullptr ? impl_->substrate->element_count(tag) : 0;
 }

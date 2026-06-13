@@ -549,6 +549,7 @@ struct Substrate::Impl {
     std::list<PreviewState> previews;
     int next_preview_id = 0;
     bool last_preview_dmabuf = false; // test probe: last import took the dmabuf path
+    int resize_realloc_count = 0;     // test probe: # of set_size GL-target reallocs
 
     // Pointer implicit grab: the consumer of the first button press owns the
     // whole press..release stream (standard seat behavior). `pointer_grab`
@@ -605,6 +606,17 @@ struct Substrate::Impl {
     void refresh_bindings(Surface& s);
 
     bool init_surface_gl(Surface& s);
+    // Free ONLY the GL render-target resources of `s` (FBO, swapchain + its
+    // cached EGLImages/textures, Plan-B texture/shm buffer, readback scratch) —
+    // leaves the context/document/scene_buffer/bindings intact. Caller holds the
+    // sibling context current. Shared by destroy_surface and the resize path.
+    void free_surface_gl(Surface& s);
+    // Reallocate `s`'s render target to w×h (FBO + swapchain/shm + EGLImage +
+    // texture). Updates s.width/s.height and the RmlUi context dimensions. Caller
+    // must guarantee w>0 && h>0. Returns false if the rebuild failed (the surface
+    // is then left with no GL target and will not render until a later resize
+    // succeeds). Caller holds the sibling context current.
+    bool resize_surface_gl(Surface& s, int w, int h);
     void render_surface(Surface& s); // caller holds context current
     void destroy_surface(Surface* s);
 
@@ -780,9 +792,24 @@ void Substrate::Impl::render_surface(Surface& s) {
     // flip_y: GL renders bottom-left origin; the FBO is sampled/scanned-out
     // top-first, so flip the final composite for an upright submitted buffer.
     gl.render_iface->SetOutputFramebuffer(target_fbo, /*flip_y=*/true);
+    // PER-PIXEL ALPHA: the output FBO is the surface's ARGB8888 wlr_buffer. It
+    // must start FULLY TRANSPARENT (0,0,0,0) so a pixel the RML document never
+    // paints stays alpha=0 and wlr_scene composites the scene below through it
+    // (no opaque region is ever set on the scene_buffer node). EndFrame()
+    // composites the document over this with the premultiplied-alpha blend
+    // (GL_ONE, GL_ONE_MINUS_SRC_ALPHA), so an opaque-bodied document still
+    // fully overwrites to opaque — identical to before. Clearing here (output
+    // FBO bound) also wipes stale swapchain content each frame. NOTE: we do NOT
+    // call render_iface->Clear() (the vendored helper clears whatever FBO is
+    // currently bound — after BeginFrame that is the internal render layer, and
+    // it clears to OPAQUE black (0,0,0,1), which is exactly what made every
+    // un-painted pixel reach the screen opaque).
+    glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     s.context->Update();
     gl.render_iface->BeginFrame();
-    gl.render_iface->Clear();
     s.context->Render();
     gl.render_iface->EndFrame();
 
@@ -809,6 +836,63 @@ void Substrate::Impl::render_surface(Surface& s) {
     s.frame_count += 1;
 }
 
+void Substrate::Impl::free_surface_gl(Surface& s) {
+    // Caller holds the sibling context current. Free every GL render-target
+    // resource; the scene_buffer keeps its OWN lock on whatever buffer it was
+    // last given (wlr_scene_buffer_set_buffer locked it), so dropping our locks
+    // here does not pull the buffer out from under the scene before the next
+    // wlr_scene_buffer_set_buffer replaces it.
+    for (auto& [buf, slot] : s.slot_gl) {
+        if (slot.tex != 0) {
+            glDeleteTextures(1, &slot.tex);
+        }
+        if (slot.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+            gl.egl_destroy_image(gl.egl_display, slot.image);
+        }
+    }
+    s.slot_gl.clear();
+    if (s.shm_tex != 0) {
+        glDeleteTextures(1, &s.shm_tex);
+        s.shm_tex = 0;
+    }
+    if (s.fbo != 0) {
+        glDeleteFramebuffers(1, &s.fbo);
+        s.fbo = 0;
+    }
+    if (s.swapchain != nullptr) {
+        wlr_swapchain_destroy(s.swapchain);
+        s.swapchain = nullptr;
+    }
+    if (s.shm != nullptr) {
+        wlr_buffer_drop(&s.shm->base);
+        s.shm = nullptr;
+    }
+    s.readback.clear();
+    s.readback.shrink_to_fit();
+    s.dmabuf = false;
+}
+
+bool Substrate::Impl::resize_surface_gl(Surface& s, int w, int h) {
+    // Caller guarantees positive geometry + sibling context current. Tear the
+    // old GL target down and rebuild at the new size; init_surface_gl re-decides
+    // Plan A vs B (it sets s.dmabuf). The RmlUi context is laid out to w×h so the
+    // document draws into a matching-size target. Per-pixel-alpha transparent
+    // clear, upright (V-flip) composite, premultiplied blend, and the fence-sync
+    // submit all live in render_surface/EndFrame and are unaffected — the new
+    // target goes through the exact same render path.
+    free_surface_gl(s);
+    s.width = w;
+    s.height = h;
+    if (s.context != nullptr) {
+        s.context->SetDimensions(Rml::Vector2i(w, h));
+    }
+    if (!init_surface_gl(s)) {
+        wlr_log(WLR_ERROR, "ui-substrate: resize realloc failed (%dx%d)", w, h);
+        return false;
+    }
+    return true;
+}
+
 void Substrate::Impl::destroy_surface(Surface* s) {
     const bool cur = gl.make_current();
     if (s->scene_buffer != nullptr) {
@@ -820,31 +904,7 @@ void Substrate::Impl::destroy_surface(Surface* s) {
         s->context = nullptr;
         s->document = nullptr;
     }
-    for (auto& [buf, slot] : s->slot_gl) {
-        if (slot.tex != 0) {
-            glDeleteTextures(1, &slot.tex);
-        }
-        if (slot.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
-            gl.egl_destroy_image(gl.egl_display, slot.image);
-        }
-    }
-    s->slot_gl.clear();
-    if (s->shm_tex != 0) {
-        glDeleteTextures(1, &s->shm_tex);
-        s->shm_tex = 0;
-    }
-    if (s->fbo != 0) {
-        glDeleteFramebuffers(1, &s->fbo);
-        s->fbo = 0;
-    }
-    if (s->swapchain != nullptr) {
-        wlr_swapchain_destroy(s->swapchain);
-        s->swapchain = nullptr;
-    }
-    if (s->shm != nullptr) {
-        wlr_buffer_drop(&s->shm->base);
-        s->shm = nullptr;
-    }
+    free_surface_gl(*s);
     if (cur) {
         gl.restore_current();
     }
@@ -1395,9 +1455,10 @@ auto Substrate::surface_pixel(int x, int y) const -> std::uint32_t {
     // Read the first rendered surface's current FBO at (x,y) via glReadPixels on
     // the sibling context — works for BOTH the shm and dmabuf paths (the FBO's
     // color attachment is the surface's submitted texture in either case), so
-    // this probe is independent of the per-surface path choice. row0 = GL
-    // bottom; the buffer is top-first (the renderer V-flips on composite), so
-    // map document-y -> GL-y = (h-1-y). R,G,B,A.
+    // this probe is independent of the per-surface path choice. The renderer
+    // V-flips on composite so the FBO is top-first (GL row 0 == document top,
+    // consistent with orientation()'s readback row0==top), hence document-y
+    // maps to GL row y DIRECTLY (a corner box at top:0 reads back at y≈0). R,G,B,A.
     for (const Surface& s : impl_->surfaces) {
         if (s.fbo == 0 || s.frame_count == 0) {
             continue;
@@ -1408,7 +1469,7 @@ auto Substrate::surface_pixel(int x, int y) const -> std::uint32_t {
         const bool cur = impl_->gl.make_current();
         std::uint8_t rgba[4] = {0, 0, 0, 0};
         glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
-        glReadPixels(x, s.height - 1 - y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         if (cur) {
             impl_->gl.restore_current();
@@ -1418,6 +1479,27 @@ auto Substrate::surface_pixel(int x, int y) const -> std::uint32_t {
                (static_cast<std::uint32_t>(rgba[2]) << 8) | static_cast<std::uint32_t>(rgba[3]);
     }
     return 0;
+}
+
+auto Substrate::surface_has_opaque_region() const -> bool {
+    // A per-pixel-alpha surface must NOT carry a forced opaque region: if it
+    // did, wlr_scene would treat the buffer as opaque and skip blending the
+    // scene below through the transparent (un-painted) pixels. We never call
+    // wlr_scene_buffer_set_opaque_region, so this reads empty.
+    for (const Surface& s : impl_->surfaces) {
+        if (s.scene_buffer == nullptr) {
+            continue;
+        }
+        // Read the region's extents directly (header-only; avoids linking the
+        // pixman lib): an empty region has a degenerate extents box.
+        const pixman_box32_t& e = s.scene_buffer->opaque_region.extents;
+        return e.x2 > e.x1 && e.y2 > e.y1;
+    }
+    return false;
+}
+
+auto Substrate::resize_realloc_count() const -> int {
+    return impl_->resize_realloc_count;
 }
 
 auto Substrate::element_count(const char* tag) const -> int {
@@ -1512,15 +1594,32 @@ void SurfaceHandle::set_position(int x, int y) {
 }
 
 void SurfaceHandle::set_size(int width, int height) {
-    // Geometry-only resize of an existing GL target is out of slice 5 (would
-    // require re-allocating FBO/swapchain). Record logical size + resize the
-    // Rml context; the rendered buffer keeps its allocated size. Documented in
-    // ui.hpp as "takes effect on next frame"; full realloc is a slice-6 ask.
-    surface_->width = width;
-    surface_->height = height;
-    if (surface_->context != nullptr) {
-        surface_->context->SetDimensions(Rml::Vector2i(width, height));
+    Surface& s = *surface_;
+    // Reject non-positive geometry, same as create_surface — keep the old size.
+    if (width <= 0 || height <= 0) {
+        wlr_log(WLR_ERROR, "ui-substrate: surface needs positive geometry");
+        return;
     }
+    // Only-on-change: a same-size set_size is a no-op (the dock calls set_size on
+    // every minimize/restore, often with the same height — never thrash the
+    // swapchain). A move (set_position) never reaches here, so it stays cheap.
+    if (width == s.width && height == s.height) {
+        return;
+    }
+    // Resize the actual render target so the surface renders at w×h (grow AND
+    // shrink): rebuild FBO + dmabuf swapchain (or shm buffer) + cached
+    // EGLImage/texture, lay the RmlUi context out to w×h, and re-set the scene
+    // node's buffer on the next render_surface tick. Heavier than set_position
+    // (reallocs GL resources); call on size changes, not every frame.
+    Substrate::Impl& impl = *substrate_->impl_;
+    const bool cur = impl.gl.make_current();
+    impl.resize_surface_gl(s, width, height); // updates s.width/s.height + ctx dims
+    ++impl.resize_realloc_count;
+    if (cur) {
+        impl.gl.restore_current();
+    }
+    // The scene-node composite size follows the new buffer (set on next render);
+    // the input hit-test rect uses s.width/s.height live, so it tracks too.
 }
 
 void SurfaceHandle::set_visible(bool visible) {

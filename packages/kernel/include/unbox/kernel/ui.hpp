@@ -47,6 +47,15 @@ namespace unbox::kernel {
 // the document AND its scene node (so hold it as a member; it dies with you,
 // in reverse declaration order, while the kernel's scene is still alive).
 // All methods are event-loop-thread only.
+//
+// PER-PIXEL ALPHA (transparency). The surface composites with per-pixel alpha:
+// any pixel your document does NOT paint is fully transparent, and the scene
+// BELOW the surface composites through it (the substrate never marks the buffer
+// opaque). So a document with a transparent <body> that paints, say, only a
+// card in one corner shows the windows beneath it everywhere else. If you want
+// a solid panel, paint an opaque background in your RCSS (e.g. body {
+// background-color: #rrggbb; }) — a fully-opaque document is pixel-identical to
+// a fully-opaque surface and occludes whatever it covers, as before.
 class UiSurface {
 public:
     virtual ~UiSurface() = default;
@@ -54,9 +63,19 @@ public:
     auto operator=(const UiSurface&) -> UiSurface& = delete;
 
     // ---- Geometry & visibility (layout coordinates) ----
-    // Move/resize the surface. The document is laid out to w×h; the node sits
-    // at (x,y) in layout space. Cheap; takes effect on the next frame.
+    // Move the surface: the node sits at (x,y) in layout space. Cheap (no
+    // realloc); takes effect on the next frame.
     virtual void set_position(int x, int y) = 0;
+    // Resize the surface to w×h. This RESIZES THE RENDER TARGET — the document
+    // is laid out to w×h AND draws into a buffer of matching size, so the
+    // surface renders fully at the new size (grow AND shrink both work; the
+    // composited node and the input hit-test rect track the new size). It is
+    // HEAVIER than set_position: on an actual size change it reallocates GL
+    // resources (the offscreen FBO + dmabuf swapchain / shm buffer), so call it
+    // on size changes, not every frame. A no-op same-size call is cheap (no
+    // realloc). Non-positive w/h is rejected (the surface keeps its size). Takes
+    // effect on the next frame; resizing a hidden surface is fine (it still is
+    // not composited until shown).
     virtual void set_size(int width, int height) = 0;
     // Show/hide without destroying. Hidden surfaces are not composited and do
     // not receive input. Default after create is the spec's `visible`.

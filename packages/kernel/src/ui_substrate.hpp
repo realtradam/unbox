@@ -189,6 +189,16 @@ public:
     // / out of bounds. A position-aware probe (like orientation()) so the suite
     // can assert a preview's known source color landed at the expected spot.
     [[nodiscard]] auto surface_pixel(int x, int y) const -> std::uint32_t;
+    // Whether the first surface's scene_buffer node carries a non-empty opaque
+    // region. The per-pixel-alpha contract requires this to be FALSE: a forced
+    // opaque region would tell wlr_scene to skip alpha-blending the ARGB8888
+    // buffer (occluding the scene below). The substrate never sets one — this
+    // probe lets the suite assert that invariant. False if no surface exists.
+    [[nodiscard]] auto surface_has_opaque_region() const -> bool;
+    // Number of set_size GL-target reallocations performed so far (across all
+    // surfaces). A same-size set_size must NOT bump it (only-on-change guard);
+    // a grow/shrink does. Lets the suite prove the no-op-same-size guard.
+    [[nodiscard]] auto resize_realloc_count() const -> int;
     // Count elements with `tag` in the first surface's loaded document (0 if no
     // surface / not loaded yet). Proves a data-for list rendered N rows.
     [[nodiscard]] auto element_count(const char* tag) const -> int;

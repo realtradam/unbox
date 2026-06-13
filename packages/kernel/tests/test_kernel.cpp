@@ -705,6 +705,234 @@ TEST_CASE("substrate: data-for list renders N rows, re-renders on dirty, routes 
 }
 
 // ============================================================================
+// slice-10 / ui-surface ALPHA (transparency). A ui surface composites with
+// per-pixel alpha: a pixel the document does NOT paint is transparent (the
+// scene below shows through), while a painted opaque box stays solid. The
+// substrate must (a) clear the surface's output buffer to transparent (0,0,0,0)
+// — NOT opaque black — and (b) never mark the scene_buffer opaque. This is the
+// substrate capability the stage dock needs (its un-painted strip becomes
+// see-through). Proven via the public Host::ui() path + the ui_pixel /
+// ui_surface_has_opaque_region probes.
+// ============================================================================
+
+namespace {
+
+// Transparent <body> with one small OPAQUE box in the top-left corner. The box
+// is #20c040 (an obvious, non-black color). Everything else is unpainted ⇒
+// must read back fully transparent. The box uses position:absolute so its
+// geometry is exact (a 40x40 square at 0,0).
+const char* kAlphaRml = R"RML(<rml>
+<head>
+<style>
+body { background-color: transparent; width: 200px; height: 200px; margin: 0px; }
+#box { display: block; width: 40px; height: 40px; background-color: #20c040; }
+</style>
+</head>
+<body data-model="ui">
+<div id="box"></div>
+</body>
+</rml>)RML";
+
+class AlphaTestExtension : public unbox::kernel::Extension {
+public:
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        UiSurfaceSpec spec;
+        spec.rml_inline = kAlphaRml;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 200;
+        spec.height = 200;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    Manifest manifest_{"alpha-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+} // namespace
+
+TEST_CASE("substrate: un-painted pixels are transparent; painted box stays opaque") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new AlphaTestExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 60); // load the document + render the surface
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM"); // no GL path on this box: skip
+        return;
+    }
+
+    // (1) The scene buffer must NOT carry a forced opaque region — otherwise
+    // wlr_scene would skip alpha-blending and occlude the scene below.
+    CHECK(server->ui_surface_has_opaque_region() == false);
+
+    // (2) A pixel in the UN-painted area (center, far from the corner box) is
+    // FULLY TRANSPARENT: premultiplied (0,0,0,0) ⇒ packed 0xRRGGBBAA == 0. This
+    // is the failing-then-passing assertion: before the fix the output FBO was
+    // cleared to opaque black (0,0,0,1) so this read back 0x000000ff.
+    const unsigned int unpainted = server->ui_pixel(100, 100);
+    INFO("un-painted center pixel (RRGGBBAA) = ", unpainted);
+    CHECK((unpainted & 0xffu) == 0u);   // alpha == 0
+    CHECK(unpainted == 0u);             // fully transparent premultiplied (0,0,0,0)
+
+    // (3) A pixel inside the box reads the box color, fully opaque. The 40x40
+    // box is the first normal-flow block at the document top-left; sample well
+    // inside it (10,10) to avoid antialiased edges.
+    const unsigned int box = server->ui_pixel(10, 10);
+    INFO("box pixel (RRGGBBAA) = ", box);
+    const int br = static_cast<int>((box >> 24) & 0xff);
+    const int bg = static_cast<int>((box >> 16) & 0xff);
+    const int bb = static_cast<int>((box >> 8) & 0xff);
+    const int ba = static_cast<int>(box & 0xff);
+    CHECK(ba == 0xff);          // opaque
+    CHECK(bg > br);             // green dominates (#20c040)
+    CHECK(bg > bb);
+    CHECK(br < 90);             // little red
+    CHECK(bg > 140);            // strong green
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+// ============================================================================
+// slice-10 / set_size RENDER-TARGET RESIZE. A surface created SMALL must grow
+// (and shrink) and render fully at the new size — set_size now reallocates the
+// FBO + dmabuf swapchain (or shm buffer) + EGLImage + texture, not just the
+// logical RmlUi layout. The dock creates a 1px placeholder and grows it; before
+// this fix the grown area rendered into the original tiny buffer (invisible).
+// Proven via the public Host::ui() path + the ui_pixel / ui_resize_realloc_count
+// probes. Full-body opaque color so a grown-area pixel reading the color proves
+// the new buffer was actually drawn into.
+// ============================================================================
+
+namespace {
+
+// A full-bleed opaque blue body (#2080e0), no margin, so EVERY pixel of the
+// surface (at whatever current size) is the painted color.
+const char* kResizeRml = R"RML(<rml>
+<head>
+<style>
+body { margin: 0px; }
+#fill { display: block; position: absolute; left: 0px; top: 0px;
+        width: 4000px; height: 4000px; background-color: #2080e0; }
+</style>
+</head>
+<body data-model="ui">
+<div id="fill"></div>
+</body>
+</rml>)RML";
+
+class ResizeTestExtension : public unbox::kernel::Extension {
+public:
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        UiSurfaceSpec spec;
+        spec.rml_inline = kResizeRml;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 40; // created SMALL (the dock starts at a tiny placeholder)
+        spec.height = 40;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+    auto surface() -> UiSurface* { return surface_.get(); }
+
+private:
+    Manifest manifest_{"resize-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+// True if (RRGGBBAA) is the painted blue #2080e0 (tolerant), opaque.
+auto is_painted_blue(unsigned int px) -> bool {
+    const int r = static_cast<int>((px >> 24) & 0xff);
+    const int g = static_cast<int>((px >> 16) & 0xff);
+    const int b = static_cast<int>((px >> 8) & 0xff);
+    const int a = static_cast<int>(px & 0xff);
+    return a == 0xff && b > 160 && b > r && b > g && r < 90;
+}
+
+} // namespace
+
+TEST_CASE("substrate: set_size resizes the render target (grow renders, shrink renders)") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM"); // exercise the real Plan-A path the dock hits
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new ResizeTestExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 30); // load + render at the small (40x40) size
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        return; // no GL path on this box: skip
+    }
+
+    // Small surface paints fully: its center reads the body color.
+    CHECK(is_painted_blue(server->ui_pixel(20, 20)));
+
+    // GROW to 200x200. Tick. A pixel deep in the GROWN region (150,150) — which
+    // does NOT exist in the original 40x40 buffer — must now read the painted
+    // color. Before the fix the document re-laid-out but rendered into the old
+    // 40x40 buffer, so (150,150) was unrendered (clamped/garbage/transparent).
+    const int before = server->ui_resize_realloc_count();
+    ext->surface()->set_size(200, 200);
+    CHECK(server->ui_resize_realloc_count() == before + 1); // grow reallocated
+    pump(*server, 10);
+    const unsigned int grown = server->ui_pixel(150, 150);
+    INFO("grown-region pixel (150,150) (RRGGBBAA) = ", grown);
+    CHECK(is_painted_blue(grown));
+    // The opaque-region invariant survives a resize (still per-pixel-alpha buffer).
+    CHECK(server->ui_surface_has_opaque_region() == false);
+    // The buffer is still upright after the realloc (no flip regression).
+    // (orientation() only inspects shm-path surfaces; this is the dmabuf path, so
+    // we assert upright indirectly: a top-left pixel and a bottom-right pixel of
+    // the full-bleed body both read the color, i.e. no garbled/empty rows.)
+    CHECK(is_painted_blue(server->ui_pixel(5, 5)));
+    CHECK(is_painted_blue(server->ui_pixel(195, 195)));
+
+    // SHRINK to 60x60. Tick. A pixel inside reads the color; out-of-bounds reads
+    // 0 (probe clamps), proving the buffer actually shrank.
+    ext->surface()->set_size(60, 60);
+    CHECK(server->ui_resize_realloc_count() == before + 2); // shrink reallocated
+    pump(*server, 10);
+    CHECK(is_painted_blue(server->ui_pixel(30, 30)));
+    CHECK(server->ui_pixel(150, 150) == 0u); // out of the new 60x60 bounds
+
+    // SAME-size set_size is a no-op realloc (only-on-change guard) and still
+    // renders correctly.
+    const int after_shrink = server->ui_resize_realloc_count();
+    ext->surface()->set_size(60, 60);
+    CHECK(server->ui_resize_realloc_count() == after_shrink); // no extra realloc
+    pump(*server, 5);
+    CHECK(is_painted_blue(server->ui_pixel(30, 30)));
+
+    // Non-positive set_size is rejected (keeps the 60x60 size; no realloc).
+    ext->surface()->set_size(0, 100);
+    ext->surface()->set_size(100, -1);
+    CHECK(server->ui_resize_realloc_count() == after_shrink);
+    pump(*server, 5);
+    CHECK(is_painted_blue(server->ui_pixel(30, 30)));
+}
+
+// ============================================================================
 // VT-switch escape hatch — PURE CORE (no wlroots): keysym -> VT number. The
 // glue (input.cpp) calls wlr_session_change_vt on a hit and consumes; this
 // helper decides the hit. Ctrl+Alt+Fn arrives as XF86Switch_VT_1..12.
