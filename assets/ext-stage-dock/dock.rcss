@@ -18,7 +18,7 @@ body.dock {
     overflow-x: hidden;
     overflow-y: auto;
     transform: translateX(-100%);
-    transition: transform 0.18s cubic-in-out;
+    transition: transform 0.36s cubic-in-out;
 }
 body.dock.open {
     transform: translateX(0px);
