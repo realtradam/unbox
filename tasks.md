@@ -29,6 +29,10 @@ real-seat feel pending):**
 - b4 ext-stage-dock (new unit) — skeleton + pure cores (reveal recognizer, dock layout). (d6535e8)
 - c2 ext-stage-dock + host-bin — Super+M minimize → preview slot → hide; tap → restore. (3376100)
 - d1 ext-stage-dock — RCSS dock slide-in + per-slot settle; restore instant. (b578327)
+- fix ext-stage-dock — dock previews were blank: `data-attr-src` (RmlUi binds
+  attrs, not `{{}}`) + font `Noto Sans` + valid `transform-origin`. REAL-SEAT
+  VERIFIED: minimizing 2 foot windows shows 2 live preview snapshots in the dock;
+  Super+M repeats with >1 window. (5ebd45a)
 
 **NEXT (needs user):**
 1. REAL-SEAT feel check (covers c2+d1): `~/start-unbox.sh -s foot`, Super+M minimizes
@@ -62,7 +66,7 @@ deprecated no-op `Options::ui_spike`, retiring host-bin's demo ui.
 | 7 | ext-window-tiling: pure layout core + thin scene glue | pending | layout math 100% doctest-covered, zero wlroots types in core |
 | 8 | ext-osk: RML keyboard ui surface injecting via wlr_seat | pending | type into foot via touch only; auto-show on text-input focus |
 | 9 | Session hardening: s6 user service, TTY launch on seat0, layout persistence (append-only state + pure reconcile on boot) | pending | survives `kill -9` + s6 restart with workspaces restored |
-| 10 | **Stage dock** (ext-stage-dock): minimized-window previews on a left-edge swipe (Fork B) | **a1–d1 landed** (real-seat pending) | DONE: Super+M minimize→RMLUi-imported preview snapshot→dock slot→hide; tap→restore; RCSS dock slide-in + slot settle. NEXT: real-seat feel + 1 boundary call (input-transparent UiSurface flag) → e1 gesture reveal/drag-out |
+| 10 | **Stage dock** (ext-stage-dock): minimized-window previews on a left-edge swipe (Fork B) | **a1–d1 landed; previews real-seat-verified** | DONE: Super+M minimize→RMLUi-imported preview snapshot→dock slot→hide (previews confirmed rendering on hardware); RCSS dock slide-in + slot settle. NEXT: confirm tap-to-restore + animation feel; 1 boundary call (input-transparent UiSurface flag) → c1 gesture-claim → e1 gesture reveal/drag-out; then config-driven minimize keybind + favicon (XDG icon dep) |
 
 ## Deferred decisions (decide when reached — see notes/plan.md §7)
 
