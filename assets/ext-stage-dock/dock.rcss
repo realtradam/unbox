@@ -1,12 +1,48 @@
 body.dock {
-    background-color: #00000080;
+    /* FULL-HEIGHT LEFT RAIL. The surface is the full output height (sized in
+       C++); height:100% fills it. #00000080 is the visible translucent panel
+       (the whole rail). It is a flex COLUMN scroll container: the cards stack
+       vertically, the .rail wrapper centers via margin:auto when they fit, and
+       overflow-y scrolls when they exceed the height. align-items:flex-start
+       pins the cards to the LEFT (the 224dp cards stay ~8dp from the screen edge
+       over the dark end of the gradient; the rail is wider (kDockWidth 288) so
+       the gradient fades to transparent over the empty space to their right). */
+    width: 100%;
+    height: 100%;
+    decorator: horizontal-gradient( #000000ff #00000000 );
     padding: 8dp;
     font-family: Noto Sans;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    overflow-x: hidden;
+    overflow-y: auto;
     transform: translateX(-100%);
     transition: transform 0.18s cubic-in-out;
 }
 body.dock.open {
     transform: translateX(0px);
+}
+/* Hide both scrollbars (the rail scrolls, but no visible scrollbar). RmlUi
+   instances scrollbarvertical/scrollbarhorizontal elements; width/height 0 hides
+   them (verified pattern: vendored Samples effects_style.rcss / invader.rcss). */
+body.dock scrollbarvertical {
+    width: 0dp;
+}
+body.dock scrollbarhorizontal {
+    height: 0dp;
+}
+/* The slot WRAPPER. margin:auto on this single flex item vertically centers the
+   card stack when it fits, and collapses to 0 free-space (top stays reachable,
+   no clipping) when the cards overflow — the correct flex-center+overflow
+   pattern (justify-content:center would strand/clip the top on overflow).
+   flex-shrink:0 so the stack keeps its natural height and the container scrolls. */
+div.rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex-shrink: 0;
+    margin: auto 0;
 }
 @keyframes slot-enter {
     from {

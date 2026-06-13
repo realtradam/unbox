@@ -9,6 +9,7 @@
 #include <unbox/kernel/ui.hpp>
 #include <unbox/kernel/wlr.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -52,36 +53,12 @@ using Toplevel = ext_xdg_shell::Toplevel;
 constexpr std::uint32_t kMinimizeKeysym = XKB_KEY_m;       // 0x06d
 constexpr std::uint32_t kMinimizeMods = WLR_MODIFIER_LOGO;  // Super/LOGO
 
-// The dock width (revealed) in px — matches the dock_layout default. For c2 the
-// dock sits fully revealed (no reveal animation); d1 animates dock_box(f).
-constexpr int kDockWidth = 240;
-
-// Card-stack metrics, in px, that MIRROR the kDockRml RCSS so the surface rect
-// can be sized (via dock_layout::content_height) to hug the rendered card stack
-// rather than the full output height. dp == px (substrate dp-ratio is 1.0), so
-// these are the RCSS dp values:
-//   kCardHeight  — one div.slot's OUTER (border-box) height. The card IS the
-//     preview now (a full-bleed `div.thumb` child carries the image() decorator
-//     and the rounded `overflow:hidden` slot clips it; the title is OVERLAID
-//     absolute at the bottom — neither child adds to the box height). The card is
-//     a FIXED EXPLICIT box: `div.slot { width: 224dp; height: 140dp; }`. Both
-//     dimensions MUST be explicit: the slot's only children are out-of-flow
-//     (absolute), so an auto/`width:100%` box has no in-flow content and
-//     COLLAPSED (decorators paint inside the box but contribute NO layout size) —
-//     only a ~10dp sliver of the rounded edge rendered. The explicit 224dp ×
-//     140dp box fixes that. 224 = the dock inner width (240 dock_width - 2*8dp
-//     body padding); 140 ≈ a 16:10 landscape card at 224 wide (224*10/16=140), a
-//     sane thumbnail aspect. A fixed box keeps the surface-hugging math
-//     deterministic; the thumb decorator's `cover center center` fit fills the
-//     box (centered) for any source aspect without distortion (cropping overflow).
-//   kCardGap     — the inter-card vertical space (div.slot margin-bottom: 8dp).
-//   kStripPad    — the strip's inner top/bottom margin (body.dock padding: 8dp).
-// content_height(count) = 2*kStripPad + count*kCardHeight + (count-1)*kCardGap.
-// MUST stay in lockstep with the RCSS height/margin/padding AND with
-// tests/test_policy.cpp's expected hug heights.
-constexpr int kCardHeight = 140;
-constexpr int kCardGap = 8;
-constexpr int kStripPad = 8;
+// The dock width (revealed) in px. The rail is kDockWidth wide x the full output
+// height tall (dock_box). d1 animates the reveal via the body translateX in RCSS
+// (not by resizing the surface). 288 = the original 240 widened ~20% so the
+// horizontal gradient (dark left -> transparent right) extends farther right;
+// the cards stay 224dp (RCSS) left-aligned, so the extra width is to their right.
+constexpr int kDockWidth = 288;
 
 // A minimized window's dock entry: the live Toplevel* borrow (valid until its
 // unmapped event), the frozen Preview (owns the imported texture; null when the
@@ -300,13 +277,10 @@ private:
     //     -> the body slides back out; we DEFER set_visible(false) until the
     //     slide-out finishes (on_dock_settled, fired by RmlUi's transitionend
     //     through the existing event binding) so the close animation is seen.
-    // The surface rect tracks the slot count: whenever there is at least one
-    // slot we set_size the height to content_height(count) so the rect hugs the
-    // card stack (brief §3 — minimize the input-capturing area). We do NOT
-    // shrink to 0 the instant the dock empties: that would collapse the surface
-    // mid slide-OUT and the close animation would not be seen. Instead we keep
-    // the last non-empty height through the slide and shrink to 0 in
-    // on_dock_settled (with set_visible(false)). The width is fixed (kDockWidth).
+    // The surface is a fixed full-height rail; its size never changes with the
+    // card count (the RCSS scrolls/centers the cards within it). Only visibility
+    // toggles: shown when there is >= 1 slot, hidden (after the slide-out) when
+    // empty so the rail is not always eating the left strip.
     //
     // No-op on the visual when the surface is null (no-GL backend); the model is
     // still tracked, and slot_count()/the c2 invariants are unchanged.
@@ -315,13 +289,6 @@ private:
             return;
         }
         dock_surface_->dirty("slots");
-
-        // Resize the rect to hug the cards while non-empty (growing OR shrinking
-        // by one of several). When empty, defer the collapse to on_dock_settled.
-        if (!slots_.empty()) {
-            const int w = layout::dock_box(dock_metrics(), 1.0).w;
-            dock_surface_->set_size(w, surface_height_for(slots_.size()));
-        }
 
         const bool want_open = !slots_.empty();
         if (want_open == open_) {
@@ -351,31 +318,34 @@ private:
     // again-open dock: we re-check open_.
     void on_dock_settled() {
         if (dock_surface_ != nullptr && closing_ && !open_) {
+            // Slide-out finished and the dock is empty: hide the full-height rail
+            // so it stops compositing AND stops capturing input over the left
+            // strip. The surface keeps its full height (no resize) for the next
+            // reveal; only visibility toggled.
             dock_surface_->set_visible(false);
-            // Collapse the rect now that the slide-out is done and the surface is
-            // hidden: a hidden empty dock captures NO input. Deferred to here (not
-            // refresh_slots) so the card stack stays sized through the slide. The
-            // height is the positive 1px placeholder (count==0), never 0.
-            const int w = layout::dock_box(dock_metrics(), 1.0).w;
-            dock_surface_->set_size(w, surface_height_for(slots_.size())); // count==0 -> 1px
         }
         closing_ = false;
     }
 
     // Create the dock UiSurface (overlay, left edge) and register all data
-    // bindings BEFORE the first frame. The surface rect HUGS the card stack: its
-    // width is the dock_box width, its height is content_height(slot count) —
-    // NOT the full output height — because the substrate consumes pointer/touch
-    // over the whole rect regardless of visual transparency, so a transparent
-    // full-height strip would still eat clicks over the empty area (brief §3).
-    // Height tracks the slot count via set_size in refresh_slots(); at create
-    // the dock is empty so the height is a POSITIVE 1px placeholder (the
-    // substrate rejects non-positive geometry — see surface_height_for) and the
-    // surface is hidden (spec.visible=false) until the first slot. Null surface
-    // (no-GL backend) is fine — we just skip it and the model is still tracked.
+    // bindings BEFORE the first frame. The surface is a FULL-HEIGHT left RAIL:
+    // kDockWidth (240) wide x the full OUTPUT HEIGHT tall, at the output's
+    // top-left, REGARDLESS of card count (the RCSS owns the in-rail flow:
+    // flex-column centering + overflow-y scroll). It is hidden (spec.visible =
+    // false) until the first slot, so the rail only appears when there are
+    // minimized windows (it does not always eat the left strip). set_size never
+    // changes the height afterwards — only visibility toggles.
+    //
+    // ACCEPTED CAVEAT (deferred): while shown, the full-height surface captures
+    // pointer/touch across the whole 240px left strip — windows under it there
+    // are not clickable. Width is kept minimal (240). The real fix is the
+    // deferred input-transparent UiSurfaceSpec flag (report change-req).
+    //
+    // Null surface (no-GL backend) is fine — we just skip it and the model is
+    // still tracked.
     void create_dock_surface() {
         const layout::DockMetrics m = dock_metrics();
-        const layout::Box frame = layout::dock_box(m, 1.0); // fully revealed (c2)
+        const layout::Box frame = layout::dock_box(m, 1.0); // full-height rail
 
         kernel::UiSurfaceSpec spec;
         // External asset (RELATIVE to the asset root the orchestrator wires) so
@@ -385,7 +355,10 @@ private:
         spec.x = frame.x;
         spec.y = frame.y;
         spec.width = frame.w;
-        spec.height = surface_height_for(slots_.size()); // hug the card stack
+        // Full output height. Guard >= 1: the substrate rejects non-positive
+        // geometry, and on a backend with no output yet frame.h could be 0 (the
+        // dock is hidden until a slot exists anyway).
+        spec.height = std::max(1, frame.h);
         spec.layer = kernel::SceneLayer::overlay;
         spec.visible = false; // shown when slot count > 0
 
@@ -426,9 +399,8 @@ private:
 
     // Dock metrics from the first output's size (queried via output_layout). On
     // a backend with no output yet, falls back to 0x0 (the dock is hidden until
-    // a slot exists anyway). The dock keeps its fixed width; its HEIGHT now hugs
-    // the card stack (content_height), not the full output (input caveat, §3).
-    // The card-stack dims (slot_height/gap/pad) mirror the kDockRml RCSS.
+    // a slot exists anyway). dock_box() turns these into the full-height rail
+    // rect (kDockWidth wide x output height tall, at the output top-left).
     [[nodiscard]] auto dock_metrics() const -> layout::DockMetrics {
         int ow = 0;
         int oh = 0;
@@ -449,26 +421,7 @@ private:
         m.output_w = ow;
         m.output_h = oh;
         m.dock_width = kDockWidth;
-        // Card-stack dims mirror the kDockRml RCSS so content_height() yields the
-        // surface height that hugs the rendered cards (see kCardHeight et al.).
-        m.slot_height = kCardHeight;
-        m.gap = kCardGap;
-        m.pad = kStripPad;
         return m;
-    }
-
-    // The POSITIVE surface HEIGHT that hugs `count` cards: the strip's content
-    // height (2*pad + count*card + (count-1)*gap) per dock_layout, CLAMPED to a
-    // strictly-positive minimum (>= 1). The substrate REJECTS non-positive
-    // geometry (create_surface/set_size return nullptr + log
-    // "surface needs positive geometry"), so the EMPTY dock (count 0 ->
-    // content_height 0) must be created/resized at a positive size and merely
-    // hidden (set_visible(false)), never at height 0. The substrate consumes
-    // input over the whole rect, so sizing height to the card stack (not the
-    // full output) leaves the rest of the screen interactive (brief §3 caveat);
-    // the empty-dock 1px placeholder is hidden, so it captures nothing.
-    [[nodiscard]] auto surface_height_for(std::size_t count) const -> int {
-        return layout::surface_height(dock_metrics(), static_cast<int>(count));
     }
 
     const kernel::Manifest manifest_{

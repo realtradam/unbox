@@ -133,9 +133,7 @@ TEST_CASE("an inactive (non-edge) recognizer is inert") {
 // ============================================================================
 
 static auto metrics() -> lay::DockMetrics {
-    return lay::DockMetrics{
-        .output_w = 1920, .output_h = 1080, .dock_width = 300,
-        .slot_height = 100, .gap = 10, .pad = 20};
+    return lay::DockMetrics{.output_w = 1920, .output_h = 1080, .dock_width = 300};
 }
 
 TEST_CASE("dock_box: f=0 fully off-screen left, f=1 flush at x==0") {
@@ -165,98 +163,22 @@ TEST_CASE("dock_box: x is monotonic non-decreasing in f and clamps outside [0,1]
     CHECK(lay::dock_box(m, 2.0).x == 0);     // clamped to f=1
 }
 
-TEST_CASE("visible_slots: 0/1/many capacity") {
-    // usable = 1080 - 40 = 1040; stride = 110; 1 + (1040-100)/110 = 1 + 8 = 9.
-    CHECK(lay::visible_slots(metrics()) == 9);
-
-    // Exactly one slot fits.
-    lay::DockMetrics one{.output_w = 0, .output_h = 140, .dock_width = 300,
-                         .slot_height = 100, .gap = 10, .pad = 20};
-    CHECK(lay::visible_slots(one) == 1); // usable 100 == slot_height
-
-    // Nothing fits (usable < slot_height).
-    lay::DockMetrics none{.output_w = 0, .output_h = 100, .dock_width = 300,
-                          .slot_height = 100, .gap = 10, .pad = 20};
-    CHECK(lay::visible_slots(none) == 0); // usable 60 < 100
-}
-
-TEST_CASE("content_height: 0/1/many slots") {
-    auto m = metrics(); // pad 20, slot 100, gap 10
-    CHECK(lay::content_height(m, 0) == 0);
-    CHECK(lay::content_height(m, 1) == 2 * 20 + 100);              // 140, no gap
-    CHECK(lay::content_height(m, 3) == 2 * 20 + 3 * 100 + 2 * 10); // 360
-}
-
-// The glue (src/extension.cpp) sizes the dock SURFACE rect to HUG the card stack
-// via content_height(card-stack metrics, slot count) instead of the full output
-// height — so the transparent strip captures input only over the cards (brief
-// §3: the substrate consumes input over the whole rect regardless of visual
-// transparency). These are the exact px values the surface height takes, with
-// the card-stack metrics that mirror the kDockRml RCSS (kCardHeight=140 — the
-// card IS the preview now, a fixed 16:10-ish box with the title OVERLAID (the
-// title no longer adds to the box height); kCardGap=8 inter-card margin;
-// kStripPad=8 body padding). Keep in lockstep with src/extension.cpp's
-// kCard*/kStripPad constants + dock_metrics().
-TEST_CASE("dock surface height hugs the card stack (content_height with RCSS card metrics)") {
-    // Mirror src/extension.cpp: kCardHeight=140, kCardGap=8, kStripPad=8.
-    lay::DockMetrics card{.output_w = 1920, .output_h = 1080, .dock_width = 240,
-                          .slot_height = 140, .gap = 8, .pad = 8};
-    // Empty dock -> 0 content (but the SURFACE is clamped positive, below).
-    CHECK(lay::content_height(card, 0) == 0);
-    // One card -> 2*pad + card (no trailing gap).
-    CHECK(lay::content_height(card, 1) == 2 * 8 + 140);                   // 156
-    // Two cards -> +gap between them.
-    CHECK(lay::content_height(card, 2) == 2 * 8 + 2 * 140 + 1 * 8);       // 304
-    // Many cards grow linearly and stay FAR under the full output height, so the
-    // surface never spans the whole left edge (the hug-the-cards property).
-    CHECK(lay::content_height(card, 4) == 2 * 8 + 4 * 140 + 3 * 8);       // 600
-    CHECK(lay::content_height(card, 4) < card.output_h);                  // < 1080
-}
-
-// REGRESSION GUARD (0-geometry boot bug): the ui substrate REJECTS a surface
-// with non-positive geometry ("surface needs positive geometry") and returns
-// nullptr, so the EMPTY dock must be created/resized at a POSITIVE height, not 0.
-// surface_height() — the helper the glue's surface_height_for() delegates to —
-// clamps content_height to >= 1, so create_surface/set_size are never called
-// with height 0. Cover EVERY count the glue can produce, especially the empty
-// case the headless test cannot distinguish from the substrate-null path.
-TEST_CASE("surface_height is ALWAYS positive (empty-dock 0-geometry guard)") {
-    lay::DockMetrics card{.output_w = 1920, .output_h = 1080, .dock_width = 240,
-                          .slot_height = 140, .gap = 8, .pad = 8};
-    // The empty dock: content_height is 0, but the surface height is clamped to 1.
-    CHECK(lay::content_height(card, 0) == 0);
-    CHECK(lay::surface_height(card, 0) == 1);   // positive placeholder (hidden)
-    // Once there is at least one card, surface_height == content_height (>0).
-    CHECK(lay::surface_height(card, 1) == lay::content_height(card, 1));
-    CHECK(lay::surface_height(card, 4) == lay::content_height(card, 4));
-    // Never non-positive for any plausible count (incl. a negative/degenerate).
-    for (int n = -2; n <= 20; ++n) {
-        CHECK(lay::surface_height(card, n) >= 1);
+// FULL-HEIGHT RAIL: the dock surface is kDockWidth wide x the FULL OUTPUT HEIGHT
+// tall, REGARDLESS of card count (the RCSS owns the in-rail flex centering +
+// overflow scroll; the C++ no longer sizes the surface to the card stack). The
+// revealed frame the glue feeds to UiSurfaceSpec/set_position is dock_box(m, 1.0)
+// at x==0, full output height — this is what the glue's create_dock_surface uses
+// for spec.width/height. (The earlier hug-the-cards content_height/surface_height
+// helpers were removed with the rail change; the RCSS scrolls the overflow.)
+TEST_CASE("dock_box: revealed rail is dock_width x full output height, count-independent") {
+    // Various output heights -> the rail's h always equals output_h (never the
+    // card-stack content height); w always dock_width; revealed x == 0.
+    for (int oh : {600, 1080, 1440}) {
+        lay::DockMetrics m{.output_w = 1920, .output_h = oh, .dock_width = 288};
+        auto rail = lay::dock_box(m, 1.0);
+        CHECK(rail.x == 0);
+        CHECK(rail.y == 0);
+        CHECK(rail.w == 288);
+        CHECK(rail.h == oh); // FULL output height, independent of any card count
     }
-    // Even with degenerate (zeroed) metrics — defensive: still >= 1, never 0.
-    lay::DockMetrics zero{};
-    CHECK(lay::surface_height(zero, 0) >= 1);
-    CHECK(lay::surface_height(zero, 3) >= 1);
-}
-
-TEST_CASE("slot_box: vertical stacking by stride, inset width") {
-    auto m = metrics(); // pad 20, slot 100, gap 10, dock_width 300
-    auto s0 = lay::slot_box(m, 0, 0);
-    CHECK(s0.x == 20);                 // inner pad
-    CHECK(s0.y == 20);                 // pad + 0*stride
-    CHECK(s0.w == 300 - 2 * 20);       // dock_width minus pad both sides = 260
-    CHECK(s0.h == 100);
-
-    auto s1 = lay::slot_box(m, 1, 0);
-    CHECK(s1.y == 20 + 110);           // pad + 1*stride(110) = 130
-    auto s2 = lay::slot_box(m, 2, 0);
-    CHECK(s2.y == 20 + 220);           // 240
-}
-
-TEST_CASE("slot_box: scroll offset shifts slots up") {
-    auto m = metrics();
-    auto s2_unscrolled = lay::slot_box(m, 2, 0);
-    auto s2_scrolled = lay::slot_box(m, 2, 150);
-    CHECK(s2_scrolled.y == s2_unscrolled.y - 150);
-    CHECK(s2_scrolled.x == s2_unscrolled.x); // scroll is vertical only
 }
