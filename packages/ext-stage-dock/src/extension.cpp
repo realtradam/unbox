@@ -73,8 +73,12 @@ struct Slot {
 // rounded like the Stage-Manager reference. d1 ADDS the RCSS animation on top of
 // c2's static document — without touching the data model (same "slots" list,
 // same per-row preview/title/restore bindings). data-model "ui" (the substrate
-// default). {{ row.preview }} is the Preview source_uri(); data-event-click
-// delivers the row index to restore().
+// default). The img src is the Preview source_uri(), bound via
+// `data-attr-src="row.preview"` — RmlUi interpolates {{ }} only in TEXT, so an
+// element attribute must use the data-attr-<attr> attribute-binding form
+// (verified against vendored RmlUi 6.2: data_binding/options samples). The
+// title is TEXT, so {{ row.title }} is correct there. data-event-click delivers
+// the row index to restore().
 //
 // d1 animation (RCSS, RMLUi 6.2; verified against the vendored source):
 //
@@ -95,16 +99,20 @@ struct Slot {
 //     the element is instanced, which is exactly when dirty("slots") grows the
 //     list — so a new minimize animates its card in with no extra binding.
 //
-// transform-origin keeps the slot scaling toward its own top so the grow reads
-// as "into the dock", within what a left-strip surface can convey (the literal
-// cross-screen flight needs an input-transparent overlay — report change-req).
+// transform-origin keeps the slot scaling toward its own top-left so the grow
+// reads as "into the dock", within what a left-strip surface can convey (the
+// literal cross-screen flight needs an input-transparent overlay — report
+// change-req). RmlUi 6.2's `transform-origin` is an X-then-Y-then-Z shorthand
+// whose X axis takes only {left,center,right} (or length/percent) — so the
+// CSS-style `top left` is a parse error (top is not a valid X keyword). We use
+// the unambiguous percentage form `0% 0%` (= top-left); `left top` also parses.
 constexpr const char* kDockRml = R"RML(<rml>
 <head>
 <style>
 body.dock {
     background-color: #1c1c1ee6;
     padding: 8dp;
-    font-family: sans-serif;
+    font-family: Noto Sans;
     transform: translateX(-100%);
     transition: transform 0.18s cubic-in-out;
 }
@@ -123,11 +131,12 @@ body.dock.open {
 }
 div.slot {
     display: block;
+    min-height: 40dp;
     margin-bottom: 8dp;
     padding: 6dp;
     background-color: #2e2e32ff;
     border-radius: 10dp;
-    transform-origin: top left;
+    transform-origin: 0% 0%;
     animation: slot-enter 0.16s cubic-out 1 normal;
 }
 div.slot img.preview {
@@ -147,7 +156,7 @@ div.slot span.title {
 </head>
 <body data-model="ui" class="dock" data-class-open="open" data-event-transitionend="dock_settled()">
 <div data-for="row : slots" class="slot" data-event-click="restore(it_index)">
-<img class="preview" src="{{ row.preview }}"/>
+<img class="preview" data-attr-src="row.preview"/>
 <span class="title">{{ row.title }}</span>
 </div>
 </body>
@@ -199,13 +208,15 @@ public:
         // minimize the focused window. TODO: migrate to a config-driven
         // `minimize` action in ext-keybindings + a Service we export (post-d1;
         // change-request in the report). We do NOT trigger on Super alone (that
-        // is ext-keybindings' tap-launcher).
+        // is ext-keybindings' tap-launcher). When NOTHING is focused there is
+        // nothing to minimize, so we do NOT consume the chord (let the key pass
+        // rather than silently eating it — minor UX, brief §Also).
         key_filter_ = host.subscribe(
             host.key_filter(), [this](kernel::KeyEvent ev) {
                 if (ev.pressed && ev.keysym == kMinimizeKeysym &&
-                    (ev.modifiers & kMinimizeMods) != 0) {
+                    (ev.modifiers & kMinimizeMods) != 0 && focused_ != nullptr) {
                     do_minimize_focused();
-                    ev.handled = true; // consume
+                    ev.handled = true; // consume (only when we actually acted)
                 }
                 return ev;
             });
