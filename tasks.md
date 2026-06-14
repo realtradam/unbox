@@ -5,6 +5,19 @@
 
 ## Now
 
+**ACTIVE (core, user-driven) — Slice 13: RML COMPOSITING SPIKE.** Big direction
+change: RMLUi becomes the content compositor — toplevels + layer-shell (incl.
+wallpaper) + chrome are RML elements backed by LIVE, SHARED GL textures, with
+layout/animation/3D effects in RCSS; wlroots stays foundation + cursor plane +
+(deferred) fullscreen scanout bypass. Lost wlr_scene damage/scanout is mitigated
+by OUR dirty-gated rendering (NOT a RMLUi built-in) + a deferred scanout bypass.
+GATED BY A SPIKE before commit. Full spec + acceptance criteria:
+`notes/rml-compositing.md`; decision row in `notes/plan.md` §2.
+NEXT ACTION: write the spike brief (kernel/substrate) and summon it.
+Tiling (slice 7) is DEFERRED behind this (becomes RCSS over surface elements;
+pure layout core in `notes/tiling-spec.md` carries over). Stage dock (slice 10)
+real-seat feel check is paused under this pivot.
+
 **DEV WORKFLOW (RML/RCSS hot-reload — use this):** UI documents are external assets
 under `assets/<unit>/` (e.g. `assets/ext-stage-dock/dock.rml` + `dock.rcss`), loaded
 via `UiSurfaceSpec::rml_path`. Launch unbox with
@@ -76,8 +89,12 @@ real-seat feel pending):**
    minimize-keybind migration (ext-keybindings action + a stage-dock Service), and
    favicon (needs an XDG icon-theme dep) follow.
 
-Slice 6 (ext-taskbar + ext-launcher) is paused; the stage dock matures the same
-ui-substrate gaps it would have (list bindings, first real interactive consumer).
+Slice 6 re-scoped: the **window-list taskbar is CUT** (overlaps the stage dock,
+conflicts with the touch/iPad direction; its contract-exercise purpose was met by
+the stage dock). Replaced by two future, not-yet-designed features sequenced
+AFTER slice 7 (tiling): **status bar** (slice 11) and **home screen** (slice 12)
+— ideas + open questions captured in `notes/status-bar-home-screen.md`. Launching
+is covered by fuzzel today (and the home screen later).
 Still queued whenever UI work resumes: keyboard-into-ui-surfaces, removing the
 deprecated no-op `Options::ui_spike`, retiring host-bin's demo ui.
 
@@ -92,11 +109,14 @@ deprecated no-op `Options::ui_spike`, retiring host-bin's demo ui.
 | 4 | Extension host + contracts: bus, manifests, static registration; xdg-shell/layer-shell refactored OUT of kernel into core extensions | **DONE** 2026-06-12 | met: kernel boots featureless (names no feature); typed Event/Filter bus error-isolated + topo activation; ext-xdg-shell (toplevels, focus, grabs via pure GrabMachine, button/axis routing, Ctrl+Alt+Backspace quit) + ext-layer-shell (fuzzel verified, pure arrangement core) pass suites; typed surface→scene-tree registry replaced the data-field convention; first protocol codegen (wlr-layer-shell XML vendored); user hands-on: all input paths verified incl. touch; 68 cases green + ASan clean; idle RSS ≈73 MiB |
 | 5 | Input routing + ergonomics contract: unified pointer/touch→RMLUi events, keybinding filter chain, touch-mode RCSS variables | **DONE** 2026-06-13 | met (user hands-on): real ui substrate (`Host::ui()` → UiSurface, scalar+event bindings, dmabuf+fence+swapchain); same demo surface driven by mouse AND finger; consume-or-pass with implicit-grab ownership (press owner gets release, per touch point too); touch-mode = state+notification only, NO visual scaling (user decision); touch-initiated grabs incl. pointer/touch alternation (seat release-leak fixed); keybinding chain satisfied by slice-4 Filter (ext-keybindings deferred); 113 doctest cases green, ASan clean, idle RSS ≈78 MiB |
 | 5b | Usability: `ext-keybindings` (config-driven `unbox.toml`) — Super→fuzzel, Alt+Tab focus rotation; ext-xdg-shell keybinds migrated; kernel exports `WAYLAND_DISPLAY` for spawned clients | **DONE** 2026-06-13 | met (real-seat, user-confirmed): fuzzel opens on Super, Alt+Tab cycles all windows, quit works; build + build-asan both green (3rd-party Mesa/RmlUi sanitizer noise suppressed; a real libwayland leak in the layer-shell client test fixed) |
-| 6 | First standard extensions: ext-taskbar + ext-launcher | pending | proves the ui-substrate contract is complete (friction = bad contract) |
-| 7 | ext-window-tiling: pure layout core + thin scene glue | pending | layout math 100% doctest-covered, zero wlroots types in core |
+| 6 | ~~ext-taskbar~~ + ext-launcher | **taskbar CUT / re-scoped** | window-list taskbar dropped (overlaps the stage dock + conflicts with the touch/iPad direction). Replaced by slices 11–12. Launching is covered by fuzzel today and the home screen later. The contract-exercise purpose was met by the stage dock. |
+| 7 | ext-window-tiling: pure layout core + thin scene glue | **DEFERRED pending slice 13** (baseline designed) | layout math 100% doctest-covered, zero wlroots types in core. Baseline = `primary` (right) + `stack` (left), auto-tile, 1=full/2=50-50/3+=stack-left; see `notes/tiling-spec.md` (+ `notes/tiling-layouts-reference.md`). Held until RML compositing (slice 13) lands — tiling then becomes RCSS layout over surface elements; the pure core is renderer-agnostic and carries over. (`Toplevel::set_box` prototype reverted; recreate from `prompts/ext-xdg-shell.md` when tiling resumes.) |
 | 8 | ext-osk: RML keyboard ui surface injecting via wlr_seat | pending | type into foot via touch only; auto-show on text-input focus |
 | 9 | Session hardening: s6 user service, TTY launch on seat0, layout persistence (append-only state + pure reconcile on boot) | pending | survives `kill -9` + s6 restart with workspaces restored |
 | 10 | **Stage dock** (ext-stage-dock): minimized-window previews on a left-edge swipe (Fork B) | **a1–d1 landed; previews real-seat-verified** | DONE: Super+M minimize→RMLUi-imported preview snapshot→dock slot→hide (previews confirmed rendering on hardware); RCSS dock slide-in + slot settle. NEXT: confirm tap-to-restore + animation feel; 1 boundary call (input-transparent UiSurface flag) → c1 gesture-claim → e1 gesture reveal/drag-out; then config-driven minimize keybind + favicon (XDG icon dep) |
+| 11 | **Status bar** (tent. ext-statusbar): iPad/iOS top bar — clock (left), configurable left/middle/right sections, tray (right) wifi/volume/battery | **IDEA — needs design** | sequenced AFTER slice 7 (tiling); replaces cut taskbar. Details + open questions: `notes/status-bar-home-screen.md` |
+| 12 | **Home screen** (tent. ext-home, iPad springboard): app grid; tap = launch-or-raise (instance picker if >1 open); add/remove apps; swipe-up-from-bottom to enter | **IDEA — needs design** | sequenced AFTER slice 7 (tiling); replaces cut taskbar. Details + open questions: `notes/status-bar-home-screen.md` |
+| 13 | **THE SPIKE: RML compositing** — RMLUi becomes the content compositor (toplevels + layer-shell incl. wallpaper + chrome = RML elements backed by LIVE, SHARED GL textures; layout/animation/3D effects in RCSS). wlroots = foundation + cursor plane + (deferred) fullscreen scanout bypass. | **ACTIVE (core) — spike** | GO/NO-GO on the CF-AX3: (1) live toplevel texture in RmlUi via shared context, ZERO per-frame copy; (2) RCSS 3D transform on it; (3) pointer+touch+keyboard routed back through RmlUi picking → wl_seat; (4) window w/ popup+subsurface composited (decides per-subsurface-elements vs per-window RTT); (5) wallpaper as an element; (6) perf ~4 windows@1080p + idle≈no-work (our dirty-gating) + video cost; (7) present via existing FBO→scene_buffer bridge. Full spec + decision row: `notes/rml-compositing.md`, plan.md §2. |
 
 ## Deferred decisions (decide when reached — see notes/plan.md §7)
 
