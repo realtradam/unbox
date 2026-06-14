@@ -20,7 +20,12 @@ body.dock {
 div.panel {
     width: 100%;
     height: 100%;
-    decorator: horizontal-gradient( #000000ff #00000000 );
+    /* Use the SHADER-based linear-gradient (not the legacy horizontal-gradient,
+       which renders via interpolated vertex colours and shows hard 8-bit alpha
+       banding over light backgrounds). linear-gradient is computed per-pixel in
+       our GL3 fragment shader, which also applies ~1 LSB TPDF dither to break the
+       alpha-ramp banding as it fades to transparent. */
+    decorator: linear-gradient( to right, #000000ff, #00000000 );
     padding: 8dp;
     font-family: Noto Sans;
     display: flex;
