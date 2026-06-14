@@ -1,0 +1,31 @@
+# remote.local.example — template for the remote-builder settings.
+#
+# These are machine/network specifics and are deliberately NOT committed. To use
+# the remote-build helpers (setup-distcc.sh, build-remote.sh), copy this file and
+# fill in your own values:
+#
+#     cp packaging/remote.local.example packaging/remote.local
+#     $EDITOR packaging/remote.local        # packaging/remote.local is gitignored
+#
+# Prerequisites on a NEW set of systems:
+#   * A fast "builder" box reachable over a private network (Tailscale/WireGuard/
+#     LAN), with the SAME gcc version as this machine (distcc plain mode requires
+#     matching compilers), passwordless SSH from here, and sudo on the builder.
+#   * `distcc` (and `ccache`) installed on BOTH machines.
+# Then run:  packaging/setup-distcc.sh
+
+# SSH host/alias of the fast remote builder.
+REMOTE_HOST=builder.example.ts.net
+
+# Private IP of the remote builder (Tailscale/WireGuard/LAN). distccd binds
+# (--listen) ONLY to this address, so it is never exposed on public interfaces.
+REMOTE_TS=100.64.0.2
+
+# Private IP of THIS machine. distccd will --allow ONLY this address.
+LOCAL_TS=100.64.0.1
+
+# Parallel compile slots the remote offers (roughly its CPU core count).
+REMOTE_JOBS=16
+
+# (Optional) working dir name created in the builder's home for build-remote.sh.
+REMOTE_DIR=unbox

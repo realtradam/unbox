@@ -7,6 +7,10 @@ compile_commands.json
 prompts/
 reports/
 
+# machine/network specifics for the remote-build helpers (template is committed:
+# packaging/remote.local.example). Never commit real hosts/IPs.
+packaging/remote.local
+
 # meson subprojects: keep wraps + our patch files, ignore downloaded sources
 subprojects/*
 !subprojects/*.wrap

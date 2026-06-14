@@ -7,4 +7,13 @@
 # makes PipeWire spam RTKit "ServiceUnknown" warnings.
 #
 # Usage:  from a TTY, run  start-unbox
+#
+# Wallpaper: unbox has no built-in wallpaper, so we draw one with swaybg (a
+# wlr-layer-shell client on the background layer) via unbox's -s startup hook.
+# It runs only if the image exists; put your image at the path below (a real file
+# or a symlink), or override with UNBOX_WALLPAPER=/path/to/image.
+WALLPAPER="${UNBOX_WALLPAPER:-$HOME/.config/unbox/wallpaper}"
+if [ -f "$WALLPAPER" ]; then
+    exec dbus-run-session -- unbox -s "swaybg -i '$WALLPAPER' -m fill"
+fi
 exec dbus-run-session -- unbox
