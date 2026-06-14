@@ -34,11 +34,16 @@ div.panel {
     overflow-x: hidden;
     overflow-y: auto;
 }
-/* Ease only when NOT dragging: during a finger-follow drag (body.dock has the
-   gesture, div.panel gets data-class-dragging) there is no transition so each
-   `slide` update lands instantly under the finger; on release the Controller
-   clears dragging_, this rule re-applies, and the slide-to-target eases 0.36s. */
-div.panel:not(.dragging) {
+/* DECLARATIVE EASING CARRIER for the C++ animator (d1 fix). This `transition` is
+   NOT animated by RmlUi: RmlUi only starts a CSS transition on a class/definition
+   change, and `slide` is driven through the inline data-style-transform above,
+   which RmlUi never animates. Instead the C++ SlideAnimator READS this transition
+   (duration + tween) via UiSurface::transition_timing("panel", "transform") and
+   drives slide_px_ itself, frame by frame — so editing the duration/tween here
+   hot-reloads the on-seat feel with no recompile. The element id="panel" is what
+   transition_timing looks the element up by. NOTE: RmlUi 6.2 has NO bare `linear`
+   keyword — use a named tween; `cubic-in-out` is the authored ease here. */
+#panel {
     transition: transform 0.36s cubic-in-out;
 }
 /* Hide both scrollbars (the rail scrolls, but no visible scrollbar). RmlUi

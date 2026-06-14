@@ -1,19 +1,23 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "anim.hpp"
 #include "dock_layout.hpp"
 #include "gesture.hpp"
 #include "reveal.hpp"
 
 // Pure-core tests — the heart of this b4 step. No kernel, no wlroots, no RMLUi.
-// Three cores: the reveal recognizer (reversible edge swipe -> fraction +
-// commit), the dock layout geometry (reveal fraction -> rects), and the e1
-// gesture Controller (touch/drag STREAM -> slide_px/dragging/open + the Outcome
-// the glue applies). The Controller needs nothing running.
+// Four cores: the reveal recognizer (reversible edge swipe -> fraction +
+// commit), the dock layout geometry (reveal fraction -> rects), the e1 gesture
+// Controller (touch/drag STREAM -> slide_px/dragging/open + the Outcome the glue
+// applies), and the d1-fix SlideAnimator (the interruptible easing animator that
+// drives slide_px over time for the keyboard/minimize/restore/drag-release
+// paths). All four need nothing running.
 
 namespace rv = unbox::ext_stage_dock::reveal;
 namespace lay = unbox::ext_stage_dock::layout;
 namespace gst = unbox::ext_stage_dock::gesture;
+namespace anm = unbox::ext_stage_dock::anim;
 
 using rv::RevealCommit;
 using rv::RevealConfig;
@@ -388,4 +392,135 @@ TEST_CASE("Controller: set_metrics re-scales the slide offset for a new output")
     c.set_metrics(lay::DockMetrics{.output_w = 2560, .output_h = 1440, .dock_width = 100});
     c.close_now();
     CHECK(c.slide_px() == doctest::Approx(-100.0));
+}
+
+// ============================================================================
+// SlideAnimator (d1 fix) — the interruptible easing animator over time
+// ============================================================================
+
+using anm::SlideAnimator;
+
+// A linear tween (identity) so lerped values are exact at any progress.
+static auto linear() -> std::function<float(float)> {
+    return [](float t) { return t; };
+}
+
+TEST_CASE("SlideAnimator: starts inactive and reports its initial value") {
+    SlideAnimator a;
+    CHECK_FALSE(a.active());
+    CHECK(a.value() == doctest::Approx(0.0));
+    // tick while inactive is inert (returns the held value, does not advance).
+    CHECK(a.tick(0.016) == doctest::Approx(0.0));
+    CHECK_FALSE(a.active());
+}
+
+TEST_CASE("SlideAnimator: linear run progresses monotonically and ends exactly at target") {
+    // A 0.5s run; ticks of 0.05s (well under the kMaxTickDt clamp) so the
+    // accumulated elapsed is exact and the loop terminates deterministically.
+    SlideAnimator a;
+    a.start(/*from=*/-100.0, /*to=*/0.0, /*duration=*/0.5, linear());
+    CHECK(a.active());
+    CHECK(a.value() == doctest::Approx(-100.0)); // at start: from
+
+    // Advance in 0.05s steps; value must never go backward and tracks the lerp.
+    double prev = a.value();
+    for (int i = 0; i < 9; ++i) {
+        double v = a.tick(0.05);
+        CHECK(v >= prev); // monotonic for an inward (increasing) run
+        prev = v;
+        CHECK(a.active()); // still mid-run before the final step (0.45s < 0.5s)
+    }
+    // 0.45s elapsed -> 90% of the way: -100 + 90 = -10.
+    CHECK(a.value() == doctest::Approx(-10.0));
+
+    // The step that crosses duration lands EXACTLY on `to` and goes inactive. A
+    // final dt of 0.1 (the clamp) clears the remaining ~0.05s unambiguously.
+    double end = a.tick(0.1); // elapsed > duration -> done
+    CHECK(end == doctest::Approx(0.0)); // exactly the target, no float drift
+    CHECK_FALSE(a.active());
+    // Further ticks are inert and stay pinned at the target.
+    CHECK(a.tick(0.5) == doctest::Approx(0.0));
+    CHECK(a.value() == doctest::Approx(0.0));
+}
+
+TEST_CASE("SlideAnimator: overshooting dt pins exactly to target and marks done") {
+    SlideAnimator a;
+    a.start(0.0, 50.0, 0.05, linear()); // 50ms run
+    // First tick's dt (0.1s) exceeds the run AND is exactly the clamp; elapsed
+    // becomes 0.1 >= 0.05 so it completes this frame, pinned to `to`.
+    CHECK(a.tick(0.1) == doctest::Approx(50.0));
+    CHECK_FALSE(a.active());
+}
+
+TEST_CASE("SlideAnimator: dt is clamped (kMaxTickDt) so a huge frame gap doesn't teleport") {
+    SlideAnimator a;
+    a.start(0.0, 100.0, 1.0, linear());
+    // A 5-second stall: dt is clamped to kMaxTickDt (0.1s), so the run advances
+    // only 10% this frame — the motion stays visible instead of snapping to 100.
+    double v = a.tick(5.0);
+    CHECK(v == doctest::Approx(10.0)); // 0.1s / 1.0s = 10%
+    CHECK(a.active());
+}
+
+TEST_CASE("SlideAnimator: a non-linear tween is honoured and sampled at t=0 and t=1") {
+    // An ease-out-ish tween: f(t) = t*(2-t). f(0)=0, f(1)=1, f(0.5)=0.75.
+    auto ease_out = [](float t) { return t * (2.0F - t); };
+
+    // Sample at t=0.5: 100 * 0.75 = 75 (ahead of a linear 50 — the ease-out
+    // front-loads progress). Use a short 0.5s run so a single dt=0.05 tick (well
+    // under the clamp) lands at exactly progress 0.5.
+    SlideAnimator half;
+    half.start(/*from=*/0.0, /*to=*/100.0, /*duration=*/0.1, ease_out);
+    CHECK(half.tick(0.05) == doctest::Approx(75.0)); // progress 0.5 -> eased 0.75
+
+    // Endpoints: t=0 maps to `from`, t=1 maps EXACTLY to `to` (the done-pin,
+    // independent of the tween). Re-run to sample the start endpoint cleanly.
+    SlideAnimator b;
+    b.start(0.0, 100.0, 0.1, ease_out);
+    CHECK(b.value() == doctest::Approx(0.0)); // t=0 -> from, regardless of ease
+    CHECK(b.tick(0.1) == doctest::Approx(100.0)); // t=1 -> to (exact, pinned)
+    CHECK_FALSE(b.active());
+}
+
+TEST_CASE("SlideAnimator: a null ease falls back to linear") {
+    SlideAnimator a;
+    a.start(0.0, 100.0, /*duration=*/0.1, /*ease=*/nullptr);
+    CHECK(a.tick(0.025) == doctest::Approx(25.0)); // progress 0.25, pure linear
+}
+
+TEST_CASE("SlideAnimator: non-positive duration snaps immediately to target") {
+    SlideAnimator a;
+    a.start(-100.0, 0.0, /*duration=*/0.0, linear());
+    CHECK_FALSE(a.active()); // nothing to animate
+    CHECK(a.value() == doctest::Approx(0.0)); // landed on the target at once
+    CHECK(a.tick(0.016) == doctest::Approx(0.0)); // inert thereafter
+}
+
+TEST_CASE("SlideAnimator: set_immediate snaps the value and cancels any run") {
+    SlideAnimator a;
+    a.start(0.0, 100.0, 1.0, linear());
+    a.tick(0.3);
+    CHECK(a.active());
+    // The drag-scrub: snap the value to the finger position with no run.
+    a.set_immediate(42.0);
+    CHECK_FALSE(a.active());
+    CHECK(a.value() == doctest::Approx(42.0));
+    // tick is inert after set_immediate (the finger drives, not the clock).
+    CHECK(a.tick(0.1) == doctest::Approx(42.0));
+    CHECK_FALSE(a.active());
+}
+
+TEST_CASE("SlideAnimator: interrupting a run re-anchors continuously from the new from") {
+    SlideAnimator a;
+    // Short run so single sub-clamp ticks land at clean fractions.
+    a.start(-100.0, 0.0, 0.1, linear());
+    a.tick(0.04); // 40% of the way: -100 + 40 = -60
+    CHECK(a.value() == doctest::Approx(-60.0));
+    // Reverse mid-run (a drag-release back toward closed) from the CURRENT value:
+    // motion continues from -60, not from a stale anchor.
+    a.start(a.value(), -100.0, 0.1, linear());
+    CHECK(a.value() == doctest::Approx(-60.0)); // continuous: no jump on restart
+    CHECK(a.target() == doctest::Approx(-100.0));
+    a.tick(0.05); // halfway from -60 to -100 -> -80
+    CHECK(a.value() == doctest::Approx(-80.0));
 }

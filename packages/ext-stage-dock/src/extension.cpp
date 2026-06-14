@@ -5,15 +5,20 @@
 #include "probe.hpp"
 #include "reveal.hpp"
 
+#include "anim.hpp"
+
 #include <unbox/ext-xdg-shell/ext_xdg_shell.hpp>
+#include <unbox/kernel/frames.hpp>
 #include <unbox/kernel/host.hpp>
 #include <unbox/kernel/ui.hpp>
 #include <unbox/kernel/wlr.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -62,6 +67,18 @@ constexpr std::uint32_t kMinimizeMods = WLR_MODIFIER_LOGO;  // Super/LOGO
 // horizontal gradient (dark left -> transparent right) extends farther right;
 // the cards stay 224dp (RCSS) left-aligned, so the extra width is to their right.
 constexpr int kDockWidth = 288;
+
+// d1-fix C++-driven slide animation. The dock open/close is animated in C++
+// (the SlideAnimator pure core), NOT by RmlUi: RmlUi only starts a CSS
+// transition on a class/definition change, never on the inline
+// data-style-transform we drive `slide` with, so the keyboard/minimize/restore
+// paths used to snap. We read the duration + tween from the RCSS `transition` on
+// #panel (UiSurface::transition_timing) so they stay hot-reloadable; these are
+// the FALLBACKS used when the document has not rendered a frame yet (so computed
+// values do not exist) or authors no transition. kFallbackDurS matches the
+// authored 0.36s; the fallback ease is linear (RmlUi 6.2 has no `linear`
+// keyword, so the RCSS carrier uses cubic-in-out — see dock.rcss).
+constexpr double kFallbackDurS = 0.36; // seconds, matches dock.rcss #panel
 
 // A minimized window's dock entry: the live Toplevel* borrow (valid until its
 // unmapped event), the frozen Preview (owns the imported texture; null when the
@@ -168,24 +185,27 @@ public:
         // on edge-slop / already-open itself (empty Outcome = ignored).
         touch_down_ = host.subscribe(
             host.on_touch_down(), [this](const kernel::TouchDownEvent& e) {
-                apply(controller_.touch_down(e.touch_id, e.lx, e.ly, e.time_msec));
+                // Edge-swipe OPEN begins: a finger landed at the edge. This is a
+                // finger-DRIVEN scrub (the finger is the clock), so stop any
+                // running animation frame loop and scrub from here.
+                apply_scrub(controller_.touch_down(e.touch_id, e.lx, e.ly, e.time_msec),
+                            /*on_drag_start=*/true);
             });
         touch_motion_ = host.subscribe(
             host.on_touch_motion(), [this](const kernel::TouchMotionEvent& e) {
-                apply(controller_.touch_motion(e.touch_id, e.lx, e.ly, e.time_msec));
+                apply_scrub(controller_.touch_motion(e.touch_id, e.lx, e.ly, e.time_msec),
+                            /*on_drag_start=*/false);
             });
         touch_up_ = host.subscribe(
             host.on_touch_up(), [this](const kernel::TouchUpEvent& e) {
-                // A release that commits CLOSE eases out; arm closing_ so the
-                // dock_settled transitionend hides the surface (gated on
-                // !controller_.open()). An open release leaves closing_ untouched.
-                closing_ = true;
-                apply(controller_.touch_up(e.touch_id, e.time_msec));
+                // RELEASE = "resume": ease from the current finger value to the
+                // snap target the controller decided (open or closed). The
+                // animator's completion hides the surface on a CLOSE (on_frame).
+                apply_release(controller_.touch_up(e.touch_id, e.time_msec));
             });
         touch_cancel_ = host.subscribe(
             host.on_touch_cancel(), [this](const kernel::TouchCancelEvent& e) {
-                closing_ = true;
-                apply(controller_.touch_cancel(e.touch_id));
+                apply_release(controller_.touch_cancel(e.touch_id));
             });
 
         // Create the dock surface up front, kept hidden until the first slot. It
@@ -288,35 +308,144 @@ private:
             return;
         }
         if (controller_.open()) {
-            // Close: slide out. closing_ = true so the existing dock_settled path
-            // hides the surface once the slide-out transition finishes.
-            closing_ = true;
-            apply(controller_.close_now());
+            // Close: animate the slide-out; on_frame hides the surface once the
+            // CLOSE animation completes (replaces the old dock_settled hide).
+            apply_animated(controller_.close_now());
         } else {
-            // Open: make the surface visible (may already be from slots), then
-            // ease the body to translateX(0). open_now() sets make_visible.
-            closing_ = false;
-            apply(controller_.open_now());
+            // Open: make the surface visible (open_now sets make_visible) then
+            // animate the slide-in. apply_animated honours make_visible FIRST.
+            apply_animated(controller_.open_now());
         }
     }
 
-    // ---- e1 glue: apply a controller Outcome to the surface ----------------
-    // The thin adapter the controller's contract calls for: make the surface
-    // visible, then dirty `dragging` BEFORE `slide` (so the restored RCSS
-    // transition eases the snap on release). No-op when the surface is null
-    // (no-GL backend); the controller state still advances for the model/probe.
-    void apply(const gesture::Outcome& o) {
+    // ---- d1-fix glue: C++-driven slide animation ---------------------------
+    // The animation is owned in C++ (anim::SlideAnimator), driven once per frame
+    // by a kernel FrameRequest, with the duration + tween READ FROM RCSS so they
+    // stay hot-reloadable. There are three routing paths a controller Outcome can
+    // take, distinguished by who is the "clock":
+    //   * apply_animated — the keyboard/minimize/restore open/close paths: PLAY
+    //     the animation from the current slide value to the controller's target.
+    //   * apply_scrub    — the finger-driven drag-MOVE (and the OPEN drag start):
+    //     the finger IS the clock, so set slide directly, no animation.
+    //   * apply_release  — a drag/touch RELEASE: RESUME the animation from the
+    //     current finger value to the snapped target the controller decided.
+    // All three no-op the visual when the surface is null (no-GL backend); the
+    // controller state still advances for the model/probe.
+
+    // PLAY: animate the dock to the controller's freshly-set target slide value.
+    // make_visible FIRST (a hidden surface is not composited, so it cannot be
+    // seen sliding in), then start the run from the CURRENT slide_px_ (so an
+    // interrupted animation continues smoothly) to controller_.slide_px().
+    void apply_animated(const gesture::Outcome& o) {
         if (dock_surface_ == nullptr) {
             return;
         }
         if (o.make_visible) {
             dock_surface_->set_visible(true);
         }
-        if (o.dirty_dragging) {
-            dock_surface_->dirty("dragging");
+        animate_to(controller_.slide_px(), /*release_scale=*/false);
+    }
+
+    // SCRUB: the finger drives slide directly (drag-move, and the edge-swipe OPEN
+    // start). set_immediate() cancels any in-flight run; on a drag START we also
+    // stop the frame loop (the brief: "reset any running FrameRequest on drag
+    // start") so a prior keyboard animation does not fight the finger.
+    void apply_scrub(const gesture::Outcome& o, bool on_drag_start) {
+        if (dock_surface_ == nullptr) {
+            return;
+        }
+        if (on_drag_start && frame_.active()) {
+            frame_.reset(); // stop the animation loop; the finger takes over
+        }
+        if (o.make_visible) {
+            dock_surface_->set_visible(true);
         }
         if (o.dirty_slide) {
+            slide_px_ = controller_.slide_px();
+            anim_.set_immediate(slide_px_);
             dock_surface_->dirty("slide");
+        }
+    }
+
+    // RESUME: a release eases from the current finger value to the snapped target
+    // the controller decided. Scaled duration (release_scale) so a near-complete
+    // drag finishes quickly. make_visible honoured (an OPEN-commit release).
+    void apply_release(const gesture::Outcome& o) {
+        if (dock_surface_ == nullptr) {
+            return;
+        }
+        if (o.make_visible) {
+            dock_surface_->set_visible(true);
+        }
+        animate_to(controller_.slide_px(), /*release_scale=*/true);
+    }
+
+    // Start a run to `target` px. Reads the RCSS-authored duration + tween from
+    // #panel's `transition: transform` (hot-reloadable) with a sane fallback
+    // (kFallbackDurS, linear) when the document has not rendered yet / authors no
+    // transition. `release_scale` shrinks the duration by the fraction of the
+    // dock width still to travel, so a drag released near the snap target settles
+    // fast (a full-distance move keeps the full duration). Arms the per-frame
+    // FrameRequest if it is not already running.
+    void animate_to(double target, bool release_scale) {
+        const double from = slide_px_;
+
+        double duration = kFallbackDurS;
+        std::function<float(float)> ease; // null == linear (the fallback)
+        if (auto t = dock_surface_->transition_timing("panel", "transform")) {
+            duration = t->duration > 0.0 ? t->duration : kFallbackDurS;
+            ease = std::move(t->ease);
+        }
+
+        if (release_scale) {
+            // Scale by the remaining-distance fraction of the full dock width so
+            // a near-finished drag completes quickly. dock_width is the full
+            // travel; clamp to [0,1] (the recognizer can overshoot in theory).
+            const double width = static_cast<double>(kDockWidth);
+            if (width > 0.0) {
+                const double frac = std::clamp(std::abs(target - from) / width, 0.0, 1.0);
+                duration *= frac;
+            }
+        }
+
+        anim_.start(from, target, duration, std::move(ease));
+        // A zero/degenerate-duration run already landed on the target (no frames
+        // needed); reflect it now and skip arming the loop.
+        if (!anim_.active()) {
+            slide_px_ = anim_.value();
+            dock_surface_->dirty("slide");
+            on_animation_finished();
+            return;
+        }
+        if (!frame_.active()) {
+            frame_ = host_->request_frames([this](double dt) { on_frame(dt); });
+        }
+    }
+
+    // The per-frame tick (runs BEFORE the surface renders each frame while the
+    // FrameRequest is held): advance the animator, push the value into the
+    // `slide` binding, and when the run completes stop the frame loop (don't hold
+    // frames at rest) + run the completion hook (the CLOSE-hide).
+    void on_frame(double dt) {
+        if (dock_surface_ == nullptr) {
+            frame_.reset();
+            return;
+        }
+        slide_px_ = anim_.tick(dt);
+        dock_surface_->dirty("slide");
+        if (!anim_.active()) {
+            on_animation_finished();
+            frame_.reset(); // idle: stop scheduling frames
+        }
+    }
+
+    // Run when a play/resume animation reaches its target. If we animated to the
+    // CLOSED state (dock not open), hide the surface NOW — this REPLACES the old
+    // dock_settled/transitionend hide. Guarded on !controller_.open() so a reveal
+    // that raced a conceal (reopened mid-animation) does not hide an open dock.
+    void on_animation_finished() {
+        if (dock_surface_ != nullptr && !controller_.open()) {
+            dock_surface_->set_visible(false);
         }
     }
 
@@ -354,15 +483,17 @@ private:
     }
 
     // Re-render the dock list and ANIMATE the dock reveal. The dock is revealed
-    // iff there is at least one slot. The slide is value-driven (e1): both the
-    // gesture and these non-gesture call sites flow through the one Controller,
-    // which sets slide_px_ (the body's translateX) and clears dragging_ so the
-    // RCSS transition eases the move:
+    // iff there is at least one slot. The slide is value-driven: these non-gesture
+    // call sites flow through the one Controller (which sets the OPEN/CLOSED target
+    // px) and then the C++ SlideAnimator (apply_animated), which eases slide_px_
+    // from its current value to the target over frames (the d1 fix — RmlUi never
+    // animated the inline transform):
     //   empty -> non-empty: open_now() (make the surface visible FIRST — a hidden
-    //     surface is not composited, so it can't animate — then ease the body in).
-    //   non-empty -> empty: close_now() eases the body back out; we DEFER
-    //     set_visible(false) until the slide-out finishes (on_dock_settled, fired
-    //     by RmlUi's transitionend through the existing event binding).
+    //     surface is not composited, so it can't be seen sliding in — then animate
+    //     the slide-in via apply_animated).
+    //   non-empty -> empty: close_now() animates the slide-out; on_frame hides the
+    //     surface once the CLOSE animation completes (replaces the old transitionend
+    //     dock_settled hide).
     // The surface is a fixed full-height rail; its size never changes with the
     // card count (the RCSS scrolls/centers the cards within it). Only visibility
     // toggles: shown when there is >= 1 slot, hidden (after the slide-out) when
@@ -381,34 +512,12 @@ private:
             return; // reveal state unchanged (e.g. minimize a 2nd window)
         }
         if (want_open) {
-            // Reveal: composite before animating, then ease the body in.
-            closing_ = false;
-            apply(controller_.open_now());
+            // Reveal: composite before animating, then animate the body in.
+            apply_animated(controller_.open_now());
         } else {
-            // Conceal: ease the body out now, hide once the slide-out ends.
-            closing_ = true;
-            apply(controller_.close_now());
+            // Conceal: animate the body out; on_frame hides it on completion.
+            apply_animated(controller_.close_now());
         }
-    }
-
-    // RmlUi fires `transitionend` on body.dock when the reveal-slide transition
-    // completes; the existing data-event binding routes it here (VERIFIED: the
-    // substrate's data-event controller binds any registered RmlUi event by
-    // name, and RmlUi dispatches transitionend from AdvanceAnimations() — no
-    // kernel change needed for this completion signal; see report). We only act
-    // on the CLOSE direction: once the slide-OUT has played, drop the surface
-    // from compositing. The open-direction transitionend is a no-op. Guarded so
-    // a stale end-event (e.g. a reveal that raced a conceal) cannot hide an
-    // again-open dock: we re-check open_.
-    void on_dock_settled() {
-        if (dock_surface_ != nullptr && closing_ && !controller_.open()) {
-            // Slide-out finished and the dock is empty: hide the full-height rail
-            // so it stops compositing AND stops capturing input over the left
-            // strip. The surface keeps its full height (no resize) for the next
-            // reveal; only visibility toggled.
-            dock_surface_->set_visible(false);
-        }
-        closing_ = false;
     }
 
     // Create the dock UiSurface (overlay, left edge) and register all data
@@ -471,41 +580,43 @@ private:
         dock_surface_->bind_list_event(
             "slots", "restore", [this](std::size_t i) { do_restore(i); });
 
-        // e1 reveal bindings (registered before the first frame, same rule as the
-        // list bindings; capture only `this`, whose members outlive the surface).
-        // `slide` drives the body's data-style-transform translateX(px) — the
-        // value-driven reveal both the gesture AND the keyboard/minimize/restore
-        // paths feed through the one Controller. `dragging` drives
-        // data-class-dragging -> RCSS turns the transition OFF so a live drag
-        // follows the finger 1:1. `dock_settled` is body.dock's transitionend ->
-        // hide after the slide-out. `dock_drag` is the CLOSE path (see below).
-        dock_surface_->bind_double("slide", [this]() -> double { return controller_.slide_px(); });
-        dock_surface_->bind_bool("dragging", [this]() -> bool { return controller_.dragging(); });
-        dock_surface_->bind_event("dock_settled", [this]() { on_dock_settled(); });
+        // Reveal binding (registered before the first frame, same rule as the
+        // list bindings; captures only `this`, whose members outlive the surface).
+        // `slide` drives the panel's data-style-transform translateX(px). It now
+        // reads the GLUE-OWNED slide_px_ (driven by the C++ SlideAnimator, or set
+        // directly during a finger scrub) rather than the controller's value: the
+        // animator interpolates between the controller's open/closed TARGETS over
+        // time. NOTE (d1 fix): the old `dragging` (data-class-dragging) +
+        // `dock_settled` (transitionend) bindings are GONE — RmlUi never animated
+        // the inline transform, so the class-toggle machinery was dead; the C++
+        // animator's completion (on_frame) now does the close-hide instead.
+        dock_surface_->bind_double("slide", [this]() -> double { return slide_px_; });
 
-        // e1 CLOSE path — UiSurface::bind_drag. The OPEN dock is a visible ui
+        // CLOSE/scrub path — UiSurface::bind_drag. The OPEN dock is a visible ui
         // surface, so the substrate captures its touches into our RMLUi document
         // (NOT the kernel bus); the body opts into dragging via RCSS `drag: drag;`
         // and authors data-event-dragstart/drag/dragend all naming "dock_drag".
         // x/y are surface-LOCAL document px — fed straight to the recognizer (no
         // layout-origin subtract). bind_drag carries no time, so we stamp a
         // monotonic ms clock. A tap still fires data-event-click -> restore(), so
-        // tap-to-restore coexists.
+        // tap-to-restore coexists. drag-START/-MOVE SCRUB slide_px_ directly (the
+        // finger is the clock); drag-END RESUMES the animator from the current
+        // finger value to the snapped target (apply_release).
         dock_surface_->bind_drag(
             "dock_drag", [this](kernel::UiSurface::DragPhase p, double x, double y) {
                 switch (p) {
                 case kernel::UiSurface::DragPhase::start:
-                    closing_ = false; // not committed yet; armed by drag_end
-                    apply(controller_.drag_start(x, y, now_ms()));
+                    // Finger takes over: stop any running animation loop + scrub.
+                    apply_scrub(controller_.drag_start(x, y, now_ms()),
+                                /*on_drag_start=*/true);
                     break;
                 case kernel::UiSurface::DragPhase::move:
-                    apply(controller_.drag_move(x, y, now_ms()));
+                    apply_scrub(controller_.drag_move(x, y, now_ms()),
+                                /*on_drag_start=*/false);
                     break;
                 case kernel::UiSurface::DragPhase::end:
-                    // Like a touch_up: a CLOSE commit eases out, so arm closing_
-                    // for the dock_settled hide (gated on !controller_.open()).
-                    closing_ = true;
-                    apply(controller_.drag_end(now_ms()));
+                    // Resume: ease from the finger value to the snapped target.
+                    apply_release(controller_.drag_end(now_ms()));
                     break;
                 }
             });
@@ -513,10 +624,13 @@ private:
         // Seed the output geometry into the Controller and set the CLOSED target
         // so the very first render shows the dock off-screen (translateX(
         // -dock_width)) — matching spec.visible=false. close_now() leaves open_
-        // false and slide_px_ at the f=0 offset; the dirties are harmless before
-        // the first frame (the getters are simply read once geometry is known).
+        // false and the closed offset as the target; seed slide_px_ to it directly
+        // (no animation at create) so the first frame renders the dock off-screen.
         controller_.set_metrics(m);
-        apply(controller_.close_now());
+        controller_.close_now();
+        slide_px_ = controller_.slide_px();
+        anim_.set_immediate(slide_px_);
+        dock_surface_->dirty("slide");
     }
 
     // Dock metrics from the first output's size (queried via output_layout). On
@@ -568,23 +682,26 @@ private:
     std::vector<Slot> slots_;
 
     // e1 gesture state. The Controller (src/gesture.hpp) is the pure decision
-    // core: it owns slide_px_/dragging_/open_ and the event->state transition for
-    // BOTH input sources (the kernel touch bus = OPEN, UiSurface::bind_drag =
-    // CLOSE). The glue is a thin adapter that feeds it events and applies the
-    // returned Outcome to the surface. Declared BEFORE dock_surface_ (like slots_)
-    // so it stays alive while the surface — whose `slide`/`dragging` getters read
-    // it — tears down. Constructed with the real dock width (kDockWidth) and
-    // default recognizer tunables (edge_slop / threshold / fling); set_metrics()
-    // seeds the output geometry once an output exists.
+    // core: it owns the recognizer + the event->state transition (open_, the snap
+    // commit, and the open/closed TARGET slide_px) for BOTH input sources (the
+    // kernel touch bus = OPEN, UiSurface::bind_drag = CLOSE). The glue feeds it
+    // events and routes the resulting target through the SlideAnimator. Declared
+    // BEFORE dock_surface_ (like slots_) so it stays alive while the surface tears
+    // down. Constructed with the real dock width (kDockWidth) + default recognizer
+    // tunables; set_metrics() seeds the output geometry once an output exists.
     gesture::Controller controller_{
         reveal::RevealConfig{.dock_width = kDockWidth},
         layout::DockMetrics{.dock_width = kDockWidth}};
 
-    // closing_: are we mid slide-OUT, waiting on transitionend to set_visible
-    // (false)? Distinct from controller_.open() (the target state) because the
-    // hide must wait for the transition to finish. Set when a close starts, read
-    // (with !controller_.open()) by on_dock_settled.
-    bool closing_ = false;
+    // d1-fix C++ slide animation state. slide_px_ is the LIVE translateX px the
+    // `slide` binding reads — driven by anim_ (the SlideAnimator) for the
+    // keyboard/minimize/restore/drag-release paths, or set directly during a
+    // finger scrub. anim_ holds the current run; frame_ is the kernel per-frame
+    // tick that advances it (armed only while a run is live; reset at rest).
+    // slide_px_ + anim_ are declared BEFORE dock_surface_ so the `slide` getter
+    // reading slide_px_ stays valid through the surface's teardown.
+    double slide_px_ = 0.0;     // live translateX px (closed = -dock_width, open = 0)
+    anim::SlideAnimator anim_;  // the interruptible easing run
 
     // The dock ui surface. Destroyed before slots_ (declared after it) so any
     // getter invoked during its teardown still sees a live slots_; destroyed
@@ -603,6 +720,12 @@ private:
     kernel::Subscription touch_motion_;
     kernel::Subscription touch_up_;
     kernel::Subscription touch_cancel_;
+
+    // The per-frame animation tick. Declared LAST (with the subscriptions) so it
+    // is destroyed FIRST at teardown: its callback captures `this` and touches
+    // dock_surface_ / anim_ / slide_px_ / controller_, so it must stop before any
+    // of them are gone (same listener-lifetime rule as the Subscriptions).
+    kernel::FrameRequest frame_;
 };
 
 } // namespace

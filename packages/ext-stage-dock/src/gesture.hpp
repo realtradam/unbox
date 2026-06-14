@@ -29,21 +29,26 @@
 namespace unbox::ext_stage_dock::gesture {
 
 // What the glue must do AFTER a controller call (the side effects the pure core
-// cannot perform itself). The glue applies these to the UiSurface: make it
-// visible, dirty the `slide`/`dragging` bindings (dirty `dragging` BEFORE
-// `slide` on release so the restored RCSS transition eases the snap), and — on a
-// settling CLOSE — let the existing dock_settled() transitionend hide it.
+// cannot perform itself). The glue makes the surface visible on make_visible and
+// uses dirty_slide to know the slide value changed. NOTE (d1 fix): the close-hide
+// is now driven by the C++ SlideAnimator's COMPLETION (the glue's on_frame),
+// NOT an RmlUi transitionend; and dirty_dragging is VESTIGIAL — the
+// data-class-dragging machinery was removed (RmlUi never animated the inline
+// transform), so the glue ignores it. The field stays for the controller's own
+// pure-core tests + a record of the gesture's "now scrubbing" intent.
 struct Outcome {
     bool make_visible = false;   // show the surface (open begins compositing)
-    bool dirty_slide = false;    // re-read the `slide` double getter next frame
-    bool dirty_dragging = false; // re-read the `dragging` bool getter next frame
+    bool dirty_slide = false;    // the `slide` value changed -> re-render/animate
+    bool dirty_dragging = false; // vestigial (see note above); glue ignores it
 };
 
-// The live gesture state, read by the `slide`/`dragging` bound getters and by
-// the open/close call sites. open == is the dock revealed (drives visibility +
-// the dock_settled close-hide). slide_px == the translateX px the body binds
-// (closed = -dock_width, open = 0). dragging == is a finger-follow drag active
-// (RCSS turns the transition OFF so motion follows the finger 1:1).
+// The live gesture state, read by the open/close call sites + the slide getter.
+// open == is the dock revealed (the glue's animator-completion close-hide is
+// gated on !open). slide_px == the open/closed TARGET translateX px (closed =
+// -dock_width, open = 0) the glue's SlideAnimator eases toward (the body's
+// live translateX is the glue-owned slide_px_ the animator drives, NOT this).
+// dragging == is a finger-follow scrub active (the glue scrubs slide directly
+// during it rather than animating).
 class Controller {
 public:
     Controller(reveal::RevealConfig reveal_config, layout::DockMetrics metrics)
@@ -151,12 +156,12 @@ public:
         return snap(commit);
     }
 
-    // ---- non-gesture open/close call sites (unified onto slide_px_) --------
+    // ---- non-gesture open/close call sites (set the open/closed TARGET) ----
     // Super+M reveal, do_restore reveal, refresh_slots reveal, toggle_visible
-    // open: set the OPEN target. dragging_ = false so the RCSS transition is on
-    // and the body eases to translateX(0). The glue makes the surface visible +
-    // dirties dragging THEN slide. No-op shape if already open (still returns the
-    // outcome so the glue's set_visible(true) is idempotent / safe).
+    // open: set the OPEN target (slide_px == translateX 0). dragging_ = false. The
+    // glue makes the surface visible then ANIMATES slide_px_ to this target via
+    // the C++ SlideAnimator (d1 fix). No-op shape if already open (still returns
+    // the outcome so the glue's set_visible(true) is idempotent / safe).
     auto open_now() -> Outcome {
         open_ = true;
         dragging_ = false;
@@ -165,8 +170,9 @@ public:
     }
 
     // refresh_slots conceal, toggle_visible close: set the CLOSED target. The
-    // body eases back out (transition on); the existing dock_settled() hides the
-    // surface once the slide-out transition ends. dirty dragging THEN slide.
+    // glue ANIMATES slide_px_ back out via the SlideAnimator; its completion
+    // (on_frame) hides the surface once the slide-out finishes (d1 fix — this
+    // replaced the old RmlUi transitionend dock_settled hide).
     auto close_now() -> Outcome {
         open_ = false;
         dragging_ = false;
@@ -184,10 +190,10 @@ private:
         return static_cast<double>(layout::dock_box(metrics_, fraction).x);
     }
 
-    // Shared release for both paths: stop dragging (transition back on), set the
-    // open/closed state + the snap target px. The glue dirties dragging THEN
-    // slide so the restored 0.36s cubic-in-out transition eases the snap; on a
-    // CLOSE the existing dock_settled() transitionend hides the surface.
+    // Shared release for both paths: stop dragging, set the open/closed state +
+    // the snap TARGET px. The glue RESUMES the C++ SlideAnimator from the current
+    // finger value to this target (apply_release), easing with the RCSS-read
+    // tween; on a CLOSE the animator's completion hides the surface.
     auto snap(reveal::RevealCommit commit) -> Outcome {
         dragging_ = false;
         if (commit == reveal::RevealCommit::open) {
