@@ -3,6 +3,7 @@
 #include "file_watcher.hpp"
 #include "rmlui_renderer_gl3.h"
 
+#include <RmlUi/Core/Animation.h> // Transition / TransitionList / Tween
 #include <RmlUi/Core/Context.h>
 #include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/DataModelHandle.h>
@@ -12,7 +13,10 @@
 #include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/Factory.h>
 #include <RmlUi/Core/ID.h>
+#include <RmlUi/Core/Property.h>
+#include <RmlUi/Core/StyleSheetSpecification.h> // GetPropertyId
 #include <RmlUi/Core/SystemInterface.h>
+#include <RmlUi/Core/Tween.h>
 #include <RmlUi/Core/Variant.h>
 
 // The kernel owns GL; system EGL/GLES headers are allowed here (same as the
@@ -2148,6 +2152,63 @@ void SurfaceHandle::dirty() {
     if (surface_->model) {
         surface_->model.DirtyAllVariables();
     }
+}
+
+auto SurfaceHandle::transition_timing(std::string_view element_id, std::string_view property) const
+    -> std::optional<TransitionTiming> {
+    const Surface& s = *surface_;
+    if (s.document == nullptr) {
+        return std::nullopt; // not loaded yet => no computed values
+    }
+    Rml::Element* el = s.document->GetElementById(Rml::String(element_id));
+    if (el == nullptr) {
+        return std::nullopt;
+    }
+    // The computed `transition` property: a TransitionList (none/all + entries).
+    const Rml::Property* prop = el->GetProperty(Rml::PropertyId::Transition);
+    if (prop == nullptr) {
+        return std::nullopt;
+    }
+    const Rml::TransitionList list = prop->Get<Rml::TransitionList>();
+    if (list.none) {
+        return std::nullopt;
+    }
+
+    // Resolve the requested property name (e.g. "transform") to RmlUi's id, then
+    // find the matching per-property transition. An `all` transition applies to
+    // every property and serves as the fallback if no exact entry exists; an
+    // exact entry wins over `all`.
+    const Rml::PropertyId want = Rml::StyleSheetSpecification::GetPropertyId(Rml::String(property));
+    const Rml::Transition* match = nullptr;
+    if (want != Rml::PropertyId::Invalid) {
+        for (const Rml::Transition& t : list.transitions) {
+            if (t.id == want) {
+                match = &t;
+                break;
+            }
+        }
+    }
+    Rml::Tween tween;
+    double duration = 0.0;
+    double delay = 0.0;
+    if (match != nullptr) {
+        tween = match->tween;
+        duration = static_cast<double>(match->duration);
+        delay = static_cast<double>(match->delay);
+    } else if (list.all && !list.transitions.empty()) {
+        // `all foo 0.2s ease` parses to a single entry flagged all=true; reuse
+        // its timing/tween for the requested property.
+        const Rml::Transition& t = list.transitions.front();
+        tween = t.tween;
+        duration = static_cast<double>(t.duration);
+        delay = static_cast<double>(t.delay);
+    } else {
+        return std::nullopt;
+    }
+
+    // Wrap RmlUi's Tween BY VALUE — Tween::operator()(float) is the evaluator;
+    // capturing it keeps RmlUi types out of the contract entirely.
+    return TransitionTiming{duration, delay, [tween](float t) { return tween(t); }};
 }
 
 // ---- PreviewHandle (public Preview impl) ------------------------------------

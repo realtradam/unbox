@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -202,6 +203,30 @@ public:
     // shrinking the rendered rows to match the new count on the next frame.
     virtual void dirty(std::string_view name) = 0;
     virtual void dirty() = 0;
+
+    // ---- RCSS easing reader (timing authored in RCSS, driven from C++) ----
+    // The timing+easing authored on an element's `transition` for a given
+    // property, so a C++ animator can REUSE the RCSS-defined values (which stay
+    // hot-reloadable). The substrate looks the element up by id within THIS
+    // surface's document, reads its computed `transition`, and returns the entry
+    // whose target matches `property` — resolving the property NAME (e.g.
+    // "transform", "opacity") to RmlUi's internal property id, and honouring an
+    // `all` transition (which matches every property) as a fallback. `ease` is
+    // RmlUi's own tween evaluator wrapped as a pure function (normalized
+    // progress [0,1] -> eased value); NO RmlUi types cross this contract.
+    // Returns nullopt if the surface/element/transition is absent (the caller
+    // falls back to its own default). Cheap; call at animation START — and again
+    // after a hot-reload, because the reloaded element is re-parsed so a fresh
+    // call sees the new values. Document must have loaded (its first frame has
+    // rendered) for computed values to exist; before that, nullopt.
+    struct TransitionTiming {
+        double duration;                  // seconds
+        double delay;                     // seconds
+        std::function<float(float)> ease; // normalized progress [0,1] -> eased value
+    };
+    [[nodiscard]] virtual auto transition_timing(std::string_view element_id,
+                                                 std::string_view property) const
+        -> std::optional<TransitionTiming> = 0;
 
 protected:
     UiSurface() = default;

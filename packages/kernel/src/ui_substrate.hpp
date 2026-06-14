@@ -118,6 +118,9 @@ public:
     void on_touch_mode_changed(std::function<void(bool)> callback) override;
     void dirty(std::string_view name) override;
     void dirty() override;
+    [[nodiscard]] auto transition_timing(std::string_view element_id,
+                                         std::string_view property) const
+        -> std::optional<TransitionTiming> override;
 
 private:
     Substrate* substrate_;

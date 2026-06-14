@@ -1,5 +1,6 @@
 #pragma once
 
+#include <unbox/kernel/frames.hpp>
 #include <unbox/kernel/hooks.hpp>
 #include <unbox/kernel/surface_registry.hpp>
 #include <unbox/kernel/watch.hpp>
@@ -220,6 +221,32 @@ public:
         return register_file_watch(std::string(path), std::move(on_change));
     }
 
+    // ---- Per-frame animation tick (C++-driven, RCSS-timed animations) ----
+    // Run `on_frame(dt_seconds)` once per rendered output frame for as long as
+    // the returned handle lives; reset/destroy the handle to stop. `dt_seconds`
+    // is the monotonic time since the PREVIOUS rendered frame (clamp large gaps
+    // yourself in the callback — e.g. after a stall the first dt can be big).
+    // While >=1 FrameRequest is alive the kernel SCHEDULES output frames
+    // continuously (wlr_output_schedule_frame) so animations advance even when
+    // the scene is otherwise idle; when the last handle dies it stops requesting
+    // frames (no busy render at rest). Callbacks run BEFORE the ui substrate
+    // ticks + the scene commits each frame, so a callback that updates state +
+    // UiSurface::dirty() is composited THAT frame. The set is drained
+    // RE-ENTRANCY-SAFE: a callback may add or remove requests, including its own
+    // (a request added during a drain first fires next frame; one removed during
+    // a drain does not fire again this drain). ERROR-ISOLATED to YOUR extension:
+    // a throw out of `on_frame` disables your extension (same boundary as
+    // watch_file / a hook), never the session. Hold the handle as a member.
+    //
+    // The kernel drives this from the PRIMARY output's frame event (the first
+    // output added); secondary outputs share the same dt and do not double-fire
+    // the callbacks. A backend with no event loop / no output yields an inactive
+    // handle (active() == false) — mirror of watch_file's no-loop behaviour.
+    [[nodiscard]] auto request_frames(std::function<void(double dt_seconds)> on_frame)
+        -> FrameRequest {
+        return register_frame_request(std::move(on_frame));
+    }
+
     // ---- Kernel event catalogue ----
     // Subscribe through these to react to kernel-owned input/output. Each
     // returns an Event/Filter you subscribe to with YOUR extension id (the
@@ -336,6 +363,12 @@ protected:
     [[nodiscard]] virtual auto register_file_watch(std::string path,
                                                    std::function<void()> on_change)
         -> FileWatch = 0;
+
+    // Non-template per-frame-callback core (the request_frames shim above
+    // injects YOUR id for error isolation). Registers on the kernel's frame
+    // driver; returns an inactive handle if there is no event loop / output.
+    [[nodiscard]] virtual auto register_frame_request(std::function<void(double)> on_frame)
+        -> FrameRequest = 0;
 
     // The kernel-owned, session-wide surface->tree association store (shared by
     // ALL extensions; the host_surface/scene_tree_for shims above route here).

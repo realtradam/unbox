@@ -399,6 +399,26 @@ auto Server::Impl::file_watcher() -> FileWatcher* {
     return watcher.get();
 }
 
+auto Server::Impl::frame_driver() -> FrameDriver* {
+    // Lazily create the per-frame animation driver on first use, carrying the
+    // kernel's disable sink for error isolation. No loop/wlr resource of its own
+    // (the frame handler drives it), so it is always creatable.
+    if (frames == nullptr) {
+        frames = std::make_unique<FrameDriver>([this](ExtensionId who) { disable(who); });
+    }
+    return frames.get();
+}
+
+void Server::Impl::schedule_driver_frame() {
+    // Pick / keep the primary driving output: the first one still present.
+    if (frame_driver_output == nullptr && !outputs.empty()) {
+        frame_driver_output = outputs.front()->output;
+    }
+    if (frame_driver_output != nullptr) {
+        wlr_output_schedule_frame(frame_driver_output);
+    }
+}
+
 void Server::Impl::shutdown() {
     // Destroy extensions FIRST, in reverse activation order: their RAII members
     // (Subscriptions, Listeners, scene nodes) release while the wlr objects
@@ -531,6 +551,33 @@ void Server::Impl::handle_new_output(wlr_output* wlr_output) {
     outputs.push_back(std::move(owned));
 
     output->frame.connect(wlr_output->events.frame, [this, output](void*) {
+        // Per-frame animation callbacks (Host::request_frames) run on the PRIMARY
+        // output's frame only — the first output added is the frame driver, so a
+        // multi-output session gets ONE shared dt and the callbacks fire once per
+        // displayed frame rather than once per output. They run BEFORE
+        // substrate->tick_all()/commit so a callback that updates state +
+        // UiSurface::dirty() is composited THIS frame.
+        if (frame_driver_output == nullptr) {
+            frame_driver_output = output->output; // promote a survivor / first output
+        }
+        if (output->output == frame_driver_output && frames != nullptr &&
+            frames->has_requests()) {
+            timespec ts{};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const double t = static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+            const double dt = (last_frame_time < 0.0) ? 0.0 : (t - last_frame_time);
+            last_frame_time = t;
+            frames->drain(dt); // error-isolated; may add/remove requests (incl. its own)
+            // Keep the frames coming while any request is still alive after the
+            // drain (a callback may have removed the last one — then we stop,
+            // returning to idle: no busy render at rest).
+            if (frames->has_requests()) {
+                wlr_output_schedule_frame(frame_driver_output);
+            } else {
+                last_frame_time = -1.0; // reset the dt base for the next animation
+            }
+        }
+
         if (substrate != nullptr) {
             substrate->tick_all();
         }
@@ -548,6 +595,27 @@ void Server::Impl::handle_new_output(wlr_output* wlr_output) {
     output->destroy.connect(wlr_output->events.destroy, [this, output](void*) {
         const OutputEvent ev{output->output};
         ev_output_removed.emit(ev);
+        // If the frame DRIVER output is going away, re-point it (and reset the dt
+        // base) so live animations keep advancing on a surviving output. This
+        // MUST all happen BEFORE `outputs.remove_if` below: that call destroys
+        // `output` together with THIS very listener's std::function storage, so
+        // it has to be the LAST action — nothing may touch the lambda or its
+        // captures afterwards.
+        if (frame_driver_output == output->output) {
+            frame_driver_output = nullptr;
+            last_frame_time = -1.0;
+            // Promote a SURVIVING output (skip the one being destroyed) and, if
+            // any frame request is alive, schedule its next frame.
+            for (const auto& owned : outputs) {
+                if (owned.get() != output) {
+                    frame_driver_output = owned->output;
+                    break;
+                }
+            }
+            if (frame_driver_output != nullptr && frames != nullptr && frames->has_requests()) {
+                wlr_output_schedule_frame(frame_driver_output);
+            }
+        }
         // Last action: destroys `output` (and these listeners with it).
         outputs.remove_if([output](const auto& owned) { return owned.get() == output; });
     });

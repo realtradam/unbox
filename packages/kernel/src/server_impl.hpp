@@ -6,6 +6,7 @@
 #include <unbox/kernel/wlr.hpp>
 
 #include "file_watcher.hpp"
+#include "frame_driver.hpp"
 #include "listener.hpp"
 #include "ui_substrate.hpp"
 
@@ -104,6 +105,23 @@ struct Server::Impl : detail::DisableSink {
     // no wl_event_loop (never in practice — the display always has one).
     auto file_watcher() -> FileWatcher*;
 
+    // The per-frame animation driver (Host::request_frames). Holds the live
+    // per-frame callbacks; drained from the PRIMARY output's frame handler
+    // (frame_driver_output) BEFORE substrate->tick_all()/commit. Created lazily
+    // on the first request; outlives the extensions (their FrameRequest handles
+    // unregister into it on destruction), so it is a plain Impl member torn down
+    // after the extension slots in shutdown(). Has no loop/wlr resource itself.
+    std::unique_ptr<FrameDriver> frames;
+    auto frame_driver() -> FrameDriver*;
+    // The output whose frame event drives request_frames: the FIRST output
+    // added (the primary). One shared dt; secondary outputs do not drive the
+    // callbacks. Cleared when that output is removed (a survivor is promoted in
+    // the next frame handler that runs). Borrow; the kernel owns the output.
+    wlr_output* frame_driver_output = nullptr;
+    // Monotonic timestamp (seconds) of the previous driving frame; used to
+    // compute dt. Reset (< 0) until the first driving frame establishes a base.
+    double last_frame_time = -1.0;
+
     std::list<std::unique_ptr<Output>> outputs;
     std::list<std::unique_ptr<Keyboard>> keyboards;
     std::list<std::unique_ptr<TouchDevice>> touch_devices;
@@ -167,6 +185,9 @@ struct Server::Impl : detail::DisableSink {
     void handle_new_output(wlr_output* output);
     void start_substrate(); // builds the ui substrate; never throws, may be unavailable
     void register_hook(detail::HookBase& hook); // track for purge/disable
+    // Schedule a frame on the driving output (if any) so the continuous-frame
+    // loop keeps advancing while >=1 FrameRequest is alive. No-op if no output.
+    void schedule_driver_frame();
 
     // server.cpp — extension host
     void install(std::unique_ptr<Extension> extension);
@@ -274,6 +295,18 @@ protected:
             return FileWatch{};
         }
         return w->add(path, std::move(on_change), id_);
+    }
+    auto register_frame_request(std::function<void(double)> on_frame) -> FrameRequest override {
+        FrameDriver* d = server_->frame_driver();
+        if (d == nullptr) {
+            return FrameRequest{}; // no event loop: inert handle (mirror watch_file)
+        }
+        FrameRequest req = d->add(std::move(on_frame), id_);
+        // Kick the driving output so the continuous-frame loop starts THIS turn
+        // even if the scene was idle (the frame handler re-arms each frame while
+        // requests live). Safe before any output exists (no-op then).
+        server_->schedule_driver_frame();
+        return req;
     }
 
 private:

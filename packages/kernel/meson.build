@@ -56,6 +56,7 @@ kernel_lib = static_library(
   'src/server.cpp',
   'src/input.cpp',
   'src/file_watcher.cpp',
+  'src/frame_driver.cpp',
   'src/ui_substrate.cpp',
   'src/rmlui_renderer_gl3.cpp',
   # Listing the generated header as a source forces codegen before any kernel

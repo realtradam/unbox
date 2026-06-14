@@ -2448,3 +2448,110 @@ TEST_CASE("grab: a fresh stream can flip owner (substrate then bus)") {
     CHECK(g.press(false) == GrabOwner::bus);
     CHECK(g.release() == GrabOwner::bus);
 }
+
+// ============================================================================
+// RCSS easing reader: UiSurface::transition_timing parses an element's authored
+// `transition` (duration/delay + the RmlUi tween wrapped as a pure function),
+// resolves the property name to its id, and honours an `all` transition.
+// GL/seat note: transition_timing reads COMPUTED values, which only exist once
+// the document has loaded + a context update ran — so it needs the gles2 GL
+// bridge (headless+gles2). On a box with no GL path the surface is null and the
+// case degrades to a no-op (asserts nothing), exactly like the other substrate
+// cases. The frame-callback (request_frames) scheduling is real-seat / GL-frame
+// driven and is exercised only under a live output, not mocked here.
+// ============================================================================
+
+namespace {
+
+// transform => an exact `transform` transition; opacity => only via the `all`
+// fallback; the #plain element has no transition at all (nullopt).
+const char* kEaseRml = R"RML(<rml>
+<head>
+<style>
+body { width: 200px; height: 120px; }
+#anim  { display: block; width: 100px; height: 20px;
+         transition: transform 0.2s cubic-in-out 0.05s; }
+#allel { display: block; width: 100px; height: 20px;
+         transition: all 0.3s; }
+#plain { display: block; width: 100px; height: 20px; }
+</style>
+</head>
+<body data-model="ui">
+<div id="anim"></div>
+<div id="allel"></div>
+<div id="plain"></div>
+</body>
+</rml>)RML";
+
+class EaseTestExtension : public unbox::kernel::Extension {
+public:
+    auto manifest() const -> const Manifest& override { return manifest_; }
+    void activate(Host& host) override {
+        UiSurfaceSpec spec;
+        spec.rml_inline = kEaseRml;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 200;
+        spec.height = 120;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+    [[nodiscard]] auto surface() -> UiSurface* { return surface_.get(); }
+
+private:
+    Manifest manifest_{"ease-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+} // namespace
+
+TEST_CASE("ui: transition_timing reads RCSS duration/delay + tween, resolves property + all") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new EaseTestExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 60); // load the document + run a context update => computed values
+
+    if (!ext->has_surface()) {
+        // No GL path on this box: surface is null, nothing computed. Graceful.
+        CHECK(true);
+        return;
+    }
+    UiSurface* s = ext->surface();
+
+    // (1) Exact property match: transform 0.2s cubic-in-out 0.05s.
+    const auto tt = s->transition_timing("anim", "transform");
+    REQUIRE(tt.has_value());
+    CHECK(tt->duration == doctest::Approx(0.2));
+    CHECK(tt->delay == doctest::Approx(0.05));
+    REQUIRE(static_cast<bool>(tt->ease));
+    // cubic-in-out: clamped endpoints 0 and 1, monotone, midpoint ~0.5.
+    CHECK(tt->ease(0.0F) == doctest::Approx(0.0F));
+    CHECK(tt->ease(1.0F) == doctest::Approx(1.0F));
+    CHECK(tt->ease(0.5F) == doctest::Approx(0.5F)); // symmetric in-out hits 0.5 at t=0.5
+    const float q = tt->ease(0.25F);
+    CHECK(q > 0.0F);
+    CHECK(q < 0.5F); // ease-in region rises slower than linear
+
+    // (2) `all` fallback: #allel has `all 0.3s` (no tween => RmlUi's default
+    // linear); a property with no exact entry resolves through the all
+    // transition (linear => ease(t) == t).
+    const auto allt = s->transition_timing("allel", "transform");
+    REQUIRE(allt.has_value());
+    CHECK(allt->duration == doctest::Approx(0.3));
+    CHECK(allt->delay == doctest::Approx(0.0));
+    REQUIRE(static_cast<bool>(allt->ease));
+    CHECK(allt->ease(0.5F) == doctest::Approx(0.5F)); // linear
+
+    // (3) No transition on the element => nullopt.
+    CHECK_FALSE(s->transition_timing("plain", "transform").has_value());
+    // (4) Unknown element id => nullopt.
+    CHECK_FALSE(s->transition_timing("nope", "transform").has_value());
+    // (5) Unparseable property name => nullopt (no exact match, no `all` here).
+    CHECK_FALSE(s->transition_timing("anim", "not-a-real-property").has_value());
+}
