@@ -15,3 +15,6 @@ packaging/remote.local
 subprojects/*
 !subprojects/*.wrap
 !subprojects/packagefiles/
+
+# local spike launcher (run-spike.sh)
+/run-spike.sh

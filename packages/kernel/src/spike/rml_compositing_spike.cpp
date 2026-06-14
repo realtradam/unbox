@@ -181,17 +181,26 @@ auto run_verify() -> int {
             wlr_render_pass_submit(pass);
         }
         gl.make_current();
-        live_zero_copy = live.adopt(client_buf) && live.is_dmabuf;
+        live_zero_copy = live.adopt(client_buf, /*seq=*/1) && live.is_dmabuf;
     }
     check(client_buf != nullptr && live.tex != 0,
           "criterion 1: live client buffer imported as a sampled texture");
     check(live_zero_copy, "criterion 1: live import is ZERO-COPY dmabuf (not a CPU copy)");
 
+    // Re-adopting the SAME buffer at the SAME commit seq is the idle-gate case:
+    // no commit happened, so the seq is unchanged and we must NOT re-import.
     const int reimports_before = live.reimports;
-    live.adopt(client_buf);
-    live.adopt(client_buf);
+    live.adopt(client_buf, /*seq=*/1);
+    live.adopt(client_buf, /*seq=*/1);
     check(live.reimports == reimports_before,
-          "criterion 1: unchanged buffer is NOT re-imported (cached)");
+          "criterion 1: unchanged surface state (same seq) is NOT re-imported (cached)");
+
+    // But a NEW commit (seq advances) of the SAME pooled buffer pointer with new
+    // contents MUST re-import — the frozen-frame fix. Proven here directly.
+    live.adopt(client_buf, /*seq=*/2);
+    check(live.reimports == reimports_before + 1,
+          "criterion 1: a new commit (seq++) of a reused buffer pointer DOES re-import "
+          "(frozen-frame fix: pool reuse no longer skips the update)");
 
     std::string rml = kVerifyRmlTemplate;
     rml.replace(rml.find("LIVE_URI"), 8, live.uri);
@@ -425,7 +434,7 @@ auto run_verify_surface_trees() -> int {
     };
     for (const Pair& p : {Pair{&wall, wall_buf}, Pair{&top, top_buf}, Pair{&sub, sub_buf},
                           Pair{&pop, pop_buf}}) {
-        const bool ok = p.b != nullptr && p.t->adopt(p.b);
+        const bool ok = p.b != nullptr && p.t->adopt(p.b, /*seq=*/1);
         zero_copy = zero_copy && ok && p.t->is_dmabuf;
     }
     check(zero_copy, "criterion 4/5: tree (toplevel+subsurface+popup) + wallpaper imported zero-copy");

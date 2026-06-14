@@ -222,23 +222,57 @@ struct GlBridge {
 };
 
 // --- A LIVE surface element: a client buffer imported zero-copy as a sampled
-// texture, registered under a URI, re-imported ONLY on a new buffer commit. ---
+// texture, registered under a URI, re-imported on each NEW surface commit. ---
+//
+// FROZEN-FRAME FIX. The re-import was gated on the wlr_buffer POINTER changing
+// (`buf == current`). That is WRONG for real clients: Wayland clients (foot)
+// recycle a SMALL POOL of buffers, and wlroots re-uses the SAME wlr_client_buffer
+// for a re-attached wl_buffer — so the identical pointer is re-committed with
+// BRAND-NEW contents. The pointer-equality early-return then wrongly skipped the
+// update and the displayed texture stayed stuck on buffer #1 (`commits=3` but
+// `reimports=1` in the headless log). The correct dirty signal is the surface's
+// COMMIT SEQUENCE (`wlr_surface_state.seq`), which increments on EVERY commit
+// regardless of pool reuse. We re-import whenever the seq advances, re-binding
+// the EGLImage to the current buffer (a live dmabuf view => new pixels) or
+// re-uploading for shm, so new contents show even on a reused buffer pointer.
+//
+// BUFFER LIFECYCLE. `surface->buffer` is a wlr_client_buffer (the renderer-side
+// import); wlroots has ALREADY released the client's underlying wl_buffer back
+// to its pool, so reading it never starves the client. We still LOCK the buffer
+// we are importing (so its dmabuf FDs stay valid while we build the EGLImage and
+// sample it) and UNLOCK the PREVIOUS one once the new import is live — a
+// double-buffered lock that mirrors wlroots' consumer lock/release discipline
+// and guarantees we never pin more than one buffer at a time.
 struct LiveTexture {
     GlBridge* gl = nullptr;
     std::string uri;
     int width = 0, height = 0;
-    wlr_buffer* current = nullptr;
+    wlr_buffer* current = nullptr;       // the buffer currently imported + LOCKED
+    std::uint32_t current_seq = 0;       // surface commit seq of `current`
+    bool have_seq = false;               // false until the first adopt()
     EGLImageKHR image = EGL_NO_IMAGE_KHR;
     GLuint tex = 0;
     bool is_dmabuf = false;
     int reimports = 0;
     int commits_seen = 0;
 
-    auto adopt(wlr_buffer* buf) -> bool {
+    // Re-import the surface's CURRENT committed buffer for commit sequence `seq`.
+    // `seq` MUST be the surface's wlr_surface_state.seq (advances every commit) —
+    // NOT the buffer pointer, which a pooled client recycles. Returns true if the
+    // sampled texture reflects the current buffer afterwards.
+    auto adopt(wlr_buffer* buf, std::uint32_t seq) -> bool {
         ++commits_seen;
-        if (buf == current && tex != 0) {
-            return true; // unchanged buffer: zero re-import, zero copy
+        // Idle gate: a static client never commits, so its seq never advances and
+        // we do zero work (the dirty-gate stays intact). A re-committed buffer —
+        // even the SAME pointer with new contents — bumps seq and re-imports.
+        if (have_seq && seq == current_seq && buf == current && tex != 0) {
+            return true; // truly unchanged surface state: zero re-import, zero copy
         }
+        // Lock the buffer we are about to sample so its storage (dmabuf FDs / shm)
+        // stays valid for the whole import+sample; unlock the PREVIOUS one once the
+        // new import is live (double-buffered: at most one buffer pinned).
+        wlr_buffer* prev = current;
+        wlr_buffer_lock(buf);
         wlr_dmabuf_attributes attrs{};
         if (gl->dmabuf_ok && wlr_buffer_get_dmabuf(buf, &attrs) && attrs.n_planes >= 1) {
             EGLint ia[] = {EGL_WIDTH,
@@ -270,18 +304,18 @@ struct LiveTexture {
                 width = attrs.width;
                 height = attrs.height;
                 is_dmabuf = true;
-                current = buf;
-                ++reimports;
+                adopt_commit(prev, buf, seq);
                 register_uri();
                 return true;
             }
         }
-        // Fallback: one CPU upload for an shm client (still only on a new buffer).
+        // Fallback: one CPU upload for an shm client.
         void* data = nullptr;
         std::uint32_t fmt = 0;
         std::size_t stride = 0;
         if (!wlr_buffer_begin_data_ptr_access(buf, WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &fmt,
                                               &stride)) {
+            wlr_buffer_unlock(buf); // import failed: drop the lock we just took
             return false;
         }
         release_gl();
@@ -302,10 +336,24 @@ struct LiveTexture {
         width = buf->width;
         height = buf->height;
         is_dmabuf = false;
-        current = buf;
-        ++reimports;
+        adopt_commit(prev, buf, seq);
         register_uri();
         return true;
+    }
+
+    // Commit a successful import: adopt `buf` (already locked) at sequence `seq`
+    // and release the PREVIOUSLY-locked buffer (double-buffered lock). Counts a
+    // reimport. NB: prev may equal buf when a pooled client re-commits the same
+    // pointer with new contents — lock/unlock balance still holds (net +1 then
+    // -1 => the single live lock we took above for THIS adopt).
+    void adopt_commit(wlr_buffer* prev, wlr_buffer* buf, std::uint32_t seq) {
+        current = buf;
+        current_seq = seq;
+        have_seq = true;
+        ++reimports;
+        if (prev != nullptr) {
+            wlr_buffer_unlock(prev);
+        }
     }
 
     void register_uri() {
@@ -326,7 +374,12 @@ struct LiveTexture {
             gl->render->unregister_preview_texture(uri);
         }
         release_gl();
-        current = nullptr;
+        if (current != nullptr) {
+            wlr_buffer_unlock(current); // release the buffer we held locked
+            current = nullptr;
+        }
+        have_seq = false;
+        current_seq = 0;
     }
 };
 
