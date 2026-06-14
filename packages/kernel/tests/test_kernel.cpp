@@ -15,6 +15,15 @@
 #include "../src/ui_core.hpp"
 // The VT-switch escape hatch's pure core (keysym -> VT number), no wlroots.
 #include "../src/vt_core.hpp"
+// SPIKE (rml-compositing, Phase 0): the throwaway spike's PURE input-inversion
+// core (screen-point -> surface-local through a 3D transform). Header-only, no
+// wlroots/GL/RMLUi, so the criterion-3 geometry is doctest-ed here alongside the
+// runnable target's own headless self-check (src/spike/). Kept in the kernel
+// suite so the spike's geometry stays green with the unit.
+#include "../src/spike/spike_input_core.hpp"
+
+#include <cmath>
+#include <numbers>
 
 #include <cstdlib>
 #include <filesystem>
@@ -2554,4 +2563,93 @@ TEST_CASE("ui: transition_timing reads RCSS duration/delay + tween, resolves pro
     CHECK_FALSE(s->transition_timing("nope", "transform").has_value());
     // (5) Unparseable property name => nullopt (no exact match, no `all` here).
     CHECK_FALSE(s->transition_timing("anim", "not-a-real-property").has_value());
+}
+
+// ============================================================================
+// SPIKE (rml-compositing, Phase 0) — PURE input-inversion core (criterion 3).
+// The runnable spike target (src/spike/) self-checks the live-texture / 3D
+// transform / present / idle-gate headless; THIS unit-tests the screen-point ->
+// (surface element, surface-local coord) inversion through a known transform —
+// the math the runtime RmlUi-pick -> wl_seat translation rides on. Throwaway,
+// but kept green with the kernel: a regressed inverse would silently mis-route
+// touch on a tilted window, the exact failure criterion 3 guards against.
+// ============================================================================
+
+namespace {
+namespace spk = unbox::kernel::spike;
+
+// Forward-project a surface-local point through `t`, then invert; assert the
+// round trip recovers the original to sub-pixel. err in pixels.
+auto roundtrip_err(const spk::Mat4& t, double lx, double ly) -> double {
+    const spk::ScreenPoint s = spk::project_to_screen(t, lx, ly);
+    const auto back = spk::unproject_to_local(t, s.x, s.y);
+    if (!back) {
+        return 1e9;
+    }
+    return std::hypot(back->x - lx, back->y - ly);
+}
+} // namespace
+
+TEST_CASE("spike(rml-compositing): screen->surface-local inverts an affine transform") {
+    // A plain translate (no perspective): the inverse must be exact everywhere.
+    const spk::Mat4 t = spk::translate(120.0, -40.0);
+    CHECK(roundtrip_err(t, 0.0, 0.0) < 1e-9);
+    CHECK(roundtrip_err(t, 200.0, 150.0) < 1e-9);
+    // The forward map is a pure offset: a local (10,10) lands at (130,-30).
+    const spk::ScreenPoint s = spk::project_to_screen(t, 10.0, 10.0);
+    CHECK(s.x == doctest::Approx(130.0));
+    CHECK(s.y == doctest::Approx(-30.0));
+}
+
+TEST_CASE("spike(rml-compositing): inverts perspective + rotateY about the element origin") {
+    // The criterion-3 case: a 256x256 surface element with perspective(800) +
+    // rotateY, resolved about the 50% origin (what RCSS computes). The inverse is
+    // a ray/plane intersection (non-affine under perspective); assert sub-0.01px
+    // recovery across the element, including off-center points that foreshorten.
+    const double origin = 128.0;
+    for (double deg : {15.0, 35.0, 60.0, -45.0}) {
+        const spk::Mat4 t = spk::rcss_transform_about_origin(
+            spk::mul(spk::perspective(800.0),
+                     spk::rotate_y(deg * std::numbers::pi / 180.0)),
+            origin, origin);
+        CHECK(roundtrip_err(t, 128.0, 128.0) < 1e-6); // center: on the rotation axis
+        CHECK(roundtrip_err(t, 32.0, 64.0) < 0.01);   // near edge (foreshortened)
+        CHECK(roundtrip_err(t, 224.0, 200.0) < 0.01); // far edge
+        CHECK(roundtrip_err(t, 64.0, 96.0) < 0.01);   // arbitrary interior point
+    }
+}
+
+TEST_CASE("spike(rml-compositing): the inverse is the true matrix inverse (M*inv ~ I)") {
+    // The unprojection's correctness rests on invert(): assert inv(M)*M is the
+    // identity for the perspective+rotateY operator (the non-trivial case). This
+    // is the algebraic backstop under the geometric round-trip tests above.
+    const double origin = 128.0;
+    const spk::Mat4 m = spk::rcss_transform_about_origin(
+        spk::mul(spk::perspective(800.0), spk::rotate_y(40.0 * std::numbers::pi / 180.0)), origin,
+        origin);
+    const auto inv = spk::invert(m);
+    REQUIRE(inv.has_value());
+    const spk::Mat4 prod = spk::mul(*inv, m);
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            CHECK(prod.at(r, c) == doctest::Approx(r == c ? 1.0 : 0.0).epsilon(1e-9));
+        }
+    }
+}
+
+TEST_CASE("spike(rml-compositing): an edge-on (90deg) transform collapses the element to a line") {
+    // rotateY(90deg) about the origin turns the element edge-on: its plane
+    // projects to a vertical LINE on screen, so distinct surface-local points
+    // collapse to (nearly) the same screen x — there is no reliable preimage. We
+    // assert the GEOMETRIC truth (the forward map is degenerate) rather than a
+    // particular inverse return: at runtime RmlUi's own transform-aware pick is
+    // what declines an edge-on element, so the spike never has to invert one.
+    const double origin = 128.0;
+    const spk::Mat4 t = spk::rcss_transform_about_origin(
+        spk::mul(spk::perspective(800.0), spk::rotate_y(std::numbers::pi / 2.0)), origin, origin);
+    const spk::ScreenPoint a = spk::project_to_screen(t, 32.0, 64.0);
+    const spk::ScreenPoint b = spk::project_to_screen(t, 224.0, 64.0);
+    // Two points 192px apart in surface-local X land at the same screen X (the
+    // element is edge-on): the map lost its X information.
+    CHECK(std::abs(a.x - b.x) < 0.5);
 }

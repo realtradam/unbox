@@ -46,6 +46,8 @@
 | **ui surface** | One RMLUi document an extension contributes, composited as a scene node. | shell surface, overlay, RML window, panel (when meaning the object) |
 | **data binding** | RMLUi's model↔document binding; the ONLY way extension state reaches RML. | — |
 | **touch-mode** | The substrate state signalling finger input (auto-flipped, debounced). NO automatic visual scaling (user decision, slice 5) — extensions may adapt affordances via the change notification (spacing, invisible hit zones, OSK auto-show). | tablet mode |
+| **RML compositing** | Architecture direction (gated by the slice-13 spike): the RMLUi substrate composites ALL on-screen content — toplevels, layer-shell clients (incl. wallpaper), and chrome — as **surface elements** backed by live, shared GL textures, with layout/animation/3D effects in RCSS. wlroots stays the foundation + hardware cursor plane + fullscreen-video scanout bypass. See `notes/rml-compositing.md`, `notes/plan.md` §2. | RMLUi-as-renderer-only (when meaning this) |
+| **surface element** | An RML element backed by a live client surface's shared GL texture — a toplevel OR a layer surface presented inside the RML compositor. | window element, RML window |
 
 ## Input & keybindings
 

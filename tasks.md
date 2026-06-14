@@ -5,7 +5,7 @@
 
 ## Now
 
-**ACTIVE (core, user-driven) — Slice 13: RML COMPOSITING SPIKE.** Big direction
+**ACTIVE (core, user-driven) — Slice 13: RML COMPOSITING (Phase 0 GO → Phase 2 impl).** Big direction
 change: RMLUi becomes the content compositor — toplevels + layer-shell (incl.
 wallpaper) + chrome are RML elements backed by LIVE, SHARED GL textures, with
 layout/animation/3D effects in RCSS; wlroots stays foundation + cursor plane +
@@ -13,7 +13,21 @@ layout/animation/3D effects in RCSS; wlroots stays foundation + cursor plane +
 by OUR dirty-gated rendering (NOT a RMLUi built-in) + a deferred scanout bypass.
 GATED BY A SPIKE before commit. Full spec + acceptance criteria:
 `notes/rml-compositing.md`; decision row in `notes/plan.md` §2.
-NEXT ACTION: write the spike brief (kernel/substrate) and summon it.
+SPIKE RESULT: **PHASE 0 CLOSED — GO, real-seat CONFIRMED.** All 7 criteria
+`ALL PASS` headless on Haswell+crocus (CF-AX3 GPU class); on the real seat:
+input accurate through the 3D transform (after the `Element::Project()` routing
+fix), and ~30fps under the 4-window `--demo` load. Stage-0 instrumentation
+(per-phase split + GPU timer) shows it is **fill-bound** (~10–15ms whole-output
+composite, ~2ms CPU) → damage limiting is the recovery lever, built properly in
+Phase 1 (not the throwaway). Surface trees = **per-subsurface elements** (RTT
+hook); present = FBO→dmabuf swapchain→wlr_scene_buffer + EGL fence. Throwaway
+target `packages/kernel/rml-compositing-spike` (`--verify`/`--run`/`--demo`),
+out of the shipped binary. **CONTRACT DECISION (user): RCSS is the single source
+of truth for ALL layout + animation; C++ drives the document via a TYPED
+substrate API.** NEXT ACTION: **Phase 2 implementation** per the Phase-1 design
+doc `notes/rml-compositing-phase1.md` — Wave 1 = kernel substrate
+(`SurfaceElement` live import + input-back + damage-limited present). 4 user
+boundary calls open (design doc §10) before Wave 2 fans out.
 Tiling (slice 7) is DEFERRED behind this (becomes RCSS over surface elements;
 pure layout core in `notes/tiling-spec.md` carries over). Stage dock (slice 10)
 real-seat feel check is paused under this pivot.
@@ -116,7 +130,7 @@ deprecated no-op `Options::ui_spike`, retiring host-bin's demo ui.
 | 10 | **Stage dock** (ext-stage-dock): minimized-window previews on a left-edge swipe (Fork B) | **a1–d1 landed; previews real-seat-verified** | DONE: Super+M minimize→RMLUi-imported preview snapshot→dock slot→hide (previews confirmed rendering on hardware); RCSS dock slide-in + slot settle. NEXT: confirm tap-to-restore + animation feel; 1 boundary call (input-transparent UiSurface flag) → c1 gesture-claim → e1 gesture reveal/drag-out; then config-driven minimize keybind + favicon (XDG icon dep) |
 | 11 | **Status bar** (tent. ext-statusbar): iPad/iOS top bar — clock (left), configurable left/middle/right sections, tray (right) wifi/volume/battery | **IDEA — needs design** | sequenced AFTER slice 7 (tiling); replaces cut taskbar. Details + open questions: `notes/status-bar-home-screen.md` |
 | 12 | **Home screen** (tent. ext-home, iPad springboard): app grid; tap = launch-or-raise (instance picker if >1 open); add/remove apps; swipe-up-from-bottom to enter | **IDEA — needs design** | sequenced AFTER slice 7 (tiling); replaces cut taskbar. Details + open questions: `notes/status-bar-home-screen.md` |
-| 13 | **THE SPIKE: RML compositing** — RMLUi becomes the content compositor (toplevels + layer-shell incl. wallpaper + chrome = RML elements backed by LIVE, SHARED GL textures; layout/animation/3D effects in RCSS). wlroots = foundation + cursor plane + (deferred) fullscreen scanout bypass. | **ACTIVE (core) — spike** | GO/NO-GO on the CF-AX3: (1) live toplevel texture in RmlUi via shared context, ZERO per-frame copy; (2) RCSS 3D transform on it; (3) pointer+touch+keyboard routed back through RmlUi picking → wl_seat; (4) window w/ popup+subsurface composited (decides per-subsurface-elements vs per-window RTT); (5) wallpaper as an element; (6) perf ~4 windows@1080p + idle≈no-work (our dirty-gating) + video cost; (7) present via existing FBO→scene_buffer bridge. Full spec + decision row: `notes/rml-compositing.md`, plan.md §2. |
+| 13 | **RML compositing** — RMLUi becomes the content compositor (toplevels + layer-shell incl. wallpaper + chrome = RML elements backed by LIVE, SHARED GL textures; layout/animation/3D effects in RCSS). wlroots = foundation + cursor plane + (deferred) fullscreen scanout bypass. | **Phase 0 spike CLOSED — GO, real-seat CONFIRMED; Phase 1 design DONE (`notes/rml-compositing-phase1.md`); Phase 2 impl NEXT** | All 7 criteria `ALL PASS` headless on Haswell+crocus: (1) zero-copy live dmabuf texture (cached when unchanged); (2) RCSS perspective+rotateY on live pixels (readback); (3) screen→surface-local inversion through the transform = 0.000000px; (4) surface tree composited → **per-subsurface elements** (RTT hook for tree-spanning effects); (5) wallpaper via identical import path; (6) idle dirty-gate = 0 idle renders / 1-per-commit (frame-time @load = real-seat); (7) FBO→dmabuf→wlr_scene_buffer + EGL fence. Spike target `rml-compositing-spike` (`--verify`/`--run`). Report + runbook: `reports/rml-compositing-spike.md`. |
 
 ## Deferred decisions (decide when reached — see notes/plan.md §7)
 
