@@ -1,4 +1,8 @@
-<img src="readme-assets/unbox_logo.png" alt="unbox logo" width="240">
+<p align="center">
+  <img src="readme-assets/unbox_logo.png" alt="unbox logo" width="240">
+</p>
+
+---
 
 An experimental Wayland desktop environment for the Panasonic CF-AX3 Let's
 Note (touchscreen convertible, i5-4300U Haswell, 3.7 GiB RAM, Artix Linux +
