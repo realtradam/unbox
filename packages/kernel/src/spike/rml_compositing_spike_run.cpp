@@ -299,6 +299,16 @@ struct Runner {
     long bucket_frames0 = 0;    // demo_frames at the bucket open (for frames=N)
     bool bucket_has = false;    // a sample has landed in this bucket yet
 
+    // --- click-accuracy debug overlay (toggle 'D') ---------------------------
+    // Off by default. When on, route_point places a per-surface crosshair marker
+    // at the mapped hit point (rendered through the surface's own transform, so it
+    // overlays the wlr cursor iff the mapping is correct) and writes a numeric
+    // readout (screen -> projected element-local -> surface-local) to #dbg + log.
+    bool debug_overlay = false;
+    Rml::Element* dbg_el = nullptr; // the #dbg numeric readout box
+    double last_cursor_x = 0.0;     // last screen cursor pos, to re-place on toggle
+    double last_cursor_y = 0.0;
+
     spike::GlBridge gl;
     spike::PresentTarget present;
     Rml::Context* ctx = nullptr;
@@ -426,12 +436,26 @@ body { margin: 0px; padding: 0px; perspective: 1100px; background: #05070d; }
        font-family: "Noto Sans"; }
 #hud p { display: block; margin: 8px 0px 0px 0px; }
 #hud .big { font-size: 34px; color: #ffffff; }
+/* Click-accuracy debug overlay (toggle with 'D'). #dbg is the numeric readout;
+   each surface gets a .xhair marker child drawn THROUGH its own transform at the
+   computed hit point — if the mapping is correct it sits exactly under the wlr
+   cursor, so any gap is the live click error, visible directly (no screenshots). */
+#dbg { display: none; position: absolute; left: 8px; top: 8px;
+       width: 760px; padding: 10px;
+       background: #000000d0; border: 2px #ff2e9a;
+       font-size: 16px; color: #ff66cc; font-family: "Noto Sans"; }
+#dbg p { display: block; margin: 0px 0px 4px 0px; }
+.xhair { display: block; position: absolute; width: 18px; height: 18px;
+         border: 2px #ff2e9aff; background: #ff2e9a44; }
+.xhair .dot { display: block; position: absolute; left: 7px; top: 7px;
+              width: 4px; height: 4px; background: #ffffffff; }
 </style>
 </head>
 <body>
 <div id="wall"></div>
 <div id="stage"></div>
 <div id="hud"><p>compositor FPS</p><p class="big">--</p></div>
+<div id="dbg"><p>click-debug: press D to toggle</p></div>
 </body>
 </rml>)RML";
 
@@ -769,22 +793,105 @@ struct Routed {
     double sx = 0, sy = 0; // surface-local pixels
 };
 
+// Click-accuracy debug overlay: find-or-create the per-surface crosshair marker
+// as a child of the surface element `win`, so RmlUi draws it THROUGH win's own
+// transform — i.e. at the on-screen forward-projection of the mapped point.
+auto find_or_make_xhair(Runner& r, LiveSurface& s, Rml::Element* win) -> Rml::Element* {
+    const Rml::String xid = s.element_id + "_xhair";
+    Rml::Element* x = r.doc->GetElementById(xid);
+    if (x == nullptr) {
+        Rml::ElementPtr xp = r.doc->CreateElement("div");
+        xp->SetId(xid);
+        xp->SetClass("xhair", true);
+        Rml::ElementPtr dot = r.doc->CreateElement("div");
+        dot->SetClass("dot", true);
+        xp->AppendChild(std::move(dot));
+        x = win->AppendChild(std::move(xp));
+    }
+    return x;
+}
+
+// Place the crosshair at the mapped local point (win-local space) and update the
+// #dbg readout. The marker rides win's transform, so if route_point's inverse is
+// consistent with RmlUi's forward render it lands exactly under the wlr cursor;
+// any visible gap is the live click error. Also logged so numbers reach the file.
+void update_debug_marker(Runner& r, LiveSurface& s, Rml::Element* win, const Rml::Vector2f& doc_pt,
+                         double sx, double sy, double screen_x, double screen_y) {
+    if (win == nullptr) {
+        return;
+    }
+    Rml::Element* x = find_or_make_xhair(r, s, win);
+    const Rml::Vector2f pad = win->GetAbsoluteOffset(Rml::BoxArea::Padding);
+    x->SetProperty("left", std::to_string(doc_pt.x - pad.x - 9.0) + "px");
+    x->SetProperty("top", std::to_string(doc_pt.y - pad.y - 9.0) + "px");
+    x->SetProperty("display", "block");
+    if (r.dbg_el != nullptr) {
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+                      "<p>DEBUG (D toggles) — marker should sit UNDER the cursor</p>"
+                      "<p>surface '%s'  tex %dx%d</p>"
+                      "<p>screen (%.1f, %.1f) -&gt; elem-local (%.1f, %.1f)</p>"
+                      "<p>surface-local (%.1f, %.1f)</p>",
+                      s.element_id.c_str(), s.live.width, s.live.height, screen_x, screen_y, doc_pt.x,
+                      doc_pt.y, sx, sy);
+        r.dbg_el->SetInnerRML(buf);
+        r.dbg_el->SetProperty("display", "block");
+    }
+    r.dirty = true;
+}
+
+// Hide every surface's crosshair + the readout (debug toggled off, or a miss).
+void hide_debug_markers(Runner& r) {
+    for (LiveSurface& s : r.surfaces) {
+        if (Rml::Element* x = r.doc->GetElementById(s.element_id + "_xhair")) {
+            x->SetProperty("display", "none");
+        }
+    }
+    if (r.dbg_el != nullptr) {
+        r.dbg_el->SetProperty("display", "none");
+    }
+    r.dirty = true;
+}
+
 auto route_point(Runner& r, double screen_x, double screen_y) -> Routed {
+    r.last_cursor_x = screen_x;
+    r.last_cursor_y = screen_y;
     r.ctx->ProcessMouseMove(static_cast<int>(screen_x), static_cast<int>(screen_y), 0);
     Rml::Element* hover = r.ctx->GetHoverElement();
     LiveSurface* s = surface_for_element(r, hover);
     if (s == nullptr) {
+        if (r.debug_overlay && r.dbg_el != nullptr) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "<p>DEBUG (D toggles)</p><p>no surface under (%.1f, %.1f)</p>", screen_x,
+                          screen_y);
+            r.dbg_el->SetInnerRML(buf);
+            r.dbg_el->SetProperty("display", "block");
+        }
         return {};
     }
-    // The <img> child carries the texture box; map the screen point into its
-    // content box (RmlUi gives us the transform-resolved absolute offset) and
-    // scale to the live texture's natural pixels = surface-local coords.
-    Rml::Element* img = r.doc->GetElementById(s->element_id);
-    if (img != nullptr && img->GetFirstChild() != nullptr) {
-        img = img->GetFirstChild();
-    }
+    // The surface element `win` carries the per-corner transform; its <img> child
+    // carries the texture box. Map the screen point into the img content box.
+    Rml::Element* win = r.doc->GetElementById(s->element_id);
+    Rml::Element* img = (win != nullptr && win->GetFirstChild() != nullptr) ? win->GetFirstChild()
+                                                                            : win;
     if (img == nullptr) {
         return {};
+    }
+    // THE FIX: project the screen point onto the element's OWN (possibly
+    // 3D-transformed) plane FIRST, using the element's accumulated transform.
+    // Element::Project() ray-casts the window point through the inverse transform
+    // onto the element's z=0 plane and returns it in the element's UNTRANSFORMED
+    // document space — the same space as GetAbsoluteOffset below. For an
+    // untransformed element it is a no-op (returns the point unchanged), so the
+    // plain --run path is unaffected. Previously we fed the RAW screen point into
+    // the box math while `off` was in untransformed layout space: the two spaces
+    // coincide only for an axis-aligned window, so on a tilted --demo corner the
+    // click landed in the wrong place. Project() is the live-path analogue of the
+    // pure-core unproject_to_local that criterion 3 verifies.
+    Rml::Vector2f p(static_cast<float>(screen_x), static_cast<float>(screen_y));
+    if (!img->Project(p)) {
+        return {}; // edge-on view: ray parallel to the element plane, no valid hit
     }
     const Rml::Vector2f off = img->GetAbsoluteOffset(Rml::BoxArea::Content);
     const float bw = img->GetClientWidth();
@@ -792,12 +899,15 @@ auto route_point(Runner& r, double screen_x, double screen_y) -> Routed {
     if (bw <= 0 || bh <= 0) {
         return {};
     }
-    const double fx = (screen_x - off.x) / bw; // 0..1 across the element box
-    const double fy = (screen_y - off.y) / bh;
+    const double fx = (p.x - off.x) / bw; // 0..1 across the element box (post-projection)
+    const double fy = (p.y - off.y) / bh;
     Routed out;
     out.s = s;
     out.sx = std::clamp(fx, 0.0, 1.0) * s->live.width;
     out.sy = std::clamp(fy, 0.0, 1.0) * s->live.height;
+    if (r.debug_overlay) {
+        update_debug_marker(r, *s, win, p, out.sx, out.sy, screen_x, screen_y);
+    }
     return out;
 }
 
@@ -1224,6 +1334,27 @@ auto handle_escape_keys(Runner& r, Keyboard& kb, wlr_keyboard_key_event* ev) -> 
             // fall through: do not consume.
         }
 
+        // `D` (no ctrl/alt, --demo only) -> toggle the click-accuracy debug
+        // overlay (per-surface crosshair marker + #dbg readout). Consumed so it
+        // does NOT type a 'd' into the focused client.
+        if (r.demo && !ctrl_alt && (sym == XKB_KEY_d || sym == XKB_KEY_D)) {
+            if (pressed) {
+                r.debug_overlay = !r.debug_overlay;
+                if (r.debug_overlay) {
+                    // Place the marker immediately at the current cursor position.
+                    (void)route_point(r, r.last_cursor_x, r.last_cursor_y);
+                    slog("DEBUG overlay ON — crosshair should sit UNDER the cursor; #dbg shows "
+                         "screen -> elem-local -> surface-local. Any gap = the click error.");
+                } else {
+                    hide_debug_markers(r);
+                    slog("DEBUG overlay OFF");
+                }
+                r.dirty = true;
+                wlr_output_schedule_frame(r.output);
+            }
+            return true; // consume press AND release; never forward
+        }
+
         // Esc OR Ctrl+Alt+Backspace -> terminate the session cleanly.
         if (sym == XKB_KEY_Escape || (ctrl_alt && sym == XKB_KEY_BackSpace) ||
             (ctrl_alt && sym == XKB_KEY_Terminate_Server)) {
@@ -1553,6 +1684,10 @@ void handle_new_output(Runner& r, wlr_output* out) {
             slog("--demo: FPS HUD centered at output centre (%dx%d square), hud_el=%p",
                  hud_w, hud_h, static_cast<void*>(r.hud_el));
         }
+        // Grab the click-accuracy debug readout box (hidden until 'D' toggles it).
+        r.dbg_el = r.doc->GetElementById("dbg");
+        slog("--demo: click-debug overlay ready (press D to toggle), dbg_el=%p",
+             static_cast<void*>(r.dbg_el));
         // Open the dedicated per-5s min/max FPS log (separate from the diagnostic
         // log). fps_log_open picks $UNBOX_SPIKE_FPS_LOG else $HOME/rml-spike-fps.log.
         r.fps_log = fps_log_open(r.fps_log_path);
