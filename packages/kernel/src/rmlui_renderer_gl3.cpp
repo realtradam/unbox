@@ -128,6 +128,13 @@ in vec2 fragTexCoord;
 in vec4 fragColor;
 out vec4 finalColor;
 
+// Dave Hoskins' hash (https://www.shadertoy.com/view/4djSRW): vec2 -> [0,1).
+float hash12(vec2 p) {
+	vec3 q = fract(vec3(p.xyx) * 0.1031);
+	q += dot(q, q.yzx + 33.33);
+	return fract((q.x + q.y) * q.z);
+}
+
 vec4 mix_stop_colors(float t) {
 	vec4 color = _stop_colors[0];
 
@@ -165,7 +172,14 @@ void main() {
 		t = t0 + mod(t - t0, t1 - t0);
 	}
 
-	finalColor = fragColor * mix_stop_colors(t);
+	vec4 color = fragColor * mix_stop_colors(t);
+	// TPDF (triangular-PDF) dither, ~1 LSB of 8-bit, applied before this color is
+	// written to the 8-bit surface buffer — breaks the quantization banding of a
+	// smooth gradient (e.g. the dock's alpha ramp). Mean-zero, so it does not
+	// shift the gradient; spatial pixel-position hash (no texture) and NON-temporal
+	// so a mostly-static panel does not shimmer frame to frame.
+	float dither = (hash12(gl_FragCoord.xy) - hash12(gl_FragCoord.xy + 37.0)) / 255.0;
+	finalColor = color + dither;
 }
 )";
 
