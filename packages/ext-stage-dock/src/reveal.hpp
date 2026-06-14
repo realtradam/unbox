@@ -63,7 +63,18 @@ public:
     // commit close. For the normal OPEN-from-hidden gesture, leave it 0.0. The
     // anchor x (origin_x_) is the down x; the fraction tracks inward travel from
     // there, biased by start_fraction.
-    auto begin(double x, double y, std::uint32_t t, double start_fraction = 0.0) -> bool {
+    //
+    // force_active SKIPS the edge-slop gate (the `x <= edge_slop` test) and makes
+    // the gesture active regardless of where it began. The OPEN gesture leaves it
+    // false: it must start within edge_slop of the screen edge to count as a
+    // reveal. The CLOSE gesture (e1, fed by UiSurface::bind_drag) sets it true:
+    // the finger lands ANYWHERE on the already-open dock (surface-local x is in
+    // [0, dock_width], not near the edge), so the edge gate would wrongly reject
+    // it. The travel math (fraction = start_fraction + (x - origin_x)/width) is
+    // origin-relative, so a forced-active close still tracks the finger correctly
+    // from whatever x it began at. Velocity / fling are unaffected.
+    auto begin(double x, double y, std::uint32_t t, double start_fraction = 0.0,
+               bool force_active = false) -> bool {
         (void)y;
         origin_x_ = x;
         start_fraction_ = clamp_fraction(start_fraction);
@@ -71,7 +82,7 @@ public:
         last_x_ = x;
         last_t_ = t;
         velocity_ = 0.0;
-        active_ = x <= static_cast<double>(config_.edge_slop);
+        active_ = force_active || x <= static_cast<double>(config_.edge_slop);
         return active_;
     }
 

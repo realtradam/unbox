@@ -2,11 +2,13 @@
 <head>
 <link type="text/rcss" href="dock.rcss"/>
 </head>
-<body data-model="ui" class="dock" data-class-open="open" data-event-transitionend="dock_settled()">
+<body data-model="ui" class="dock" data-event-dragstart="dock_drag" data-event-drag="dock_drag" data-event-dragend="dock_drag">
+<div class="panel" data-class-dragging="dragging" data-style-transform="'translateX(' + slide + 'px)'" data-event-transitionend="dock_settled()">
 <div class="rail">
 <div data-for="row : slots" class="slot" data-event-click="restore(it_index)">
 <div class="thumb" data-style-decorator="'image( ' + row.preview + ' cover center center )'"/>
 <span class="title">{{ row.title }}</span>
+</div>
 </div>
 </div>
 </body>

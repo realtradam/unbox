@@ -2,14 +2,18 @@
 #include <doctest/doctest.h>
 
 #include "dock_layout.hpp"
+#include "gesture.hpp"
 #include "reveal.hpp"
 
 // Pure-core tests — the heart of this b4 step. No kernel, no wlroots, no RMLUi.
-// Two cores: the reveal recognizer (reversible edge swipe -> fraction + commit)
-// and the dock layout geometry (reveal fraction + slot count -> rects).
+// Three cores: the reveal recognizer (reversible edge swipe -> fraction +
+// commit), the dock layout geometry (reveal fraction -> rects), and the e1
+// gesture Controller (touch/drag STREAM -> slide_px/dragging/open + the Outcome
+// the glue applies). The Controller needs nothing running.
 
 namespace rv = unbox::ext_stage_dock::reveal;
 namespace lay = unbox::ext_stage_dock::layout;
+namespace gst = unbox::ext_stage_dock::gesture;
 
 using rv::RevealCommit;
 using rv::RevealConfig;
@@ -181,4 +185,207 @@ TEST_CASE("dock_box: revealed rail is dock_width x full output height, count-ind
         CHECK(rail.w == 288);
         CHECK(rail.h == oh); // FULL output height, independent of any card count
     }
+}
+
+// ============================================================================
+// gesture Controller (e1) — the touch/drag STREAM -> state transition
+// ============================================================================
+
+using gst::Controller;
+
+// Matches the recognizer test config: 100px dock so fractions are exact, 0.5
+// threshold, 1.0 px/ms fling, 24px edge slop. metrics: 100px dock_width so
+// dock_box(f).x = -100*(1-f) (closed = -100, open = 0).
+static auto ctrl() -> Controller {
+    return Controller(
+        RevealConfig{.dock_width = 100, .open_threshold = 0.5, .fling_velocity = 1.0,
+                     .edge_slop = 24},
+        lay::DockMetrics{.output_w = 1920, .output_h = 1080, .dock_width = 100});
+}
+
+TEST_CASE("Controller: full OPEN stream past 50% ends open, flush, visible") {
+    Controller c = ctrl();
+    CHECK(c.open() == false);
+    CHECK(c.dragging() == false);
+
+    // touch_down at the very edge: begins the OPEN reveal.
+    auto down = c.touch_down(/*id=*/1, /*lx=*/0.0, /*ly=*/200.0, /*t=*/0);
+    CHECK(down.make_visible);
+    CHECK(down.dirty_slide);
+    CHECK(down.dirty_dragging);
+    CHECK(c.dragging());
+    CHECK(c.gesturing());
+    CHECK(c.slide_px() == doctest::Approx(-100.0)); // f=0 fully hidden
+
+    // motion inward to 60px -> fraction 0.6 -> slide -40.
+    auto m1 = c.touch_motion(1, 60.0, 200.0, 1000);
+    CHECK(m1.dirty_slide);
+    CHECK_FALSE(m1.dirty_dragging);
+    CHECK(c.slide_px() == doctest::Approx(-40.0));
+
+    // release at 0.6 (>= 0.5, slow) -> OPEN, slide 0, surface visible.
+    auto up = c.touch_up(1, 1000);
+    CHECK(up.make_visible);
+    CHECK(up.dirty_slide);
+    CHECK(up.dirty_dragging);
+    CHECK(c.open());
+    CHECK_FALSE(c.dragging());
+    CHECK_FALSE(c.gesturing());
+    CHECK(c.slide_px() == doctest::Approx(0.0));
+}
+
+TEST_CASE("Controller: slide_px advances monotonically with inward motion") {
+    Controller c = ctrl();
+    REQUIRE(c.touch_down(1, 0.0, 0.0, 0).make_visible);
+    double prev = c.slide_px();
+    for (double x : {10.0, 30.0, 55.0, 80.0, 100.0}) {
+        c.touch_motion(1, x, 0.0, static_cast<std::uint32_t>(x) + 100);
+        CHECK(c.slide_px() >= prev);
+        prev = c.slide_px();
+    }
+    CHECK(c.slide_px() == doctest::Approx(0.0)); // f=1 flush
+}
+
+TEST_CASE("Controller: OPEN release below 50% ends closed") {
+    Controller c = ctrl();
+    REQUIRE(c.touch_down(1, 0.0, 0.0, 0).make_visible);
+    c.touch_motion(1, 40.0, 0.0, 1000); // fraction 0.4, slow
+    auto up = c.touch_up(1, 1000);
+    CHECK(up.dirty_slide);
+    CHECK(up.dirty_dragging);
+    CHECK_FALSE(up.make_visible); // close: no make_visible (dock_settled hides)
+    CHECK_FALSE(c.open());
+    CHECK_FALSE(c.dragging());
+    CHECK(c.slide_px() == doctest::Approx(-100.0)); // closed offset
+}
+
+TEST_CASE("Controller: fast inward fling below 50% still opens") {
+    Controller c = ctrl();
+    REQUIRE(c.touch_down(1, 0.0, 0.0, 0).make_visible);
+    c.touch_motion(1, 30.0, 0.0, 10); // 0.3 fraction but 3 px/ms >= fling
+    auto up = c.touch_up(1, 10);
+    CHECK(up.make_visible);
+    CHECK(c.open());
+    CHECK(c.slide_px() == doctest::Approx(0.0));
+}
+
+TEST_CASE("Controller: edge-slop rejection — a press past the slop is ignored") {
+    Controller c = ctrl();
+    auto down = c.touch_down(1, /*lx=*/25.0, 0.0, 0); // just past 24px slop
+    CHECK_FALSE(down.make_visible);
+    CHECK_FALSE(down.dirty_slide);
+    CHECK_FALSE(down.dirty_dragging);
+    CHECK_FALSE(c.gesturing());
+    CHECK_FALSE(c.dragging());
+    // Subsequent motion/up for that id are no-ops (no active gesture).
+    auto m = c.touch_motion(1, 80.0, 0.0, 100);
+    CHECK_FALSE(m.dirty_slide);
+    auto up = c.touch_up(1, 100);
+    CHECK_FALSE(up.dirty_slide);
+    CHECK_FALSE(c.open());
+}
+
+TEST_CASE("Controller: a touch_down while already open is ignored") {
+    Controller c = ctrl();
+    c.open_now();
+    REQUIRE(c.open());
+    auto down = c.touch_down(1, 0.0, 0.0, 0); // edge press, but dock is open
+    CHECK_FALSE(down.make_visible);
+    CHECK_FALSE(down.dirty_slide);
+    CHECK_FALSE(c.gesturing());
+    CHECK(c.open()); // unchanged
+}
+
+TEST_CASE("Controller: motion/up for a non-active touch id are ignored") {
+    Controller c = ctrl();
+    REQUIRE(c.touch_down(1, 0.0, 0.0, 0).make_visible);
+    auto m = c.touch_motion(/*other id=*/2, 80.0, 0.0, 100);
+    CHECK_FALSE(m.dirty_slide);
+    CHECK(c.slide_px() == doctest::Approx(-100.0)); // unchanged by the foreign id
+    auto up = c.touch_up(2, 100);
+    CHECK_FALSE(up.dirty_slide);
+    CHECK(c.gesturing()); // id 1 still active
+}
+
+TEST_CASE("Controller: touch_cancel reverts the active OPEN gesture to closed") {
+    Controller c = ctrl();
+    REQUIRE(c.touch_down(1, 0.0, 0.0, 0).make_visible);
+    c.touch_motion(1, 90.0, 0.0, 1000); // dragged well open (0.9)
+    auto cancel = c.touch_cancel(1);
+    CHECK(cancel.dirty_dragging);
+    CHECK(cancel.dirty_slide);
+    CHECK_FALSE(cancel.make_visible);
+    CHECK_FALSE(c.open());
+    CHECK_FALSE(c.dragging());
+    CHECK_FALSE(c.gesturing());
+    CHECK(c.slide_px() == doctest::Approx(-100.0));
+}
+
+TEST_CASE("Controller: CLOSE drag toward the edge below 50% closes") {
+    Controller c = ctrl();
+    c.open_now();
+    REQUIRE(c.open());
+    CHECK(c.slide_px() == doctest::Approx(0.0));
+
+    // drag_start force-active at fraction 1.0 (finger lands anywhere on the open
+    // dock). dragging on, no slide change yet.
+    auto start = c.drag_start(/*x=*/50.0, /*y=*/200.0, /*t=*/0);
+    CHECK(start.dirty_dragging);
+    CHECK(c.dragging());
+
+    // drag_move back toward the edge: from x=50 to x=-20 is -70px travel ->
+    // 1.0 + (-70/100) = 0.3 fraction -> slide -70.
+    auto move = c.drag_move(-20.0, 200.0, 1000);
+    CHECK(move.dirty_slide);
+    CHECK(c.slide_px() == doctest::Approx(-70.0));
+
+    // drag_end at 0.3 (< 0.5, slow) -> CLOSE.
+    auto end = c.drag_end(1000);
+    CHECK(end.dirty_dragging);
+    CHECK(end.dirty_slide);
+    CHECK_FALSE(end.make_visible);
+    CHECK_FALSE(c.open());
+    CHECK_FALSE(c.dragging());
+    CHECK(c.slide_px() == doctest::Approx(-100.0));
+}
+
+TEST_CASE("Controller: a CLOSE drag that barely travels stays open") {
+    Controller c = ctrl();
+    c.open_now();
+    c.drag_start(50.0, 0.0, 0);
+    c.drag_move(30.0, 0.0, 1000); // -20px -> 0.8, still past threshold, slow
+    auto end = c.drag_end(1000);
+    CHECK(c.open());
+    CHECK_FALSE(c.dragging());
+    CHECK(c.slide_px() == doctest::Approx(0.0)); // snapped back to open
+    CHECK(end.dirty_slide);
+}
+
+TEST_CASE("Controller: open_now / close_now set the target + Outcome flags") {
+    Controller c = ctrl();
+    auto o = c.open_now();
+    CHECK(o.make_visible);
+    CHECK(o.dirty_slide);
+    CHECK(o.dirty_dragging);
+    CHECK(c.open());
+    CHECK_FALSE(c.dragging());
+    CHECK(c.slide_px() == doctest::Approx(0.0));
+
+    auto cl = c.close_now();
+    CHECK_FALSE(cl.make_visible);
+    CHECK(cl.dirty_slide);
+    CHECK(cl.dirty_dragging);
+    CHECK_FALSE(c.open());
+    CHECK(c.slide_px() == doctest::Approx(-100.0));
+}
+
+TEST_CASE("Controller: set_metrics re-scales the slide offset for a new output") {
+    Controller c = ctrl();
+    c.set_metrics(lay::DockMetrics{.output_w = 1920, .output_h = 1080, .dock_width = 100});
+    c.close_now();
+    CHECK(c.slide_px() == doctest::Approx(-100.0));
+    // dock_box only uses dock_width for .x, so changing only output_h keeps it.
+    c.set_metrics(lay::DockMetrics{.output_w = 2560, .output_h = 1440, .dock_width = 100});
+    c.close_now();
+    CHECK(c.slide_px() == doctest::Approx(-100.0));
 }

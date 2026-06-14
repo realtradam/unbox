@@ -1,12 +1,23 @@
+/* body.dock is the STATIONARY full-surface DRAG HANDLE — it carries `drag: drag`
+   (so RmlUi emits dragstart/drag/dragend that our bind_drag reads) but it is
+   NEVER transformed. This is load-bearing: RmlUi projects a drag event's
+   mouse_x/mouse_y into the DRAGGED element's transformed coordinate frame, so if
+   the dragged element itself were translated by `slide` (as it was), the reported
+   drag x would feed back into `slide` and ping-pong between the finger position
+   and ~dock_width every frame (the flicker). Keeping the drag handle at identity
+   transform makes the reported coordinate the raw finger position. The MOVING
+   visual is div.panel below — a child that is NOT the drag element, so its
+   transform never enters the drag projection. body itself paints nothing (the
+   gradient lives on the panel); it is just the input-capture + drag-origin layer. */
 body.dock {
-    /* FULL-HEIGHT LEFT RAIL. The surface is the full output height (sized in
-       C++); height:100% fills it. #00000080 is the visible translucent panel
-       (the whole rail). It is a flex COLUMN scroll container: the cards stack
-       vertically, the .rail wrapper centers via margin:auto when they fit, and
-       overflow-y scrolls when they exceed the height. align-items:flex-start
-       pins the cards to the LEFT (the 224dp cards stay ~8dp from the screen edge
-       over the dark end of the gradient; the rail is wider (kDockWidth 288) so
-       the gradient fades to transparent over the empty space to their right). */
+    width: 100%;
+    height: 100%;
+    drag: drag;
+}
+/* div.panel is the VALUE-DRIVEN moving visual: data-style-transform binds
+   translateX(slide px) (closed = -dock_width, open = 0). The gradient, padding,
+   flex layout and scroll live here, not on body. */
+div.panel {
     width: 100%;
     height: 100%;
     decorator: horizontal-gradient( #000000ff #00000000 );
@@ -17,19 +28,21 @@ body.dock {
     align-items: center;
     overflow-x: hidden;
     overflow-y: auto;
-    transform: translateX(-100%);
-    transition: transform 0.36s cubic-in-out;
 }
-body.dock.open {
-    transform: translateX(0px);
+/* Ease only when NOT dragging: during a finger-follow drag (body.dock has the
+   gesture, div.panel gets data-class-dragging) there is no transition so each
+   `slide` update lands instantly under the finger; on release the Controller
+   clears dragging_, this rule re-applies, and the slide-to-target eases 0.36s. */
+div.panel:not(.dragging) {
+    transition: transform 0.36s cubic-in-out;
 }
 /* Hide both scrollbars (the rail scrolls, but no visible scrollbar). RmlUi
    instances scrollbarvertical/scrollbarhorizontal elements; width/height 0 hides
    them (verified pattern: vendored Samples effects_style.rcss / invader.rcss). */
-body.dock scrollbarvertical {
+div.panel scrollbarvertical {
     width: 0dp;
 }
-body.dock scrollbarhorizontal {
+div.panel scrollbarhorizontal {
     height: 0dp;
 }
 /* The slot WRAPPER. margin:auto on this single flex item vertically centers the

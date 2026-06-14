@@ -1,6 +1,7 @@
 #include <unbox/ext-stage-dock/ext_stage_dock.hpp>
 
 #include "dock_layout.hpp"
+#include "gesture.hpp"
 #include "probe.hpp"
 #include "reveal.hpp"
 
@@ -10,7 +11,9 @@
 #include <unbox/kernel/wlr.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -157,6 +160,34 @@ public:
                 return ev;
             });
 
+        // e1 OPEN path — the kernel touch bus. The dock is HIDDEN when a finger
+        // lands at the left edge, so the implicit-grab contract (host.hpp:242-244)
+        // routes the WHOLE down->motion->up/cancel stream to these subscriptions
+        // even after we make the dock visible mid-drag. Feed each event to the
+        // Controller and apply the side-effects it returns. The Controller gates
+        // on edge-slop / already-open itself (empty Outcome = ignored).
+        touch_down_ = host.subscribe(
+            host.on_touch_down(), [this](const kernel::TouchDownEvent& e) {
+                apply(controller_.touch_down(e.touch_id, e.lx, e.ly, e.time_msec));
+            });
+        touch_motion_ = host.subscribe(
+            host.on_touch_motion(), [this](const kernel::TouchMotionEvent& e) {
+                apply(controller_.touch_motion(e.touch_id, e.lx, e.ly, e.time_msec));
+            });
+        touch_up_ = host.subscribe(
+            host.on_touch_up(), [this](const kernel::TouchUpEvent& e) {
+                // A release that commits CLOSE eases out; arm closing_ so the
+                // dock_settled transitionend hides the surface (gated on
+                // !controller_.open()). An open release leaves closing_ untouched.
+                closing_ = true;
+                apply(controller_.touch_up(e.touch_id, e.time_msec));
+            });
+        touch_cancel_ = host.subscribe(
+            host.on_touch_cancel(), [this](const kernel::TouchCancelEvent& e) {
+                closing_ = true;
+                apply(controller_.touch_cancel(e.touch_id));
+            });
+
         // Create the dock surface up front, kept hidden until the first slot. It
         // lives on the overlay layer at the left edge; geometry from dock_layout
         // + the first output's size. The substrate is null on a no-GL backend
@@ -256,23 +287,47 @@ private:
         if (dock_surface_ == nullptr) {
             return;
         }
-        if (open_) {
-            // Close: slide out. Keep the surface compositing so the animation
-            // plays; on_dock_settled won't hide it (closing_ is false), so a
-            // subsequent toggle re-opens instantly without delay.
-            open_ = false;
-            closing_ = false;
-            dock_surface_->dirty("open");
+        if (controller_.open()) {
+            // Close: slide out. closing_ = true so the existing dock_settled path
+            // hides the surface once the slide-out transition finishes.
+            closing_ = true;
+            apply(controller_.close_now());
         } else {
             // Open: make the surface visible (may already be from slots), then
-            // slide in. If the dock was fully hidden (surface invisible), the
-            // set_visible(true) begins compositing; the dirty("open")
-            // transitions the body to translateX(0).
-            open_ = true;
+            // ease the body to translateX(0). open_now() sets make_visible.
             closing_ = false;
-            dock_surface_->set_visible(true);
-            dock_surface_->dirty("open");
+            apply(controller_.open_now());
         }
+    }
+
+    // ---- e1 glue: apply a controller Outcome to the surface ----------------
+    // The thin adapter the controller's contract calls for: make the surface
+    // visible, then dirty `dragging` BEFORE `slide` (so the restored RCSS
+    // transition eases the snap on release). No-op when the surface is null
+    // (no-GL backend); the controller state still advances for the model/probe.
+    void apply(const gesture::Outcome& o) {
+        if (dock_surface_ == nullptr) {
+            return;
+        }
+        if (o.make_visible) {
+            dock_surface_->set_visible(true);
+        }
+        if (o.dirty_dragging) {
+            dock_surface_->dirty("dragging");
+        }
+        if (o.dirty_slide) {
+            dock_surface_->dirty("slide");
+        }
+    }
+
+    // A monotonic millisecond clock for the CLOSE path: UiSurface::bind_drag
+    // carries no time_msec, but the recognizer needs a time base for its fling
+    // velocity. steady_clock keeps it consistent in shape with the bus path
+    // (which supplies time_msec) — only relative deltas matter to the recognizer.
+    [[nodiscard]] static auto now_ms() -> std::uint32_t {
+        const auto t = std::chrono::steady_clock::now().time_since_epoch();
+        return static_cast<std::uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(t).count());
     }
 
     // ---- helpers ------------------------------------------------------------
@@ -298,17 +353,16 @@ private:
         return false;
     }
 
-    // Re-render the dock list and ANIMATE the dock reveal (d1). The dock is
-    // revealed iff there is at least one slot. Where c2 toggled set_visible()
-    // instantly, d1 slides the body via the `open` class (data-class-open ->
-    // transition on transform):
-    //   empty -> non-empty: make the surface visible FIRST (a hidden surface is
-    //     not composited, so it can't animate), then flip open_=true and dirty
-    //     it -> the transition slides the body in from the left edge.
-    //   non-empty -> empty: keep the surface visible, flip open_=false and dirty
-    //     -> the body slides back out; we DEFER set_visible(false) until the
-    //     slide-out finishes (on_dock_settled, fired by RmlUi's transitionend
-    //     through the existing event binding) so the close animation is seen.
+    // Re-render the dock list and ANIMATE the dock reveal. The dock is revealed
+    // iff there is at least one slot. The slide is value-driven (e1): both the
+    // gesture and these non-gesture call sites flow through the one Controller,
+    // which sets slide_px_ (the body's translateX) and clears dragging_ so the
+    // RCSS transition eases the move:
+    //   empty -> non-empty: open_now() (make the surface visible FIRST — a hidden
+    //     surface is not composited, so it can't animate — then ease the body in).
+    //   non-empty -> empty: close_now() eases the body back out; we DEFER
+    //     set_visible(false) until the slide-out finishes (on_dock_settled, fired
+    //     by RmlUi's transitionend through the existing event binding).
     // The surface is a fixed full-height rail; its size never changes with the
     // card count (the RCSS scrolls/centers the cards within it). Only visibility
     // toggles: shown when there is >= 1 slot, hidden (after the slide-out) when
@@ -323,19 +377,17 @@ private:
         dock_surface_->dirty("slots");
 
         const bool want_open = !slots_.empty();
-        if (want_open == open_) {
+        if (want_open == controller_.open()) {
             return; // reveal state unchanged (e.g. minimize a 2nd window)
         }
-        open_ = want_open;
-        if (open_) {
-            // Reveal: composite before animating, then slide in.
+        if (want_open) {
+            // Reveal: composite before animating, then ease the body in.
             closing_ = false;
-            dock_surface_->set_visible(true);
-            dock_surface_->dirty("open");
+            apply(controller_.open_now());
         } else {
-            // Conceal: slide out now, hide once the slide-out transition ends.
+            // Conceal: ease the body out now, hide once the slide-out ends.
             closing_ = true;
-            dock_surface_->dirty("open");
+            apply(controller_.close_now());
         }
     }
 
@@ -349,7 +401,7 @@ private:
     // a stale end-event (e.g. a reveal that raced a conceal) cannot hide an
     // again-open dock: we re-check open_.
     void on_dock_settled() {
-        if (dock_surface_ != nullptr && closing_ && !open_) {
+        if (dock_surface_ != nullptr && closing_ && !controller_.open()) {
             // Slide-out finished and the dock is empty: hide the full-height rail
             // so it stops compositing AND stops capturing input over the left
             // strip. The surface keeps its full height (no resize) for the next
@@ -419,14 +471,52 @@ private:
         dock_surface_->bind_list_event(
             "slots", "restore", [this](std::size_t i) { do_restore(i); });
 
-        // d1 reveal-animation bindings (registered before the first frame, same
-        // rule as the list bindings; capture only `this`, whose members outlive
-        // the surface). `open` drives data-class-open on body.dock -> the slide
-        // transition; `dock_settled` is body.dock's transitionend -> hide after
-        // the slide-out. Initial open_ is false (the dock starts hidden, body
-        // un-`open` = translated off-screen), matching spec.visible=false.
-        dock_surface_->bind_bool("open", [this]() -> bool { return open_; });
+        // e1 reveal bindings (registered before the first frame, same rule as the
+        // list bindings; capture only `this`, whose members outlive the surface).
+        // `slide` drives the body's data-style-transform translateX(px) — the
+        // value-driven reveal both the gesture AND the keyboard/minimize/restore
+        // paths feed through the one Controller. `dragging` drives
+        // data-class-dragging -> RCSS turns the transition OFF so a live drag
+        // follows the finger 1:1. `dock_settled` is body.dock's transitionend ->
+        // hide after the slide-out. `dock_drag` is the CLOSE path (see below).
+        dock_surface_->bind_double("slide", [this]() -> double { return controller_.slide_px(); });
+        dock_surface_->bind_bool("dragging", [this]() -> bool { return controller_.dragging(); });
         dock_surface_->bind_event("dock_settled", [this]() { on_dock_settled(); });
+
+        // e1 CLOSE path — UiSurface::bind_drag. The OPEN dock is a visible ui
+        // surface, so the substrate captures its touches into our RMLUi document
+        // (NOT the kernel bus); the body opts into dragging via RCSS `drag: drag;`
+        // and authors data-event-dragstart/drag/dragend all naming "dock_drag".
+        // x/y are surface-LOCAL document px — fed straight to the recognizer (no
+        // layout-origin subtract). bind_drag carries no time, so we stamp a
+        // monotonic ms clock. A tap still fires data-event-click -> restore(), so
+        // tap-to-restore coexists.
+        dock_surface_->bind_drag(
+            "dock_drag", [this](kernel::UiSurface::DragPhase p, double x, double y) {
+                switch (p) {
+                case kernel::UiSurface::DragPhase::start:
+                    closing_ = false; // not committed yet; armed by drag_end
+                    apply(controller_.drag_start(x, y, now_ms()));
+                    break;
+                case kernel::UiSurface::DragPhase::move:
+                    apply(controller_.drag_move(x, y, now_ms()));
+                    break;
+                case kernel::UiSurface::DragPhase::end:
+                    // Like a touch_up: a CLOSE commit eases out, so arm closing_
+                    // for the dock_settled hide (gated on !controller_.open()).
+                    closing_ = true;
+                    apply(controller_.drag_end(now_ms()));
+                    break;
+                }
+            });
+
+        // Seed the output geometry into the Controller and set the CLOSED target
+        // so the very first render shows the dock off-screen (translateX(
+        // -dock_width)) — matching spec.visible=false. close_now() leaves open_
+        // false and slide_px_ at the f=0 offset; the dirties are harmless before
+        // the first frame (the getters are simply read once geometry is known).
+        controller_.set_metrics(m);
+        apply(controller_.close_now());
     }
 
     // Dock metrics from the first output's size (queried via output_layout). On
@@ -477,13 +567,23 @@ private:
     // ends. Each Slot owns a Preview (frees its texture on erase/destruction).
     std::vector<Slot> slots_;
 
-    // d1 reveal-animation state, read by the `open` bool getter + the
-    // transitionend handler. Declared BEFORE dock_surface_ (like slots_) so they
-    // stay alive while the surface — whose binding reads open_ — tears down.
-    // open_: is the dock currently revealed (body has the `open` class)? Starts
-    // false (hidden + slid off-screen, matching spec.visible=false). closing_:
-    // are we mid slide-OUT, waiting on transitionend to set_visible(false)?
-    bool open_ = false;
+    // e1 gesture state. The Controller (src/gesture.hpp) is the pure decision
+    // core: it owns slide_px_/dragging_/open_ and the event->state transition for
+    // BOTH input sources (the kernel touch bus = OPEN, UiSurface::bind_drag =
+    // CLOSE). The glue is a thin adapter that feeds it events and applies the
+    // returned Outcome to the surface. Declared BEFORE dock_surface_ (like slots_)
+    // so it stays alive while the surface — whose `slide`/`dragging` getters read
+    // it — tears down. Constructed with the real dock width (kDockWidth) and
+    // default recognizer tunables (edge_slop / threshold / fling); set_metrics()
+    // seeds the output geometry once an output exists.
+    gesture::Controller controller_{
+        reveal::RevealConfig{.dock_width = kDockWidth},
+        layout::DockMetrics{.dock_width = kDockWidth}};
+
+    // closing_: are we mid slide-OUT, waiting on transitionend to set_visible
+    // (false)? Distinct from controller_.open() (the target state) because the
+    // hide must wait for the transition to finish. Set when a close starts, read
+    // (with !controller_.open()) by on_dock_settled.
     bool closing_ = false;
 
     // The dock ui surface. Destroyed before slots_ (declared after it) so any
@@ -497,6 +597,12 @@ private:
     kernel::Subscription focused_sub_;
     kernel::Subscription unmapped_;
     kernel::Subscription key_filter_;
+    // e1 OPEN path: the kernel touch bus. Held as members so they unsubscribe on
+    // teardown before the controller they feed is gone.
+    kernel::Subscription touch_down_;
+    kernel::Subscription touch_motion_;
+    kernel::Subscription touch_up_;
+    kernel::Subscription touch_cancel_;
 };
 
 } // namespace
