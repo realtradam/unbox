@@ -82,10 +82,18 @@ kernel_dep = declare_dependency(
   dependencies: [wlroots_dep, wayland_server_dep],
 )
 
+# wayland-client (TEST-ONLY): the surface-element integration test spins an
+# in-process Wayland CLIENT thread that connects to the headless server, creates
+# a wl_surface + wl_shm buffer, and commits — the only in-process way to get a
+# REAL wlr_surface with an advancing commit seq to exercise the live import.
+# It is NOT a kernel-library dependency (the kernel is a compositor, never a
+# client); scoped to the test executable only.
+wayland_client_dep = dependency('wayland-client')
+
 kernel_test = executable(
   'kernel-tests',
   'tests/test_kernel.cpp',
-  dependencies: [kernel_dep, doctest_dep],
+  dependencies: [kernel_dep, doctest_dep, wayland_client_dep],
 )
 test('kernel', kernel_test, suite: 'kernel')
 

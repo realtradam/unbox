@@ -85,6 +85,19 @@ struct Server::Impl : detail::DisableSink {
     wlr_seat* seat = nullptr;
     std::string socket;
 
+    // ---- surface-element test seam (kernel suite only) ----
+    // The kernel-owned wlr_compositor + a new_surface listener that captures the
+    // most recently committed CLIENT wl_surface, so the suite can build a real
+    // SurfaceElement from a real client surface headlessly (the public path —
+    // Host::ui().create_surface_element — needs the wl_surface, which a test has
+    // no other way to reach in-process). Used ONLY by ui_* test probes; no
+    // production code path reads these.
+    wlr_compositor* compositor = nullptr;
+    Listener test_new_surface;
+    std::list<Listener> test_surface_commits; // per captured client surface
+    wlr_surface* test_last_client_surface = nullptr; // last surface with a buffer
+    std::unique_ptr<SurfaceElement> test_surface_element; // built on demand by the probe
+
     // Ordered scene-tree z-bands (SceneLayer order). Created once over
     // scene->tree in stacking order so background < … < overlay. Extensions
     // attach nodes via Host::scene_layer(); the kernel owns them.
@@ -217,6 +230,7 @@ public:
 
     auto create_surface(const UiSurfaceSpec& spec) -> std::unique_ptr<UiSurface> override;
     auto create_preview(wlr_scene_tree* source) -> std::unique_ptr<Preview> override;
+    auto create_surface_element(wlr_surface* client) -> std::unique_ptr<SurfaceElement> override;
     auto available() const -> bool override;
     auto touch_mode() const -> bool override;
     void set_touch_mode_override(TouchModeOverride ov) override;

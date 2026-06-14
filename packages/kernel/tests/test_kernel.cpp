@@ -34,6 +34,21 @@
 #include <string>
 #include <vector>
 
+// TEST-ONLY: an in-process Wayland CLIENT for the surface-element integration
+// test (the only in-process way to get a real wlr_surface with an advancing
+// commit seq). wayland-client is a test-executable-only dep (the kernel is a
+// compositor, never a client) — see packages/kernel/meson.build.
+#include <wayland-client.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <thread>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 TEST_CASE("kernel compiles against and links wlroots + libwayland-server") {
     CHECK(unbox::kernel::link_probe());
     CHECK(unbox::kernel::wlroots_version().substr(0, 4) == "0.20");
@@ -2652,4 +2667,301 @@ TEST_CASE("spike(rml-compositing): an edge-on (90deg) transform collapses the el
     // Two points 192px apart in surface-local X land at the same screen X (the
     // element is edge-on): the map lost its X information.
     CHECK(std::abs(a.x - b.x) < 0.5);
+}
+
+// ============================================================================
+// RML compositing Wave 1: surface-element PURE CORES (ui_core.hpp). The URI
+// minting and the seq-gate decision predicate are pure (no wlroots/GL), so they
+// are doctest-ed here with nothing running — the strict-core half of the
+// asymmetric testing rule. The live import/frame-done glue is covered by the
+// headless integration test below.
+// ============================================================================
+
+TEST_CASE("surface-element: source_uri mints a stable unbox-surface:// URI") {
+    using unbox::kernel::surface_element_uri;
+    CHECK(surface_element_uri(1) == "unbox-surface://1");
+    CHECK(surface_element_uri(7) == "unbox-surface://7");
+    // Distinct ids => distinct URIs (each element samples its own texture).
+    CHECK(surface_element_uri(1) != surface_element_uri(2));
+    // The scheme matches the public-contract example and is the LIVE sibling of
+    // the preview scheme (NOT the same — a live element is not a frozen preview).
+    CHECK(surface_element_uri(42).rfind("unbox-surface://", 0) == 0);
+    CHECK(surface_element_uri(42).rfind("unbox-preview://", 0) != 0);
+}
+
+TEST_CASE("surface-element: the seq-gate is reuse-proof (the frozen-frame fix)") {
+    using unbox::kernel::surface_element_needs_reimport;
+
+    // First import: no seq yet AND no texture => MUST import, whatever the rest.
+    CHECK(surface_element_needs_reimport(/*have_seq=*/false, /*cur=*/0, /*new=*/1,
+                                         /*same_ptr=*/false, /*have_tex=*/false));
+    CHECK(surface_element_needs_reimport(false, 0, 1, true, false));
+
+    // Texture lost but seq known (defensive): re-import to rebuild it.
+    CHECK(surface_element_needs_reimport(/*have_seq=*/true, /*cur=*/5, /*new=*/5,
+                                         /*same_ptr=*/true, /*have_tex=*/false));
+
+    // The IDLE case: same seq, same buffer pointer, live texture => NO re-import
+    // (a static client costs zero work — the idle dirty-gate is preserved).
+    CHECK_FALSE(surface_element_needs_reimport(true, 5, 5, /*same_ptr=*/true, /*have_tex=*/true));
+
+    // A NEW commit (seq advances) of the SAME pooled buffer pointer with new
+    // contents => MUST re-import. This is THE frozen-frame fix: a buffer-pointer
+    // gate would wrongly skip it (foot recycles a small buffer pool), the seq
+    // gate does not.
+    CHECK(surface_element_needs_reimport(true, 5, /*new=*/6, /*same_ptr=*/true, /*have_tex=*/true));
+
+    // A new commit with a DIFFERENT buffer pointer => re-import (obviously).
+    CHECK(surface_element_needs_reimport(true, 5, 6, /*same_ptr=*/false, /*have_tex=*/true));
+
+    // Same seq but a different pointer (should not happen in practice, but the
+    // predicate is conservative): re-import rather than show a stale texture.
+    CHECK(surface_element_needs_reimport(true, 5, 5, /*same_ptr=*/false, /*have_tex=*/true));
+}
+
+// ============================================================================
+// RML compositing Wave 1: surface-element HEADLESS INTEGRATION TEST. Mirrors the
+// spike --verify criteria 1 (zero-copy live import + seq-gate) + 6 (frame-done
+// driven per composited frame), but against a REAL client surface: an
+// in-process Wayland client thread connects to the headless server, creates a
+// wl_surface + wl_shm buffers, and commits; the kernel captures that wl_surface
+// (test seam) and builds a real SurfaceElement; the suite asserts URI/size, that
+// a new commit (seq++) re-imports exactly once while re-adopting the same seq
+// re-imports zero, and that wl_surface frame-done is sent per composited frame.
+// We cannot see pixels headless — we assert the counters/URIs, exactly as the
+// spike's --verify does. (Lenient shell test, AGENTS.md: glue on the wlr
+// headless backend, not unit-coverage chasing.)
+// ============================================================================
+
+namespace {
+
+// A minimal in-process Wayland client on its own thread. It binds wl_compositor
+// + wl_shm, creates ONE wl_surface, and commits an shm buffer on demand. Two
+// pre-made buffers let the test exercise BOTH a new pointer AND (by re-using
+// buffer A) the pooled same-pointer re-commit. Driven by atomics the test sets;
+// the client flushes after every commit and the TEST pumps the server loop so
+// the commits land.
+struct TestWaylandClient {
+    std::thread thread;
+    std::atomic<bool> ready{false};   // connected + surface created + first commit done
+    std::atomic<bool> stop{false};
+    std::atomic<int> commit_cmd{0};   // bump to request another commit (cycles buffers)
+    std::atomic<int> commit_done{0};  // echoes commit_cmd once that commit was sent
+    std::string socket;
+
+    explicit TestWaylandClient(std::string sock) : socket(std::move(sock)) {}
+
+    void start() { thread = std::thread([this] { run(); }); }
+    void join() {
+        stop = true;
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    // -- registry globals --
+    wl_registry* registry = nullptr;
+    wl_compositor* compositor = nullptr;
+    wl_shm* shm = nullptr;
+
+    static void reg_global(void* data, wl_registry* reg, uint32_t name, const char* iface,
+                           uint32_t /*ver*/) {
+        auto* self = static_cast<TestWaylandClient*>(data);
+        if (std::strcmp(iface, "wl_compositor") == 0) {
+            self->compositor = static_cast<wl_compositor*>(
+                wl_registry_bind(reg, name, &wl_compositor_interface, 4));
+        } else if (std::strcmp(iface, "wl_shm") == 0) {
+            self->shm =
+                static_cast<wl_shm*>(wl_registry_bind(reg, name, &wl_shm_interface, 1));
+        }
+    }
+    static void reg_remove(void*, wl_registry*, uint32_t) {}
+
+    // Make a 64x64 ARGB8888 shm buffer of a solid color.
+    static auto make_buffer(wl_shm* shm, int w, int h, uint32_t argb) -> wl_buffer* {
+        const int stride = w * 4;
+        const int size = stride * h;
+        int fd = memfd_create("unbox-se-test", MFD_CLOEXEC);
+        if (fd < 0) {
+            return nullptr;
+        }
+        if (ftruncate(fd, size) < 0) {
+            close(fd);
+            return nullptr;
+        }
+        auto* px = static_cast<uint32_t*>(
+            mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+        if (px == MAP_FAILED) {
+            close(fd);
+            return nullptr;
+        }
+        for (int i = 0; i < w * h; ++i) {
+            px[i] = argb;
+        }
+        munmap(px, size);
+        wl_shm_pool* pool = wl_shm_create_pool(shm, fd, size);
+        wl_buffer* buf = wl_shm_pool_create_buffer(pool, 0, w, h, stride,
+                                                   WL_SHM_FORMAT_ARGB8888);
+        wl_shm_pool_destroy(pool);
+        close(fd);
+        return buf;
+    }
+
+    void run() {
+        wl_display* dpy = wl_display_connect(socket.c_str());
+        if (dpy == nullptr) {
+            return; // no server socket: the test will time out waiting on ready
+        }
+        registry = wl_display_get_registry(dpy);
+        static const wl_registry_listener reg_l = {reg_global, reg_remove};
+        wl_registry_add_listener(registry, &reg_l, this);
+        wl_display_roundtrip(dpy); // bind globals
+        if (compositor == nullptr || shm == nullptr) {
+            wl_display_disconnect(dpy);
+            return;
+        }
+        wl_surface* surface = wl_compositor_create_surface(compositor);
+        wl_buffer* buf_a = make_buffer(shm, 64, 64, 0xff2060c0);
+        wl_buffer* buf_b = make_buffer(shm, 64, 64, 0xff60c020);
+        if (surface == nullptr || buf_a == nullptr || buf_b == nullptr) {
+            wl_display_disconnect(dpy);
+            return;
+        }
+        // First commit: attach buffer A (seq advances to 1, surface->buffer set).
+        wl_surface_attach(surface, buf_a, 0, 0);
+        wl_surface_damage(surface, 0, 0, 64, 64);
+        wl_surface_commit(surface);
+        wl_display_flush(dpy);
+        ready = true;
+
+        int last = 0;
+        while (!stop) {
+            wl_display_dispatch_pending(dpy);
+            wl_display_flush(dpy);
+            const int cmd = commit_cmd.load();
+            if (cmd != last) {
+                // Command 1 attaches buffer B (a NEW pointer vs the current A);
+                // command 2+ RE-attaches buffer B (the SAME pointer as current =>
+                // the pooled same-pointer re-commit, §0d). Either way the surface
+                // commit seq advances, so the seq-gate must re-import exactly once
+                // — proving the gate keys on the seq, not the buffer pointer.
+                wl_surface_attach(surface, buf_b, 0, 0);
+                wl_surface_damage(surface, 0, 0, 64, 64);
+                wl_surface_commit(surface);
+                wl_display_flush(dpy);
+                last = cmd;
+                commit_done = cmd;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        // Destroy every bound proxy before disconnect (mirrors the ext-*-client
+        // tests' teardown) so libwayland-client retains no proxy allocations —
+        // keeps the asan suite leak-clean.
+        wl_buffer_destroy(buf_a);
+        wl_buffer_destroy(buf_b);
+        wl_surface_destroy(surface);
+        if (compositor != nullptr) {
+            wl_compositor_destroy(compositor);
+        }
+        if (shm != nullptr) {
+            wl_shm_destroy(shm);
+        }
+        if (registry != nullptr) {
+            wl_registry_destroy(registry);
+        }
+        wl_display_flush(dpy);
+        wl_display_disconnect(dpy);
+    }
+};
+
+// Pump the server until `pred()` is true or `max_turns` elapses. Returns pred().
+template <typename Pred>
+auto pump_until_se(unbox::kernel::Server& s, Pred pred, int max_turns = 400) -> bool {
+    for (int i = 0; i < max_turns && !pred(); ++i) {
+        s.dispatch(5);
+    }
+    return pred();
+}
+
+} // namespace
+
+TEST_CASE("surface-element: live import + seq-gate + frame-done against a real client") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+
+    auto server = unbox::kernel::Server::create({});
+    server->activate_extensions();
+
+    // Spin the in-process client; it connects to our socket and commits buffer A.
+    TestWaylandClient client(server->socket_name());
+    client.start();
+
+    // Pump the server until the client has connected + committed its first buffer
+    // (the kernel test seam captures the latest committed client wl_surface).
+    const bool got_surface =
+        pump_until_se(*server, [&] { return client.ready.load(); }) &&
+        pump_until_se(*server, [&] {
+            return server->ui_create_surface_element_for_test();
+        });
+    if (!got_surface) {
+        // No GL path on this box, or the client could not connect: nothing the
+        // headless agent can prove here (mirrors the other GL-gated tests' skip).
+        client.join();
+        return;
+    }
+
+    // (criterion 1) The element reports a stable unbox-surface:// URI and the
+    // client's current pixel size.
+    CHECK(server->ui_surface_element_uri().rfind("unbox-surface://", 0) == 0);
+    CHECK(server->ui_surface_element_width() == 64);
+    CHECK(server->ui_surface_element_height() == 64);
+
+    // The initial import counts as one re-import (the first buffer adopted).
+    const int reimports_after_create = server->ui_surface_element_reimport_count();
+    CHECK(reimports_after_create >= 1);
+
+    // (criterion 6) Frame-done must be DRIVEN per composited frame while the
+    // element exists: pump and watch the counter climb (the stuck-frame fix —
+    // without it the client would draw once and wait forever).
+    const int fd_before = server->ui_surface_element_frame_done_count();
+    pump(*server, 40);
+    const int fd_after = server->ui_surface_element_frame_done_count();
+    CHECK(fd_after > fd_before);
+
+    // (criterion 1, the seq-gate) IDLE: with no new client commit, pumping more
+    // frames must NOT re-import (a static client costs zero import work — the
+    // idle dirty-gate is intact).
+    const int reimports_idle0 = server->ui_surface_element_reimport_count();
+    pump(*server, 40);
+    CHECK(server->ui_surface_element_reimport_count() == reimports_idle0);
+
+    // (criterion 1, the seq-gate / frozen-frame fix) A NEW commit (seq++) of a
+    // NEW buffer pointer => exactly ONE more re-import.
+    const int before_new = server->ui_surface_element_reimport_count();
+    const int cmd1 = client.commit_cmd.fetch_add(1) + 1; // even => buffer B (new ptr)
+    pump_until_se(*server, [&] { return client.commit_done.load() >= cmd1; });
+    pump(*server, 20); // let tick_all re-import the committed buffer
+    CHECK(server->ui_surface_element_reimport_count() == before_new + 1);
+
+    // (criterion 1, the §0d pooled re-commit) A new commit (seq++) re-using the
+    // SAME buffer pointer (buffer A) STILL re-imports exactly once — the gate is
+    // on the commit SEQ, not the buffer pointer (foot recycles a buffer pool).
+    const int before_reuse = server->ui_surface_element_reimport_count();
+    const int cmd2 = client.commit_cmd.fetch_add(1) + 1; // odd => buffer A (same ptr)
+    pump_until_se(*server, [&] { return client.commit_done.load() >= cmd2; });
+    pump(*server, 20);
+    CHECK(server->ui_surface_element_reimport_count() == before_reuse + 1);
+
+    // Dropping the element ends the frame-callback duty: with no element left the
+    // counts read 0 and stay 0 (the duty does not run for a destroyed element).
+    server->ui_drop_surface_element_for_test();
+    CHECK_FALSE(server->ui_surface_element_uri().rfind("unbox-surface://", 0) == 0);
+    CHECK(server->ui_surface_element_frame_done_count() == 0);
+    pump(*server, 20);
+    CHECK(server->ui_surface_element_frame_done_count() == 0);
+
+    client.join();
+    unsetenv("WLR_HEADLESS_OUTPUTS");
 }

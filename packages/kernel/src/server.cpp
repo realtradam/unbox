@@ -85,6 +85,45 @@ auto Server::ui_preview_import_is_dmabuf() const -> bool {
     return impl_->substrate != nullptr && impl_->substrate->preview_import_is_dmabuf();
 }
 
+auto Server::ui_surface_element_reimport_count() const -> int {
+    return impl_->substrate != nullptr ? impl_->substrate->surface_element_reimport_count() : 0;
+}
+
+auto Server::ui_surface_element_frame_done_count() const -> int {
+    return impl_->substrate != nullptr ? impl_->substrate->surface_element_frame_done_count() : 0;
+}
+
+auto Server::ui_surface_element_import_is_dmabuf() const -> bool {
+    return impl_->substrate != nullptr && impl_->substrate->surface_element_import_is_dmabuf();
+}
+
+auto Server::ui_create_surface_element_for_test() -> bool {
+    if (impl_->test_surface_element != nullptr) {
+        return true; // already built (idempotent — no id churn on repeated polls)
+    }
+    if (impl_->substrate == nullptr || impl_->test_last_client_surface == nullptr) {
+        return false;
+    }
+    impl_->test_surface_element =
+        impl_->substrate->create_surface_element(impl_->test_last_client_surface);
+    return impl_->test_surface_element != nullptr;
+}
+
+auto Server::ui_surface_element_uri() const -> std::string {
+    return impl_->test_surface_element != nullptr ? impl_->test_surface_element->source_uri()
+                                                  : std::string{};
+}
+
+auto Server::ui_surface_element_width() const -> int {
+    return impl_->test_surface_element != nullptr ? impl_->test_surface_element->width() : 0;
+}
+
+auto Server::ui_surface_element_height() const -> int {
+    return impl_->test_surface_element != nullptr ? impl_->test_surface_element->height() : 0;
+}
+
+void Server::ui_drop_surface_element_for_test() { impl_->test_surface_element.reset(); }
+
 auto Server::ui_pixel(int x, int y) const -> unsigned int {
     return impl_->substrate != nullptr ? impl_->substrate->surface_pixel(x, y) : 0U;
 }
@@ -143,6 +182,14 @@ auto PerExtensionUi::create_preview(wlr_scene_tree* source) -> std::unique_ptr<P
     return server_->substrate->create_preview(source);
 }
 
+auto PerExtensionUi::create_surface_element(wlr_surface* client)
+    -> std::unique_ptr<SurfaceElement> {
+    if (server_->substrate == nullptr) {
+        return nullptr;
+    }
+    return server_->substrate->create_surface_element(client);
+}
+
 auto PerExtensionUi::available() const -> bool {
     return server_->substrate != nullptr && server_->substrate->available();
 }
@@ -193,9 +240,26 @@ void Server::Impl::init() {
     wlr_renderer_init_wl_display(renderer, display);
     allocator = require(wlr_allocator_autocreate(backend, renderer), "wlr_allocator");
 
-    wlr_compositor_create(display, 5, renderer);
+    compositor = wlr_compositor_create(display, 5, renderer);
     wlr_subcompositor_create(display);
     wlr_data_device_manager_create(display);
+
+    // Surface-element test seam (kernel suite only): track each new client
+    // wl_surface and record the latest one that has committed a buffer, so a
+    // headless test can build a real SurfaceElement from a real client surface.
+    // No production behaviour depends on this; it just observes new_surface.
+    if (compositor != nullptr) {
+        test_new_surface.connect(compositor->events.new_surface, [this](void* data) {
+            auto* surface = static_cast<wlr_surface*>(data);
+            test_surface_commits.emplace_back();
+            Listener& commit = test_surface_commits.back();
+            commit.connect(surface->events.commit, [this, surface](void*) {
+                if (surface->buffer != nullptr) {
+                    test_last_client_surface = surface;
+                }
+            });
+        });
+    }
 
     output_layout = require(wlr_output_layout_create(display), "wlr_output_layout");
     new_output.connect(backend->events.new_output, [this](void* data) {
@@ -383,7 +447,8 @@ void Server::Impl::start_substrate() {
     // substrate uses the kernel's ONE shared FileWatcher for (UNBOX_DEV-gated)
     // asset hot-reload — the same watcher Host::watch_file uses for config.
     substrate = Substrate::create(display_egl, allocator, renderer, file_watcher(),
-                                  [this](ExtensionId who) { disable(who); });
+                                  [this](ExtensionId who) { disable(who); },
+                                  [this] { schedule_driver_frame(); });
 }
 
 auto Server::Impl::file_watcher() -> FileWatcher* {
@@ -430,6 +495,13 @@ void Server::Impl::shutdown() {
         it->host.reset();
     }
     extensions.clear();
+
+    // Surface-element test seam: drop the test element (releases its import +
+    // commit hook) and the capture listeners BEFORE the substrate/compositor go.
+    test_surface_element.reset();
+    test_new_surface.disconnect();
+    test_surface_commits.clear();
+    test_last_client_surface = nullptr;
 
     // The ui substrate owns scene nodes + GL objects on a sibling context and
     // borrows scene/renderer/allocator: tear it down before they die. (Its asset
@@ -587,6 +659,22 @@ void Server::Impl::handle_new_output(wlr_output* wlr_output) {
         timespec now{};
         clock_gettime(CLOCK_MONOTONIC, &now);
         wlr_scene_output_send_frame_done(scene_output, &now);
+
+        // Live surface elements (RML compositing) are NOT wlr_scene surface
+        // nodes — they live as imported textures inside the substrate's RmlUi
+        // documents — so wlr_scene_output_send_frame_done above never reaches
+        // their backing wl_surfaces. Drive their frame callbacks ourselves so the
+        // client keeps producing buffers (the stuck-frame fix). Done on the
+        // PRIMARY output only (one frame-done per composited frame, like the
+        // request_frames drain) and unconditionally (a client needs callbacks to
+        // progress regardless of whether we re-rendered). While >=1 element exists
+        // keep a frame scheduled so the loop self-sustains even when otherwise
+        // idle (the continuous frame-callback duty).
+        if (substrate != nullptr && output->output == frame_driver_output &&
+            substrate->has_surface_elements()) {
+            substrate->send_frame_done_to_surface_elements(now);
+            wlr_output_schedule_frame(frame_driver_output);
+        }
     });
     output->request_state.connect(wlr_output->events.request_state, [output](void* data) {
         const auto* event = static_cast<wlr_output_event_request_state*>(data);

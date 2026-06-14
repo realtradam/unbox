@@ -6,6 +6,7 @@
 #include "ui_core.hpp"
 
 #include <cstdint>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <vector>
@@ -47,6 +48,12 @@ class FileWatcher;
 // internals.
 using SubstrateDisableFn = std::function<void(ExtensionId)>;
 
+// Callback the substrate invokes to ask the kernel to schedule an output frame
+// — the dirty-gate kick for live surface elements (a client commit, or the
+// continuous frame-callback loop while >=1 element exists). Injected by the
+// kernel (Server::Impl::schedule_driver_frame). No-op-safe before any output.
+using SubstrateScheduleFn = std::function<void()>;
+
 class Substrate; // the concrete UiSubstrate, defined in ui_substrate.cpp
 
 // One ui surface's private state (Rml context + GL target + scene node +
@@ -56,8 +63,14 @@ struct Surface;
 
 // One preview's private state (snapshot dmabuf + imported EGLImage/texture +
 // RmlUi URI registration). Defined in ui_substrate.cpp; declared here so the
-// public PreviewHandle can borrow one out of the Substrate's list.
+// public PreviewHandle can borrow one.
 struct PreviewState;
+
+// One LIVE surface element's private state (the client wl_surface's seq-gated
+// zero-copy import + EGLImage/texture + RmlUi URI registration + the RAII commit
+// listener that dirties on a client commit). Defined in ui_substrate.cpp;
+// declared here so the public SurfaceElementHandle can borrow one.
+struct SurfaceElementState;
 
 // Concrete Preview handed to an extension. A thin, owning handle over a
 // PreviewState that lives in the Substrate's list; destruction frees the GL
@@ -78,6 +91,27 @@ public:
 private:
     Substrate* substrate_;
     PreviewState* state_;
+};
+
+// Concrete SurfaceElement handed to an extension. A thin, owning handle over a
+// SurfaceElementState that lives in the Substrate's list; destruction drops the
+// live import (texture + EGLImage + held buffer lock), the commit listener, and
+// the URI registration, and ends the frame-callback duty for its surface.
+class SurfaceElementHandle final : public SurfaceElement {
+public:
+    SurfaceElementHandle(Substrate* substrate, SurfaceElementState* state)
+        : substrate_(substrate), state_(state) {}
+    ~SurfaceElementHandle() override;
+    SurfaceElementHandle(const SurfaceElementHandle&) = delete;
+    auto operator=(const SurfaceElementHandle&) -> SurfaceElementHandle& = delete;
+
+    [[nodiscard]] auto source_uri() const -> std::string override;
+    [[nodiscard]] auto width() const -> int override;
+    [[nodiscard]] auto height() const -> int override;
+
+private:
+    Substrate* substrate_;
+    SurfaceElementState* state_;
 };
 
 // Concrete UiSurface handed to an extension. A thin, owning handle over a
@@ -139,7 +173,8 @@ public:
     // nullptr to disable watching. Never throws.
     static auto create(EGLDisplay egl_display, wlr_allocator* allocator,
                        wlr_renderer* renderer, FileWatcher* watcher,
-                       SubstrateDisableFn disable) -> std::unique_ptr<Substrate>;
+                       SubstrateDisableFn disable, SubstrateScheduleFn schedule)
+        -> std::unique_ptr<Substrate>;
 
     ~Substrate();
     Substrate(const Substrate&) = delete;
@@ -158,7 +193,25 @@ public:
     // throws. (See ui.hpp UiSubstrate::create_preview for the public contract.)
     auto create_preview(wlr_scene_tree* source) -> std::unique_ptr<Preview>;
 
-    // Render every dirty surface (called from the output frame handler).
+    // Create a LIVE surface element backed by `client`'s current buffer (the
+    // live sibling of create_preview). Returns nullptr if unavailable or the
+    // initial import failed. `client` is a borrow the caller must outlive (see
+    // ui.hpp UiSubstrate::create_surface_element). Never throws.
+    auto create_surface_element(wlr_surface* client) -> std::unique_ptr<SurfaceElement>;
+
+    // True while >=1 surface element exists: the kernel keeps a frame scheduled
+    // so the frame-callback duty (send_frame_done_to_surface_elements) keeps the
+    // client drawing even when nothing else is dirty.
+    [[nodiscard]] auto has_surface_elements() const -> bool;
+
+    // Frame-callback duty (the stuck-frame fix): send wl_surface frame-done to
+    // EVERY live-element-backing surface. Called once per composited output frame
+    // by the kernel (unconditionally, like wlr_scene_output_send_frame_done), so
+    // the client keeps producing buffers regardless of whether we re-rendered.
+    void send_frame_done_to_surface_elements(const timespec& now);
+
+    // Render every dirty surface (called from the output frame handler). Also
+    // re-imports every surface element's current buffer first (seq-gated).
     void tick_all();
 
     // ---- Input routing (kernel calls these BEFORE emitting on the bus) ----
@@ -196,6 +249,22 @@ public:
     // EGLImage -> sampled texture path (Plan A) rather than failing. Lets the
     // suite assert the spike's GO path engaged on hardware that supports it.
     [[nodiscard]] auto preview_import_is_dmabuf() const -> bool;
+
+    // ---- surface-element test instrumentation (kernel suite only) ----
+    // Total live re-imports across all surface elements: bumps once per REAL
+    // re-import (a seq advance). A static client (no commit => no seq change)
+    // never bumps it; an updating client bumps once per committed frame. Lets
+    // the suite assert the seq-gate (a new buffer/seq => exactly one re-import;
+    // re-adopting the same seq => zero) mirroring spike --verify criterion 1.
+    [[nodiscard]] auto surface_element_reimport_count() const -> int;
+    // Total wl_surface frame-done sends across all surface elements: bumps once
+    // per element per composited frame (the frame-callback duty). Lets the suite
+    // assert frame-done is driven per frame (spike --verify criterion 6 / §0c).
+    [[nodiscard]] auto surface_element_frame_done_count() const -> int;
+    // Whether the most recent surface-element import took the dmabuf ->
+    // EGLImage -> texture path (vs the shm-upload fallback). Lets the suite see
+    // which path engaged on the test backend.
+    [[nodiscard]] auto surface_element_import_is_dmabuf() const -> bool;
     // Packed 0xRRGGBBAA of the first shm-path surface's submitted buffer at
     // layout pixel (x,y) (readback row 0 = top). 0 if no shm surface / no frame
     // / out of bounds. A position-aware probe (like orientation()) so the suite
@@ -240,6 +309,7 @@ private:
 
     friend class SurfaceHandle;
     friend class PreviewHandle;
+    friend class SurfaceElementHandle;
 };
 
 } // namespace unbox::kernel

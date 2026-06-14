@@ -97,6 +97,33 @@ public:
     // The kernel suite asserts this is true on a gles2/dmabuf backend.
     [[nodiscard]] auto ui_preview_import_is_dmabuf() const -> bool;
 
+    // ---- surface-element test instrumentation (kernel suite only) ----
+    // Total live re-imports across all surface elements (RML compositing Wave 1):
+    // a seq advance => exactly one bump; re-adopting the same seq => zero. Lets
+    // the suite assert the seq-gate (spike --verify criterion 1).
+    [[nodiscard]] auto ui_surface_element_reimport_count() const -> int;
+    // Total wl_surface frame-done sends across all surface elements: one per
+    // element per composited frame (the frame-callback duty / stuck-frame fix).
+    // Lets the suite assert frame-done is driven per frame.
+    [[nodiscard]] auto ui_surface_element_frame_done_count() const -> int;
+    // Whether the most recent surface-element import took the dmabuf path (vs the
+    // shm-upload fallback). The suite asserts true on a gles2/dmabuf backend.
+    [[nodiscard]] auto ui_surface_element_import_is_dmabuf() const -> bool;
+
+    // Build a SurfaceElement from the most recently committed CLIENT wl_surface
+    // (captured by the kernel's compositor test seam), via the same substrate
+    // path Host::ui().create_surface_element uses. Returns true if an element was
+    // created. A test has no other in-process way to obtain a real wl_surface, so
+    // this seam lets the suite exercise the live import/seq-gate/frame-done wiring
+    // against a real client surface. Test instrumentation; single-thread only.
+    auto ui_create_surface_element_for_test() -> bool;
+    // The current test surface element's URI / size (empty / 0 if none).
+    [[nodiscard]] auto ui_surface_element_uri() const -> std::string;
+    [[nodiscard]] auto ui_surface_element_width() const -> int;
+    [[nodiscard]] auto ui_surface_element_height() const -> int;
+    // Drop the test surface element (releases its import + commit hook + URI).
+    void ui_drop_surface_element_for_test();
+
     // Packed 0xRRGGBBAA of the first shm-path ui surface's submitted buffer at
     // layout pixel (x,y) (row 0 = top). 0 if no shm surface / no frame / out of
     // bounds. Position-aware readback so the preview-spike test can assert a

@@ -24,10 +24,18 @@ hook); present = FBO→dmabuf swapchain→wlr_scene_buffer + EGL fence. Throwawa
 target `packages/kernel/rml-compositing-spike` (`--verify`/`--run`/`--demo`),
 out of the shipped binary. **CONTRACT DECISION (user): RCSS is the single source
 of truth for ALL layout + animation; C++ drives the document via a TYPED
-substrate API.** NEXT ACTION: **Phase 2 implementation** per the Phase-1 design
-doc `notes/rml-compositing-phase1.md` — Wave 1 = kernel substrate
-(`SurfaceElement` live import + input-back + damage-limited present). 4 user
-boundary calls open (design doc §10) before Wave 2 fans out.
+substrate API.** PHASE 2 on `feat/rml-compositing` (off main; spike sources carried
+as in-tree reference, `build_by_default:false`, deleted when the waves land).
+**Wave 1 DONE + verified**: kernel `SurfaceElement` (live sibling of `Preview`) —
+zero-copy seq-gated import, frame-callback duty, dirty-gate; public contract in
+`ui.hpp` (`create_surface_element(wlr_surface*)`); kernel suite + asan green
+(test-only `wayland-client` dep accepted, scoped to kernel-tests). Wave plan
+refined: **Wave 1** = the live primitive (done); **Wave 1b** = input-back
+(pick→surface-local→wl_seat via `Element::Project`) + subsurface/popup child
+trees; **Wave 2** = ext-xdg-shell (`Toplevel::wl_surface()`, retire scene
+compositing) + ext-layer-shell; **Wave 3** = NEW `ext-window-field` (window list +
+RCSS layout); **Wave 4** = ext-stage-dock; **Wave 5** = damage limiting (Option B)
++ scanout bypass. NEXT ACTION: **Wave 1b** (kernel input-back + surface trees).
 Tiling (slice 7) is DEFERRED behind this (becomes RCSS over surface elements;
 pure layout core in `notes/tiling-spec.md` carries over). Stage dock (slice 10)
 real-seat feel check is paused under this pivot.

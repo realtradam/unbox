@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 // Pure decision cores for the ui substrate — NO wlroots / GL / RMLUi types, so
 // they are doctest-able with nothing running (AGENTS.md: effects at the edges,
@@ -10,6 +11,47 @@
 // Everything runs on the single wl_event_loop thread; no synchronization here.
 
 namespace unbox::kernel {
+
+// ---- surface-element URI minting + the seq-gate decision (RML compositing) ---
+//
+// A surface element (GLOSSARY: "surface element") is the LIVE analogue of a
+// Preview: a client wl_surface's current buffer imported zero-copy as a sampled
+// GL texture, shown via <img src=source_uri()>. These two pure helpers are the
+// substrate's decision cores for it; the GL/wlroots effects wrap them in
+// ui_substrate.cpp.
+
+// The "<img src>" URI a surface element registers under, given its stable id.
+// Mirrors create_preview's "unbox-preview://N" minting; the live sibling is
+// "unbox-surface://N". Pure string math (doctest-able with nothing running).
+[[nodiscard]] inline auto surface_element_uri(int id) -> std::string {
+    return "unbox-surface://" + std::to_string(id);
+}
+
+// The seq-gate (the §0d frozen-frame fix): re-import the surface's CURRENT
+// committed buffer ONLY when the surface's commit SEQUENCE advances — NOT when
+// the buffer POINTER changes. Wayland clients (foot) recycle a small buffer
+// pool, so wlroots re-commits the SAME wlr_buffer pointer with NEW contents; a
+// pointer-equality gate wrongly skips those (the stuck-frame bug). The commit
+// seq (wlr_surface_state.seq) increments on EVERY commit regardless of pool
+// reuse, so it is the reuse-proof dirty signal. A static client never commits =>
+// its seq never advances => zero work (the idle dirty-gate stays intact).
+//
+// `have_seq` is false until the first import; `cur_seq` is the seq of the
+// currently-imported buffer; `new_seq` is the surface's current commit seq;
+// `same_ptr` is whether the surface's current buffer pointer equals the one we
+// already hold; `have_tex` is whether a texture already exists. Returns true iff
+// a (re)import is required. The first import (no seq yet, or no texture) always
+// imports; thereafter only a seq advance does (an unchanged seq on the same
+// pointer with a live texture is the only no-work case — matching the spike's
+// LiveTexture::adopt early-return exactly).
+[[nodiscard]] constexpr auto surface_element_needs_reimport(bool have_seq, std::uint32_t cur_seq,
+                                                            std::uint32_t new_seq, bool same_ptr,
+                                                            bool have_tex) -> bool {
+    if (!have_seq || !have_tex) {
+        return true; // first import (or texture lost): always import
+    }
+    return !(new_seq == cur_seq && same_ptr); // unchanged surface state => skip
+}
 
 // touch-mode: the substrate-level theme state that scales hit targets for
 // finger input. It flips automatically by last-input kind — a touch event

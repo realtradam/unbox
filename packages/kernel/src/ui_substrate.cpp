@@ -1,6 +1,7 @@
 #include "ui_substrate.hpp"
 
 #include "file_watcher.hpp"
+#include "listener.hpp" // RAII wl_listener for the surface-element commit hook
 #include "rmlui_renderer_gl3.h"
 
 #include <RmlUi/Core/Animation.h> // Transition / TransitionList / Tween
@@ -610,6 +611,45 @@ struct PreviewState {
     bool dmabuf = false;               // true once a dmabuf import succeeded
 };
 
+// ---- SurfaceElementState ----------------------------------------------------
+//
+// A LIVE surface element: a client wl_surface's CURRENT committed buffer
+// imported zero-copy as a sampled GL texture in the RMLUi sibling context and
+// registered under an "unbox-surface://N" URI — the live sibling of
+// PreviewState. Ports spike `LiveTexture` (src/spike/spike_gl.hpp) into the real
+// substrate: the seq-gated re-import (§0d frozen-frame fix) + the double-buffered
+// wlr_buffer lock/unlock lifecycle (at most ONE buffer pinned). Re-import +
+// frame-done run on the sibling context inside tick_all (the caller makes it
+// current); the RAII commit Listener (kernel-private, never crosses the
+// contract) marks the element dirty + asks the kernel to schedule a frame.
+// Lives in Substrate::Impl::surface_elements (stable addresses).
+struct SurfaceElementState {
+    Substrate::Impl* owner = nullptr;
+    int id = 0;
+    std::string uri;
+
+    wlr_surface* surface = nullptr; // BORROW; caller outlives the element (ui.hpp)
+    int width = 0;
+    int height = 0;
+
+    // The live import (ported from spike LiveTexture). `current` is the buffer we
+    // hold LOCKED + have imported; `current_seq` its surface commit seq.
+    wlr_buffer* current = nullptr;
+    std::uint32_t current_seq = 0;
+    bool have_seq = false;             // false until the first adopt()
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    GLuint tex = 0;
+    bool dmabuf = false;               // last import took the dmabuf path
+    int reimports = 0;                 // REAL re-imports (seq advances) — test probe
+    int frame_done_sends = 0;          // frame-done calls — test probe
+
+    // RAII commit hook: a client wl_surface.commit dirties this element + kicks
+    // the dirty-gate. Destruction (element drop) unsubscribes — never a bare
+    // wl_listener across the contract (.unbox/rules/listener-lifetime.md).
+    Listener commit_l;
+    bool needs_reimport = true;        // a commit happened => re-adopt next tick
+};
+
 // ---- Substrate::Impl --------------------------------------------------------
 
 struct Substrate::Impl {
@@ -617,6 +657,10 @@ struct Substrate::Impl {
     wlr_allocator* allocator = nullptr;
     wlr_renderer* renderer = nullptr;
     SubstrateDisableFn disable;
+    // Ask the kernel to schedule an output frame (the dirty-gate kick for live
+    // surface elements: a client commit, or the continuous frame-callback loop
+    // while >=1 element exists). No-op-safe before any output exists.
+    SubstrateScheduleFn schedule;
 
     TouchModeTracker touch_mode_tracker;
 
@@ -654,6 +698,13 @@ struct Substrate::Impl {
     int next_preview_id = 0;
     bool last_preview_dmabuf = false; // test probe: last import took the dmabuf path
     int resize_realloc_count = 0;     // test probe: # of set_size GL-target reallocs
+
+    // Live surface elements (RML compositing Wave 1): stable addresses
+    // (SurfaceElementHandle borrows a SurfaceElementState*). next_surface_id
+    // numbers the "unbox-surface://N" URIs.
+    std::list<SurfaceElementState> surface_elements;
+    int next_surface_id = 0;
+    bool last_surface_element_dmabuf = false; // test probe: last import path
 
     // Pointer implicit grab: the consumer of the first button press owns the
     // whole press..release stream (standard seat behavior). `pointer_grab`
@@ -732,6 +783,16 @@ struct Substrate::Impl {
     bool snapshot_into_buffer(PreviewState& p);
     bool import_snapshot(PreviewState& p);
     void destroy_preview(PreviewState* p);
+
+    // Surface elements (RML compositing Wave 1). adopt_surface_element re-imports
+    // `s`'s surface's CURRENT buffer if (and only if) the commit seq advanced
+    // (seq-gate); it manages the double-buffered wlr_buffer lock and registers
+    // the URI. Caller holds the sibling context current. Returns true if the
+    // sampled texture reflects the current buffer afterwards. destroy_surface_
+    // element drops the import (texture/EGLImage/held lock), the URI, and the
+    // element from the list.
+    bool adopt_surface_element(SurfaceElementState& s);
+    void destroy_surface_element(SurfaceElementState* s);
 
     // Forward a synthesized pointer event into a surface's Rml context. Returns
     // whether RmlUi (or our hit-test) treats it as consumed.
@@ -1380,15 +1441,174 @@ void Substrate::Impl::destroy_preview(PreviewState* p) {
     previews.remove_if([p](const PreviewState& e) { return &e == p; });
 }
 
+// ---- Surface elements: seq-gated live import (port of spike LiveTexture) -----
+//
+// The client surface's CURRENT committed buffer is `surface->buffer` — a
+// wlr_client_buffer (the renderer-side import; wlroots has ALREADY released the
+// client's underlying pool wl_buffer, so reading/locking it can never starve the
+// client). We re-import it ONLY when the surface commit SEQUENCE advances
+// (surface_element_needs_reimport, ui_core.hpp): a static client never commits =>
+// its seq never advances => zero work (idle dirty-gate intact); a pooled client
+// re-commits the SAME wlr_buffer pointer with NEW contents and a bumped seq =>
+// re-import (the §0d frozen-frame fix). The buffer we import is LOCKED for the
+// import+sample lifetime and the PREVIOUS one unlocked once the new import is
+// live — double-buffered, at most one buffer pinned, balanced in EVERY case incl.
+// the pooled same-pointer re-commit (prev == buf: net +1 then -1).
+
+bool Substrate::Impl::adopt_surface_element(SurfaceElementState& s) {
+    if (s.surface == nullptr) {
+        return s.tex != 0;
+    }
+    wlr_buffer* buf = nullptr;
+    if (s.surface->buffer != nullptr) {
+        buf = &s.surface->buffer->base;
+    }
+    if (buf == nullptr) {
+        // No buffer committed yet (e.g. a 0x0 configure-ack commit) — nothing to
+        // import; keep any prior texture. Not a failure.
+        return s.tex != 0;
+    }
+    const std::uint32_t seq = s.surface->current.seq;
+    if (!surface_element_needs_reimport(s.have_seq, s.current_seq, seq, buf == s.current,
+                                        s.tex != 0)) {
+        return true; // truly unchanged surface state: zero re-import, zero copy
+    }
+
+    // Lock the buffer we are about to sample (its dmabuf FDs / shm storage must
+    // stay valid for the whole import+sample); release the PREVIOUS one once the
+    // new import is live (double-buffered: at most one buffer pinned).
+    wlr_buffer* prev = s.current;
+    wlr_buffer_lock(buf);
+
+    auto commit = [&](bool is_dmabuf) {
+        s.current = buf;
+        s.current_seq = seq;
+        s.have_seq = true;
+        s.dmabuf = is_dmabuf;
+        last_surface_element_dmabuf = is_dmabuf;
+        ++s.reimports;
+        if (prev != nullptr) {
+            wlr_buffer_unlock(prev); // prev may == buf (pooled re-commit): net +1/-1
+        }
+        if (gl.render_iface) {
+            gl.render_iface->register_preview_texture(s.uri, s.tex,
+                                                      Rml::Vector2i(s.width, s.height));
+        }
+    };
+
+    wlr_dmabuf_attributes attribs{};
+    if (gl.dmabuf_import_ok && gl.egl_create_image != nullptr &&
+        gl.gl_image_target_texture != nullptr && wlr_buffer_get_dmabuf(buf, &attribs) &&
+        attribs.n_planes >= 1) {
+        EGLint ia[] = {
+            EGL_WIDTH,                     attribs.width,
+            EGL_HEIGHT,                    attribs.height,
+            EGL_LINUX_DRM_FOURCC_EXT,      static_cast<EGLint>(attribs.format),
+            EGL_DMA_BUF_PLANE0_FD_EXT,     attribs.fd[0],
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(attribs.offset[0]),
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,  static_cast<EGLint>(attribs.stride[0]),
+            EGL_NONE,
+        };
+        EGLImageKHR img =
+            gl.egl_create_image(gl.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, ia);
+        if (img != EGL_NO_IMAGE_KHR) {
+            // Drop the old GL objects, build the new texture from the EGLImage.
+            if (s.tex != 0) {
+                glDeleteTextures(1, &s.tex);
+                s.tex = 0;
+            }
+            if (s.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+                gl.egl_destroy_image(gl.egl_display, s.image);
+            }
+            glGenTextures(1, &s.tex);
+            glBindTexture(GL_TEXTURE_2D, s.tex);
+            gl.gl_image_target_texture(GL_TEXTURE_2D, static_cast<GLeglImageOES>(img));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            s.image = img;
+            s.width = attribs.width;
+            s.height = attribs.height;
+            commit(true);
+            return true;
+        }
+    }
+
+    // Fallback: one CPU upload for an shm client (no dmabuf path). R<->B swizzle
+    // like Preview/the spike so AR24 {B,G,R,A} samples with correct colors.
+    void* data = nullptr;
+    std::uint32_t fmt = 0;
+    std::size_t stride = 0;
+    if (!wlr_buffer_begin_data_ptr_access(buf, WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &fmt,
+                                          &stride)) {
+        wlr_buffer_unlock(buf); // import failed: drop the lock we just took
+        return s.tex != 0;
+    }
+    if (s.tex != 0) {
+        glDeleteTextures(1, &s.tex);
+        s.tex = 0;
+    }
+    if (s.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+        gl.egl_destroy_image(gl.egl_display, s.image);
+        s.image = EGL_NO_IMAGE_KHR;
+    }
+    glGenTextures(1, &s.tex);
+    glBindTexture(GL_TEXTURE_2D, s.tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(stride / 4));
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, buf->width, buf->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 data);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    wlr_buffer_end_data_ptr_access(buf);
+    s.width = buf->width;
+    s.height = buf->height;
+    commit(false);
+    return true;
+}
+
+void Substrate::Impl::destroy_surface_element(SurfaceElementState* s) {
+    s->commit_l.disconnect(); // stop dirtying after the element is gone
+    const bool cur = gl.make_current();
+    if (gl.render_iface) {
+        gl.render_iface->unregister_preview_texture(s->uri);
+    }
+    if (s->tex != 0) {
+        glDeleteTextures(1, &s->tex);
+        s->tex = 0;
+    }
+    if (s->image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+        gl.egl_destroy_image(gl.egl_display, s->image);
+        s->image = EGL_NO_IMAGE_KHR;
+    }
+    if (cur) {
+        gl.restore_current();
+    }
+    if (s->current != nullptr) {
+        wlr_buffer_unlock(s->current); // release the buffer we held locked
+        s->current = nullptr;
+    }
+    s->have_seq = false;
+    surface_elements.remove_if([s](const SurfaceElementState& e) { return &e == s; });
+}
+
 // ---- Substrate (private surface) --------------------------------------------
 
 auto Substrate::create(EGLDisplay egl_display, wlr_allocator* allocator, wlr_renderer* renderer,
-                       FileWatcher* watcher, SubstrateDisableFn disable)
+                       FileWatcher* watcher, SubstrateDisableFn disable, SubstrateScheduleFn schedule)
     -> std::unique_ptr<Substrate> {
     auto impl = std::make_unique<Impl>();
     impl->allocator = allocator;
     impl->renderer = renderer;
     impl->disable = std::move(disable);
+    impl->schedule = std::move(schedule); // dirty-gate kick for live surface elements
     impl->watcher = watcher; // shared kernel-owned file watcher (asset hot-reload)
     impl->gl.init(egl_display); // sets gl.ok; failure => unavailable substrate
     return std::unique_ptr<Substrate>(new Substrate(std::move(impl)));
@@ -1402,6 +1622,9 @@ Substrate::~Substrate() {
     // handle would dangle after this, but the contract (ui.hpp) is that the
     // substrate outlives every Preview an extension holds (it is kernel-owned
     // and torn down after extensions in Server::Impl::shutdown).
+    while (!impl_->surface_elements.empty()) {
+        impl_->destroy_surface_element(&impl_->surface_elements.front());
+    }
     while (!impl_->previews.empty()) {
         impl_->destroy_preview(&impl_->previews.front());
     }
@@ -1517,8 +1740,101 @@ auto Substrate::create_preview(wlr_scene_tree* source) -> std::unique_ptr<Previe
 
 auto Substrate::preview_import_is_dmabuf() const -> bool { return impl_->last_preview_dmabuf; }
 
+auto Substrate::create_surface_element(wlr_surface* client) -> std::unique_ptr<SurfaceElement> {
+    impl_->last_surface_element_dmabuf = false;
+    if (!impl_->available() || client == nullptr) {
+        return nullptr; // no GL path or no surface: graceful degrade (ui.hpp)
+    }
+
+    impl_->surface_elements.emplace_back();
+    SurfaceElementState& s = impl_->surface_elements.back();
+    s.owner = impl_.get();
+    s.id = ++impl_->next_surface_id;
+    s.uri = surface_element_uri(s.id);
+    s.surface = client;
+
+    // Import the client's current buffer now (so source_uri()/width()/height()
+    // are valid immediately, like create_preview). The sibling context must be
+    // current for the EGLImage/texture/RmlUi-registration work.
+    if (!impl_->gl.make_current()) {
+        impl_->destroy_surface_element(&s);
+        return nullptr;
+    }
+    const bool imported = impl_->adopt_surface_element(s);
+    impl_->gl.restore_current();
+    s.needs_reimport = false;
+    if (!imported || s.tex == 0) {
+        // The surface may simply have no buffer yet (pre-first-commit); that is a
+        // valid live element that will import on its first commit. Only fail if
+        // there is no GL path to ever import on — but available() already gated
+        // that, so a tex==0 here means no buffer yet: keep the element.
+    }
+
+    // RAII commit hook: a client commit dirties this element + kicks the
+    // dirty-gate so the next frame re-imports + re-renders. The borrow received
+    // in the handler is unused (we re-read s.surface->buffer in tick_all); the
+    // listener unsubscribes when the element (and its SurfaceElementState) dies.
+    SurfaceElementState* sp = &s;
+    Substrate::Impl* impl = impl_.get();
+    s.commit_l.connect(client->events.commit, [impl, sp](void*) {
+        sp->needs_reimport = true; // re-adopt this surface's current buffer next tick
+        if (impl->schedule) {
+            impl->schedule(); // dirty-gate: ensure a frame runs to show the update
+        }
+    });
+
+    // Kick the frame-callback loop on: while this element exists the kernel keeps
+    // a frame scheduled (has_surface_elements()) so the client keeps drawing.
+    if (impl_->schedule) {
+        impl_->schedule();
+    }
+    return std::make_unique<SurfaceElementHandle>(this, &s);
+}
+
+auto Substrate::has_surface_elements() const -> bool {
+    return !impl_->surface_elements.empty();
+}
+
+void Substrate::send_frame_done_to_surface_elements(const timespec& now) {
+    // Frame-callback duty (the stuck-frame fix, spike §0c
+    // send_frame_done_to_clients): tell every live-element-backing surface "now
+    // is a good time to draw your next frame", so the client keeps producing
+    // buffers. Wave 1 is single-surface — one wl_surface per element — so we send
+    // frame-done to that surface directly (subsurface/popup tree-walking is Wave
+    // 1b). Sent UNCONDITIONALLY per composited output frame (like
+    // wlr_scene_output_send_frame_done), NOT gated by re-render: the client needs
+    // callbacks to progress regardless of whether WE re-rendered.
+    for (SurfaceElementState& s : impl_->surface_elements) {
+        if (s.surface != nullptr) {
+            wlr_surface_send_frame_done(s.surface, const_cast<timespec*>(&now));
+            ++s.frame_done_sends;
+        }
+    }
+}
+
+auto Substrate::surface_element_reimport_count() const -> int {
+    int total = 0;
+    for (const SurfaceElementState& s : impl_->surface_elements) {
+        total += s.reimports;
+    }
+    return total;
+}
+
+auto Substrate::surface_element_frame_done_count() const -> int {
+    int total = 0;
+    for (const SurfaceElementState& s : impl_->surface_elements) {
+        total += s.frame_done_sends;
+    }
+    return total;
+}
+
+auto Substrate::surface_element_import_is_dmabuf() const -> bool {
+    return impl_->last_surface_element_dmabuf;
+}
+
 void Substrate::tick_all() {
-    if (!impl_->available() || impl_->surfaces.empty()) {
+    if (!impl_->available() ||
+        (impl_->surfaces.empty() && impl_->surface_elements.empty())) {
         return;
     }
     // Apply any hot-reload requests coalesced from inotify since the last tick
@@ -1543,6 +1859,28 @@ void Substrate::tick_all() {
     }
     if (!impl_->gl.make_current()) {
         return;
+    }
+    // Re-import every live surface element's CURRENT buffer FIRST (seq-gated), so
+    // a hosting ui surface's <img src=unbox-surface://N> samples the fresh
+    // texture this frame. The seq-gate makes a static client cost zero work (no
+    // commit => no seq advance => adopt_surface_element early-returns); a client
+    // that committed since the last tick re-imports exactly once. needs_reimport
+    // (set by the commit hook) is a cheap pre-filter so an idle element does not
+    // even touch its surface state.
+    for (SurfaceElementState& s : impl_->surface_elements) {
+        if (s.needs_reimport) {
+            const int before = s.reimports;
+            impl_->adopt_surface_element(s);
+            // Clear the flag only once the seq actually caught up: adopt is
+            // seq-gated, so if it did nothing (no new buffer) leaving the flag set
+            // would re-check next tick, which is harmless — but a successful adopt
+            // (or a no-op on an unchanged seq with a live texture) means we are
+            // current, so clear it. Keep it set only when there is still no
+            // texture (pre-first-buffer) so the first real buffer is picked up.
+            if (s.reimports != before || s.tex != 0) {
+                s.needs_reimport = false;
+            }
+        }
     }
     for (Surface& s : impl_->surfaces) {
         if (s.is_visible) {
@@ -2237,5 +2575,15 @@ void PreviewHandle::refresh() {
     impl.import_snapshot(*state_);
     impl.gl.restore_current();
 }
+
+// ---- SurfaceElementHandle (public SurfaceElement impl) ----------------------
+
+SurfaceElementHandle::~SurfaceElementHandle() {
+    substrate_->impl_->destroy_surface_element(state_);
+}
+
+auto SurfaceElementHandle::source_uri() const -> std::string { return state_->uri; }
+auto SurfaceElementHandle::width() const -> int { return state_->width; }
+auto SurfaceElementHandle::height() const -> int { return state_->height; }
 
 } // namespace unbox::kernel

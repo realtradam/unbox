@@ -313,6 +313,57 @@ protected:
     Preview() = default;
 };
 
+// A LIVE surface element (GLOSSARY: "surface element") — the live sibling of a
+// Preview. It is backed by a client wl_surface's CURRENT committed buffer,
+// imported ZERO-COPY (dmabuf -> EGLImage -> GL texture, shm-upload fallback)
+// into the ui substrate's sibling GLES context and registered under a URI, so
+// putting source_uri() into an RML <img src="..."> in ANY ui surface of this
+// substrate samples the client's LIVE pixels. Owned by the contributing
+// extension via unique_ptr; destruction drops the import, ends the
+// frame-callback duty, and unregisters the URI. Event-loop thread only.
+//
+// HOW IT DIFFERS FROM Preview (which it otherwise mirrors):
+//  - LIVE, not frozen: it re-imports the client's current buffer every commit
+//    (seq-gated — a static client costs ZERO work, an updating one costs one
+//    re-import per committed frame), so there is NO refresh(): it updates
+//    itself.
+//  - It DRIVES the client's frame callbacks: while the element exists the
+//    substrate sends the backing wl_surface its frame-done each composited
+//    frame, so the client keeps producing buffers (without this a client draws
+//    once and waits forever — the spike's stuck-frame fix).
+//  - A client commit DIRTIES the hosting ui surface(s): the next frame
+//    re-renders the updated texture (a static client schedules nothing).
+//
+// LIFETIME (part of the contract — see .unbox/rules/listener-lifetime.md). The
+// wl_surface passed to create_surface_element is a BORROW: the substrate samples
+// it live, so the CALLER guarantees it outlives this element and MUST drop the
+// element the moment the surface unmaps or is destroyed (extensions already
+// track map/unmap). Sampling a surface element after its wl_surface has been
+// destroyed is UNDEFINED BEHAVIOUR — the substrate cannot detect a freed
+// wl_surface. (Wave 1 is SINGLE-SURFACE: one element per wl_surface, no
+// subsurface/popup child trees yet — that is Wave 1b.)
+class SurfaceElement {
+public:
+    virtual ~SurfaceElement() = default;
+    SurfaceElement(const SurfaceElement&) = delete;
+    auto operator=(const SurfaceElement&) -> SurfaceElement& = delete;
+
+    // The <img src> value resolving to this surface's LIVE texture inside any ui
+    // surface of this substrate (e.g. "unbox-surface://7"). Stable for life.
+    [[nodiscard]] virtual auto source_uri() const -> std::string = 0;
+    // The client surface's current pixel size (tracks commits). 0 until the
+    // first buffer has been imported.
+    [[nodiscard]] virtual auto width() const -> int = 0;
+    [[nodiscard]] virtual auto height() const -> int = 0;
+
+    // NO refresh() (unlike Preview): a surface element updates itself every
+    // client commit (seq-gated re-import) and drives the client's frame
+    // callbacks while it exists.
+
+protected:
+    SurfaceElement() = default;
+};
+
 // The kernel's ui substrate, reached via Host::ui(). Per-session, kernel-owned;
 // the reference is a borrow valid for your extension's lifetime. Carries your
 // extension identity for error isolation.
@@ -346,6 +397,32 @@ public:
     // transform/clip/opacity per node is NOT honoured yet (a follow-up).
     [[nodiscard]] virtual auto create_preview(wlr_scene_tree* source)
         -> std::unique_ptr<Preview> = 0;
+
+    // Create a LIVE surface element backed by `client`'s current committed
+    // buffer (see the SurfaceElement docs above). The client's buffer is
+    // imported zero-copy into the RMLUi sibling context (dmabuf -> EGLImage ->
+    // texture; shm-upload + R<->B swizzle fallback when there is no dmabuf path)
+    // and registered under an "unbox-surface://N" URI; show it by putting the
+    // returned element's source_uri() into an RML <img src="..."> in any ui
+    // surface this substrate created. Ownership transfers to you (unique_ptr).
+    //
+    // Returns nullptr if the substrate has no GL path (e.g. the headless pixman
+    // renderer) or the initial import failed (graceful degrade). NEVER throws.
+    //
+    // CONTRAST WITH create_preview: a Preview is a FROZEN one-shot snapshot of a
+    // scene subtree that you refresh() manually; a SurfaceElement is LIVE and
+    // SELF-UPDATING — it re-imports `client`'s current buffer on every commit
+    // (seq-gated, so a static client is free) and the substrate DRIVES
+    // `client`'s frame callbacks while the element exists, so the client keeps
+    // drawing. There is no refresh().
+    //
+    // LIFETIME: `client` is a BORROW. The caller guarantees it outlives the
+    // returned element and MUST drop the element on the surface's unmap/destroy
+    // (see SurfaceElement above + .unbox/rules/listener-lifetime.md). Wave 1 is
+    // single-surface (one element per wl_surface; subsurface/popup child trees
+    // are Wave 1b).
+    [[nodiscard]] virtual auto create_surface_element(wlr_surface* client)
+        -> std::unique_ptr<SurfaceElement> = 0;
 
     // Whether the substrate has a working GL bridge on this backend. When
     // false, create_surface returns nullptr (degrade gracefully).
