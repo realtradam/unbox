@@ -536,7 +536,10 @@ auto run_verify_surface_trees() -> int {
 } // namespace
 
 // The real-seat run mode lives in rml_compositing_spike_run.cpp (its own TU).
-auto run_real_seat(const char* startup_cmd) -> int;
+// `demo` selects the curated 4-window perf-load scenario (3 foot + 1 firefox,
+// one per inward-angled corner, with a live FPS HUD + per-5s min/max fps log and
+// a 120s default dead-man) over the plain single-client `--run`.
+auto run_real_seat(const char* startup_cmd, bool demo) -> int;
 
 int main(int argc, char** argv) {
     const char* mode = (argc > 1) ? argv[1] : "--verify";
@@ -554,13 +557,21 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(mode, "--run") == 0) {
         const char* cmd = (argc > 2) ? argv[2] : "foot";
-        return run_real_seat(cmd);
+        return run_real_seat(cmd, /*demo=*/false);
+    }
+    if (std::strcmp(mode, "--demo") == 0) {
+        // The curated perf scenario spawns its OWN fixed client set (3 foot + 1
+        // firefox), so no startup-cmd is taken.
+        return run_real_seat(nullptr, /*demo=*/true);
     }
     std::fprintf(stderr,
-                 "usage: %s [--verify | --run [startup-cmd]]\n"
+                 "usage: %s [--verify | --run [startup-cmd] | --demo]\n"
                  "  --verify  headless self-check of criteria 1,2,3,4,5,6,7 (exit 0 = pass)\n"
                  "  --run     real/nested seat: spawn a client, composite it as a 3D\n"
-                 "            surface element, route input back, print perf/idle metrics\n",
+                 "            surface element, route input back, print perf/idle metrics\n"
+                 "  --demo    real-seat perf load: 4 windows (3 foot + 1 firefox), one per\n"
+                 "            screen corner angled INWARD, a live FPS HUD + per-5s min/max\n"
+                 "            fps log; 120s default dead-man (P resets, Esc quits)\n",
                  argv[0]);
     return 2;
 }

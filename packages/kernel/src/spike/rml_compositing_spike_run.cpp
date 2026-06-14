@@ -108,7 +108,24 @@ void log_close() {
     }
 }
 
+// --- --demo dedicated FPS log -------------------------------------------------
+//
+// Separate from the diagnostic $HOME/rml-spike.log: a clean, append-only record
+// of the per-5s compositor-FPS min/max so the user can chart FPS over a long
+// video watch. Path: $UNBOX_SPIKE_FPS_LOG if set, else $HOME/rml-spike-fps.log
+// (NEVER /tmp). fflush + fsync per line so it survives a reboot mid-run.
 struct Runner; // fwd
+
+FILE* fps_log_open(std::string& out_path) {
+    if (const char* env = getenv("UNBOX_SPIKE_FPS_LOG"); env != nullptr && env[0] != '\0') {
+        out_path = env;
+    } else if (const char* home = getenv("HOME"); home != nullptr && home[0] != '\0') {
+        out_path = std::string(home) + "/rml-spike-fps.log";
+    } else {
+        out_path = "rml-spike-fps.log";
+    }
+    return std::fopen(out_path.c_str(), "w"); // truncate at start of each demo run
+}
 
 // One keyboard device. MIRRORS the shipped kernel's src/input.cpp: every
 // keyboard from the seat gets its OWN key + modifiers + destroy listeners, held
@@ -137,8 +154,36 @@ struct LiveSurface {
     bool mapped = false;
     bool is_wallpaper = false;
     bool transform3d = false;           // toplevel gets the 3D tilt; wallpaper flat
+    int corner = -1;                    // --demo: corner slot (0..3) this surface owns, -1 if none
 
     Listener map_l, unmap_l, commit_l, destroy_l;
+};
+
+// --- --demo corner geometry --------------------------------------------------
+//
+// Four windows, one per screen corner, angled INWARD so the panels read as the
+// inside of a box: each panel's OUTER edges recede toward the screen centre. We
+// tilt about the panel's own 50%/50% origin under the document's perspective.
+//   rotateX(+A): top edge recedes (back), bottom comes forward  -> for TOP rows
+//   rotateX(-A): bottom edge recedes                            -> for BOTTOM rows
+//   rotateY(-A): left edge recedes                              -> for LEFT cols
+//   rotateY(+A): right edge recedes                             -> for RIGHT cols
+// So TL faces down-right, TR down-left, BL up-right, BR up-left.
+struct CornerSpec {
+    const char* name;
+    bool right;   // column: false=left, true=right
+    bool bottom;  // row:    false=top,  true=bottom
+    double rot_x; // degrees
+    double rot_y; // degrees
+};
+// Inward tilt angle (degrees). Tasteful: steep enough to clearly read as a box
+// interior, shallow enough to keep the client text legible on the panel.
+constexpr double kCornerTilt = 20.0;
+constexpr CornerSpec kCorners[4] = {
+    {"top-left", false, false, +kCornerTilt, -kCornerTilt},  // faces down-right
+    {"top-right", true, false, +kCornerTilt, +kCornerTilt},  // faces down-left
+    {"bottom-left", false, true, -kCornerTilt, -kCornerTilt}, // faces up-right
+    {"bottom-right", true, true, -kCornerTilt, +kCornerTilt}, // faces up-left
 };
 
 struct Runner {
@@ -228,6 +273,32 @@ struct Runner {
 
     int out_w = 1920, out_h = 1080;
 
+    // --- --demo perf-load scenario state -------------------------------------
+    // The curated 4-window scenario: 3 foot + 1 firefox, one per inward-angled
+    // corner, with a live FPS HUD and a per-5s min/max fps log. `demo` gates all
+    // of it; plain `--run` is untouched.
+    bool demo = false;
+    // Corner occupancy: corner_taken[i] true once a client has claimed slot i.
+    // firefox is steered to kFirefoxCorner; foot fills the rest in order. Cleared
+    // on unmap/destroy so a slot frees cleanly (multiple clients now).
+    bool corner_taken[4] = {false, false, false, false};
+    // FPS HUD: a centered RmlUi text element showing the live compositor FPS,
+    // refreshed ~1/s. The compositor's rendered-frames-per-second == output
+    // frames presented (on_frame ticks), NOT client commits.
+    Rml::Element* hud_el = nullptr;
+    long demo_frames = 0;       // total output frames since start (for FPS)
+    long fps_last_frames = 0;   // demo_frames at the last HUD/bucket sample
+    double fps_last_sample = 0.0; // wall time of the last FPS sample
+    double last_fps = 0.0;      // most recent computed FPS (shown on the HUD)
+    // Per-5s min/max bucket, written to the dedicated fps log.
+    FILE* fps_log = nullptr;
+    std::string fps_log_path;
+    double bucket_start = 0.0;  // wall time the current 5s bucket opened
+    double bucket_min = 0.0;    // lowest FPS sample seen this bucket
+    double bucket_max = 0.0;    // highest FPS sample seen this bucket
+    long bucket_frames0 = 0;    // demo_frames at the bucket open (for frames=N)
+    bool bucket_has = false;    // a sample has landed in this bucket yet
+
     spike::GlBridge gl;
     spike::PresentTarget present;
     Rml::Context* ctx = nullptr;
@@ -292,6 +363,12 @@ struct Runner {
                 el->GetParentNode()->RemoveChild(el);
             }
         }
+        // --demo: free this client's corner slot on destroy (an unmap may not have
+        // fired before destroy on some teardown paths — release it here too).
+        if (demo && s->corner >= 0) {
+            corner_taken[s->corner] = false;
+            s->corner = -1;
+        }
         surfaces.remove_if([s](const LiveSurface& e) { return &e == s; });
         dirty = true;
     }
@@ -318,6 +395,43 @@ body { margin: 0px; padding: 0px; perspective: 1400px; background: #0b0d14; }
 <body>
 <div id="wall"></div>
 <div id="stage"></div>
+</body>
+</rml>)RML";
+
+// The --demo document: same wallpaper + perspective stage, but a deeper
+// perspective so the four inward-angled corner panels read clearly as the inside
+// of a box, and a centered FPS HUD on top of everything. The corner panels carry
+// NO fixed transform in the stylesheet — each gets its own per-corner
+// perspective+rotateX/rotateY applied at map time (layout_corner_element). The
+// #hud is a small translucent square holding live FPS text, centered so it is
+// readable and not hidden behind the corner windows.
+const char* kDemoRml = R"RML(<rml>
+<head>
+<style>
+body { margin: 0px; padding: 0px; perspective: 1100px; background: #05070d; }
+#wall { display: block; position: absolute; left: 0; top: 0; }
+#wall img { display: block; }
+#stage { display: block; position: absolute; left: 0; top: 0;
+         width: 100%; height: 100%; }
+.corner { display: block; position: absolute;
+          transform-origin: 50% 50%;
+          box-shadow: #000c 6px 6px 28px 0px; }
+.corner img { display: block; width: 100%; height: 100%; }
+#hud { display: block; position: absolute;
+       width: 220px; height: 84px;
+       background: #000000c0; border: 2px #00e0ffd0;
+       border-radius: 10px;
+       text-align: center;
+       font-size: 22px; color: #00e0ff;
+       font-family: "Noto Sans"; }
+#hud p { display: block; margin: 8px 0px 0px 0px; }
+#hud .big { font-size: 34px; color: #ffffff; }
+</style>
+</head>
+<body>
+<div id="wall"></div>
+<div id="stage"></div>
+<div id="hud"><p>compositor FPS</p><p class="big">--</p></div>
 </body>
 </rml>)RML";
 
@@ -354,6 +468,109 @@ void layout_surface_element(Runner& r, LiveSurface& s) {
         img->SetProperty("width", std::to_string(s.w) + "px");
         img->SetProperty("height", std::to_string(s.h) + "px");
     }
+}
+
+// --demo: lay out a surface element into its assigned screen corner and apply
+// the inward-angled per-corner 3D transform. Each panel is sized to ~its corner
+// quadrant and positioned hard into that corner so its OUTER edges recede toward
+// the centre (rotateX/rotateY per kCorners). The client buffer is sampled into
+// the <img> exactly as layout_surface_element does; only the box + transform
+// differ. Built lazily once the element exists (texture imported).
+// Compute (deterministically, without needing the texture imported yet) the
+// corner panel's screen box: ~its quadrant minus a gutter + HUD clearance, hard
+// into its corner. Sets s.x/s.y/s.w/s.h. Safe to call at map time so the log +
+// early positioning are accurate before the first buffer import.
+void compute_corner_box(Runner& r, LiveSurface& s) {
+    if (s.corner < 0 || s.corner > 3) {
+        return;
+    }
+    const CornerSpec& c = kCorners[s.corner];
+    // A small inset so the panels don't bleed off the bezel and the angled outer
+    // edges stay on-screen. Each panel ~ its quadrant minus the gutter.
+    const int gutter = 28;
+    const int hud_pad = 56; // keep panels clear of the centered HUD square
+    const int pw = r.out_w / 2 - gutter - hud_pad;
+    const int ph = r.out_h / 2 - gutter - hud_pad;
+    s.w = pw > 64 ? pw : 64;
+    s.h = ph > 64 ? ph : 64;
+    s.x = c.right ? (r.out_w - s.w - gutter) : gutter;
+    s.y = c.bottom ? (r.out_h - s.h - gutter) : gutter;
+}
+
+void layout_corner_element(Runner& r, LiveSurface& s) {
+    if (r.doc == nullptr || s.live.tex == 0 || s.corner < 0 || s.corner > 3) {
+        return;
+    }
+    Rml::Element* stage = r.doc->GetElementById("stage");
+    if (stage == nullptr) {
+        return;
+    }
+    Rml::Element* win = r.doc->GetElementById(s.element_id);
+    if (win == nullptr) {
+        Rml::ElementPtr div = r.doc->CreateElement("div");
+        div->SetId(s.element_id);
+        div->SetClass("corner", true);
+        Rml::ElementPtr img = r.doc->CreateElement("img");
+        img->SetAttribute("src", s.live.uri);
+        div->AppendChild(std::move(img));
+        win = stage->AppendChild(std::move(div));
+    }
+    if (win == nullptr) {
+        return;
+    }
+    const CornerSpec& c = kCorners[s.corner];
+    // The corner box is derived in compute_corner_box (texture-independent), so it
+    // overrides any natural client size assigned in composite_frame: each panel is
+    // sized to ~its quadrant, NOT the client's own dimensions.
+    compute_corner_box(r, s);
+
+    win->SetProperty("position", "absolute");
+    win->SetProperty("left", std::to_string(s.x) + "px");
+    win->SetProperty("top", std::to_string(s.y) + "px");
+    win->SetProperty("width", std::to_string(s.w) + "px");
+    win->SetProperty("height", std::to_string(s.h) + "px");
+    // Inward tilt: perspective(...) rotateX(...) rotateY(...) about the panel's
+    // own 50%/50% origin. The outer edges recede; the panel faces the centre.
+    char xform[160];
+    std::snprintf(xform, sizeof(xform), "perspective(1100px) rotateX(%.1fdeg) rotateY(%.1fdeg)",
+                  c.rot_x, c.rot_y);
+    win->SetProperty("transform", xform);
+    if (Rml::Element* img = win->GetFirstChild()) {
+        img->SetProperty("width", std::to_string(s.w) + "px");
+        img->SetProperty("height", std::to_string(s.h) + "px");
+    }
+}
+
+// --demo: claim the next free corner slot for a connecting client. firefox is
+// steered to its designated corner; foot fills the others in order. Returns the
+// slot index (0..3) or -1 if all four are taken (extra clients fall back to the
+// plain centered toplevel layout). Deterministic by slot order.
+constexpr int kFirefoxCorner = 0; // top-left gets firefox; foot takes 1,2,3
+auto claim_corner(Runner& r, bool is_firefox) -> int {
+    if (is_firefox) {
+        if (!r.corner_taken[kFirefoxCorner]) {
+            r.corner_taken[kFirefoxCorner] = true;
+            return kFirefoxCorner;
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (i == kFirefoxCorner && !is_firefox) {
+            continue; // reserve the firefox corner for firefox until it's clearly absent
+        }
+        if (!r.corner_taken[i]) {
+            r.corner_taken[i] = true;
+            return i;
+        }
+    }
+    // All preferred slots taken — fall back to ANY free slot (e.g. firefox never
+    // connected and a 4th foot wants the reserved corner).
+    for (int i = 0; i < 4; ++i) {
+        if (!r.corner_taken[i]) {
+            r.corner_taken[i] = true;
+            return i;
+        }
+    }
+    return -1;
 }
 
 // Re-import every mapped surface's current buffer (zero re-import when unchanged)
@@ -395,7 +612,15 @@ auto composite_frame(Runner& r, bool force) -> double {
                      s.live.tex, s.live.reimports);
             }
         }
-        layout_surface_element(r, s);
+        // --demo corner panels keep their corner box + inward tilt; everything
+        // else (plain --run, wallpaper) uses the centered/stage layout. The
+        // corner element overrides w/h to its quadrant, so DON'T let the natural
+        // size above clobber it — layout_corner_element re-derives the box.
+        if (r.demo && s.corner >= 0) {
+            layout_corner_element(r, s);
+        } else {
+            layout_surface_element(r, s);
+        }
     }
     wlr_buffer* presented = r.present.render(r.ctx);
     if (cur) {
@@ -450,6 +675,68 @@ void send_frame_done_to_clients(Runner& r) {
                 ++w->r->frame_done_sends;
             },
             &wd);
+    }
+}
+
+// ---- --demo: live FPS HUD + per-5s min/max FPS log --------------------------
+//
+// Compositor FPS == output frames presented per second (on_frame ticks), NOT
+// client commits. Every output frame bumps demo_frames; ~once a second we sample
+// the rate (frames since the last sample / elapsed), push it onto the HUD text
+// element, and fold it into the current 5s min/max bucket. When a 5s bucket
+// closes we write one line to the dedicated fps log (fflush + fsync per line so
+// it survives a reboot mid-video). Called from on_frame; a no-op outside --demo.
+void demo_fps_tick(Runner& r) {
+    if (!r.demo) {
+        return;
+    }
+    ++r.demo_frames;
+    const double t = spike::now_sec();
+    const double dt = t - r.fps_last_sample;
+    if (dt < 1.0) {
+        return; // sample the rate ~1/sec, not every frame
+    }
+    const long dframes = r.demo_frames - r.fps_last_frames;
+    const double fps = dt > 0 ? static_cast<double>(dframes) / dt : 0.0;
+    r.last_fps = fps;
+    r.fps_last_frames = r.demo_frames;
+    r.fps_last_sample = t;
+
+    // Update the HUD text (the <p class="big"> number). The cursor stays a wlr
+    // plane; this is RmlUi text, re-rendered through the normal dirty-gate.
+    if (r.hud_el != nullptr) {
+        char hud[32];
+        std::snprintf(hud, sizeof(hud), "%.1f", fps);
+        r.hud_el->SetInnerRML(hud);
+        r.dirty = true; // the HUD text changed -> render it this frame
+    }
+
+    // Fold this sample into the current 5s bucket.
+    if (!r.bucket_has) {
+        r.bucket_min = fps;
+        r.bucket_max = fps;
+        r.bucket_has = true;
+    } else {
+        r.bucket_min = std::min(r.bucket_min, fps);
+        r.bucket_max = std::max(r.bucket_max, fps);
+    }
+
+    // Close the 5s bucket and write a line.
+    if (t - r.bucket_start >= 5.0) {
+        const long bframes = r.demo_frames - r.bucket_frames0;
+        if (r.fps_log != nullptr) {
+            std::fprintf(r.fps_log, "[%.1f] 5s bucket: min=%.1f max=%.1f fps (frames=%ld)\n",
+                         t, r.bucket_has ? r.bucket_min : 0.0, r.bucket_has ? r.bucket_max : 0.0,
+                         bframes);
+            std::fflush(r.fps_log);
+            ::fsync(::fileno(r.fps_log));
+        }
+        slog("[fps-bucket] 5s: min=%.1f max=%.1f fps (frames=%ld) — written to %s",
+             r.bucket_has ? r.bucket_min : 0.0, r.bucket_has ? r.bucket_max : 0.0, bframes,
+             r.fps_log_path.c_str());
+        r.bucket_start = t;
+        r.bucket_frames0 = r.demo_frames;
+        r.bucket_has = false;
     }
 }
 
@@ -618,26 +905,67 @@ void focus_toplevel(Runner& r, wlr_surface* surface) {
          static_cast<void*>(surface), kb->base.name != nullptr ? kb->base.name : "?");
 }
 
+// True if this toplevel's app_id looks like the browser (so --demo steers it to
+// its designated corner). Vivaldi (Chromium) under Wayland reports an app_id like
+// "vivaldi-stable"; also match chromium/firefox so any browser lands right.
+auto toplevel_is_firefox(LiveSurface& s) -> bool {
+    if (s.xdg == nullptr || s.xdg->toplevel == nullptr || s.xdg->toplevel->app_id == nullptr) {
+        return false;
+    }
+    const std::string id = s.xdg->toplevel->app_id;
+    return id.find("vivaldi") != std::string::npos || id.find("Vivaldi") != std::string::npos ||
+           id.find("chromium") != std::string::npos || id.find("Chromium") != std::string::npos ||
+           id.find("firefox") != std::string::npos || id.find("Firefox") != std::string::npos ||
+           id.find("mozilla") != std::string::npos;
+}
+
 void on_xdg_map(Runner& r, LiveSurface& s) {
     s.mapped = true;
-    // Place the toplevel element centered on the stage, sized to its geometry.
     if (s.xdg != nullptr && s.xdg->toplevel != nullptr) {
         const wlr_box geo = s.xdg->geometry;
         s.w = geo.width > 0 ? geo.width : 800;
         s.h = geo.height > 0 ? geo.height : 600;
     }
-    s.x = (r.out_w - s.w) / 2;
-    s.y = (r.out_h - s.h) / 2;
     s.transform3d = true;
+    // --demo: assign this client the next free corner slot (deterministic order;
+    // firefox -> its designated corner, foot -> the rest) and lay it out angled
+    // inward. The plain --run path keeps the centered single-toplevel layout.
+    if (r.demo) {
+        const bool ff = toplevel_is_firefox(s);
+        s.corner = claim_corner(r, ff);
+        if (s.corner >= 0) {
+            // Compute the corner box now (texture-independent) so the log is
+            // accurate; layout_corner_element re-applies it + the tilt to the DOM
+            // element once the first buffer imports (it early-returns until then).
+            compute_corner_box(r, s);
+            layout_corner_element(r, s);
+            slog("CLIENT SURFACE MAP (--demo): %s '%s' -> CORNER SLOT %d (%s) box %dx%d at "
+                 "(%d,%d), inward tilt rotateX(%.1f) rotateY(%.1f)",
+                 ff ? "vivaldi" : "foot", s.element_id.c_str(), s.corner, kCorners[s.corner].name,
+                 s.w, s.h, s.x, s.y, kCorners[s.corner].rot_x, kCorners[s.corner].rot_y);
+        } else {
+            // No free corner (a 5th client): fall back to a centered panel.
+            s.x = (r.out_w - s.w) / 2;
+            s.y = (r.out_h - s.h) / 2;
+            slog("CLIENT SURFACE MAP (--demo): no free corner for '%s' -> centered fallback",
+                 s.element_id.c_str());
+        }
+    } else {
+        // Place the toplevel element centered on the stage, sized to its geometry.
+        s.x = (r.out_w - s.w) / 2;
+        s.y = (r.out_h - s.h) / 2;
+    }
     // Give the toplevel keyboard focus (robust helper — handles the case where
     // no keyboard device exists yet by deferring to new_keyboard).
     r.last_toplevel = s.surface;
     focus_toplevel(r, s.surface);
     r.dirty = true;
     r.any_surface_mapped = true;
-    slog("CLIENT SURFACE MAP: toplevel %dx%d at (%d,%d) -> added to scene as live surface "
-         "element '%s' (it WILL be composited as a live texture this frame)",
-         s.w, s.h, s.x, s.y, s.element_id.c_str());
+    if (!r.demo) {
+        slog("CLIENT SURFACE MAP: toplevel %dx%d at (%d,%d) -> added to scene as live surface "
+             "element '%s' (it WILL be composited as a live texture this frame)",
+             s.w, s.h, s.x, s.y, s.element_id.c_str());
+    }
 }
 
 // MIRRORS the shipped ext-xdg-shell: wire from the xdg_shell's `new_toplevel` /
@@ -667,6 +995,12 @@ void handle_new_toplevel(Runner& r, wlr_xdg_toplevel* toplevel) {
         }
         if (r.last_toplevel == s->surface) {
             r.last_toplevel = nullptr;
+        }
+        // --demo: release this client's corner slot so it frees cleanly for a
+        // re-map (multiple clients now — slot bookkeeping must drop on unmap).
+        if (r.demo && s->corner >= 0) {
+            r.corner_taken[s->corner] = false;
+            s->corner = -1;
         }
         slog("client surface UNMAP: toplevel element '%s'", s->element_id.c_str());
     });
@@ -754,6 +1088,11 @@ void handle_new_layer(Runner& r, wlr_layer_surface_v1* layer) {
 void on_frame(Runner& r) {
     const double dt = composite_frame(r, /*force=*/false);
     ++r.commits;
+    // --demo: live compositor-FPS HUD + per-5s min/max FPS log (no-op in --run).
+    // Done first so the HUD text update sets r.dirty before the dirty-gate decides
+    // render-vs-skip below (the HUD must advance ~1/sec even on an otherwise idle
+    // scene). The output present already happened this turn; the HUD lands next.
+    demo_fps_tick(r);
     // Heartbeat (criterion B): prove the present/commit loop is alive even on a
     // static scene. First few commits are logged individually (catches an early
     // freeze); after that, once a second via the [perf] line below.
@@ -1187,13 +1526,51 @@ void handle_new_output(Runner& r, wlr_output* out) {
     r.present_node = wlr_scene_buffer_create(&r.scene->tree, nullptr);
     r.present.scene_buffer = r.present_node;
     r.ctx = Rml::CreateContext("run", Rml::Vector2i(r.out_w, r.out_h), r.gl.render);
-    r.doc = r.ctx->LoadDocumentFromMemory(kRunRml);
+    // --demo loads the curated 4-corner document (deeper perspective + the FPS
+    // HUD square); plain --run keeps the single-stage kRunRml. The corner panels
+    // get their per-corner inward tilt at map time (layout_corner_element); here
+    // we only center the HUD and grab its live-FPS text element.
+    r.doc = r.ctx->LoadDocumentFromMemory(r.demo ? kDemoRml : kRunRml);
     if (r.doc != nullptr) {
         r.doc->Show();
     }
+    if (r.demo && r.doc != nullptr) {
+        if (Rml::Element* hud = r.doc->GetElementById("hud")) {
+            // Center the HUD square on the output so it is readable and NOT hidden
+            // behind the corner windows (the corners are inset into the quadrants;
+            // the centre is clear). Position it in absolute output pixels.
+            const int hud_w = 220, hud_h = 84;
+            hud->SetProperty("left", std::to_string((r.out_w - hud_w) / 2) + "px");
+            hud->SetProperty("top", std::to_string((r.out_h - hud_h) / 2) + "px");
+            // The <p class="big"> holds the live FPS number; cache it for updates.
+            for (int i = 0; i < hud->GetNumChildren(); ++i) {
+                Rml::Element* child = hud->GetChild(i);
+                if (child != nullptr && child->IsClassSet("big")) {
+                    r.hud_el = child;
+                    break;
+                }
+            }
+            slog("--demo: FPS HUD centered at output centre (%dx%d square), hud_el=%p",
+                 hud_w, hud_h, static_cast<void*>(r.hud_el));
+        }
+        // Open the dedicated per-5s min/max FPS log (separate from the diagnostic
+        // log). fps_log_open picks $UNBOX_SPIKE_FPS_LOG else $HOME/rml-spike-fps.log.
+        r.fps_log = fps_log_open(r.fps_log_path);
+        if (r.fps_log != nullptr) {
+            slog("--demo: per-5s min/max FPS log open at '%s'", r.fps_log_path.c_str());
+        } else {
+            slog("--demo: WARNING could not open FPS log at '%s' — FPS still shown on the HUD",
+                 r.fps_log_path.c_str());
+        }
+        const double t = spike::now_sec();
+        r.fps_last_sample = t;
+        r.bucket_start = t;
+        r.bucket_frames0 = 0;
+    }
     r.gl.restore_current();
-    slog("present target init=%d dmabuf=%d; RmlUi document=%s; background+marker rects placed",
-         present_ok, r.present.dmabuf, r.doc != nullptr ? "loaded" : "FAILED");
+    slog("present target init=%d dmabuf=%d; RmlUi document=%s (%s); background+marker rects placed",
+         present_ok, r.present.dmabuf, r.doc != nullptr ? "loaded" : "FAILED",
+         r.demo ? "--demo 4-corner + HUD" : "--run single-stage");
 
     r.frame_l.connect(out->events.frame, [&r](void*) { on_frame(r); });
     wlr_output_schedule_frame(out);
@@ -1222,13 +1599,15 @@ void on_client_created(wl_listener* l, void* data) {
 
 } // namespace
 
-auto run_real_seat(const char* startup_cmd) -> int {
+auto run_real_seat(const char* startup_cmd, bool demo) -> int {
     log_open();
     wlr_log_init(WLR_INFO, nullptr);
-    slog("=== rml-compositing-spike --run START (persistent log: %s) ===", g_log_path.c_str());
+    slog("=== rml-compositing-spike --%s START (persistent log: %s) ===",
+         demo ? "demo" : "run", g_log_path.c_str());
     slog("env: WLR_BACKENDS=%s WLR_RENDERER=%s", getenv("WLR_BACKENDS") ? getenv("WLR_BACKENDS") : "(auto)",
          getenv("WLR_RENDERER") ? getenv("WLR_RENDERER") : "(auto)");
     Runner r;
+    r.demo = demo; // the curated 4-window perf-load scenario; plain --run leaves it false
     g_runner = &r;
 
     r.display = wl_display_create();
@@ -1282,7 +1661,10 @@ auto run_real_seat(const char* startup_cmd) -> int {
     // escapes). Pressing `P` re-arms it to the FULL interval (see handle_escape_
     // keys) — so keeping the session alive past 15s REQUIRES periodic P presses,
     // which doubles as the real-seat keyboard-input liveness test.
-    int timeout_s = 15;
+    // Default 15s for plain --run; 120s for --demo (still a backstop, but long
+    // enough to play an HD video and watch the FPS HUD/log). UNBOX_SPIKE_TIMEOUT
+    // overrides either (0 = disabled).
+    int timeout_s = demo ? 120 : 15;
     if (const char* env = getenv("UNBOX_SPIKE_TIMEOUT")) {
         timeout_s = std::atoi(env);
     }
@@ -1373,22 +1755,84 @@ auto run_real_seat(const char* startup_cmd) -> int {
     }
     slog("backend started; up on WAYLAND_DISPLAY=%s", socket);
 
-    if (startup_cmd != nullptr && startup_cmd[0] != '\0') {
+    // Spawn a child running `cmd` via /bin/sh, with WAYLAND_DISPLAY exported and
+    // optionally an extra env var (KEY=VALUE) set in the child (firefox needs
+    // MOZ_ENABLE_WAYLAND=1). `label` is logged. Returns the pid (>0) or -1.
+    auto spawn_client = [&](const char* cmd, const char* extra_env, const char* label) -> pid_t {
         const pid_t pid = fork();
         if (pid == 0) {
             setenv("WAYLAND_DISPLAY", socket, 1);
-            execl("/bin/sh", "/bin/sh", "-c", startup_cmd, static_cast<char*>(nullptr));
-            // Only reached if exec failed.
-            std::fprintf(stderr, "[run] exec of client failed: %s\n", startup_cmd);
+            if (extra_env != nullptr && extra_env[0] != '\0') {
+                // extra_env is "KEY=VALUE"; split once on '='.
+                const char* eq = std::strchr(extra_env, '=');
+                if (eq != nullptr) {
+                    const std::string key(extra_env, eq);
+                    setenv(key.c_str(), eq + 1, 1);
+                }
+            }
+            execl("/bin/sh", "/bin/sh", "-c", cmd, static_cast<char*>(nullptr));
+            std::fprintf(stderr, "[run] exec of client failed: %s\n", cmd);
             _exit(127);
         }
         if (pid > 0) {
-            slog("client SPAWN: pid=%d cmd='%s' (watch for a 'client surface MAP' line; if it "
-                 "never comes, the client could not connect/render)",
-                 static_cast<int>(pid), startup_cmd);
+            slog("client SPAWN: pid=%d %s cmd='%s'%s%s (watch for a 'CLIENT SURFACE MAP' line)",
+                 static_cast<int>(pid), label, cmd, extra_env != nullptr ? " env=" : "",
+                 extra_env != nullptr ? extra_env : "");
         } else {
-            slog("WARNING: fork() failed; no client spawned");
+            slog("WARNING: fork() failed; no client spawned for %s", label);
         }
+        return pid;
+    };
+
+    if (r.demo) {
+        // The curated perf load: 3x foot + 1x firefox, one per inward-angled
+        // corner. firefox is steered to its designated corner at map time
+        // (claim_corner). If firefox is not installed / cannot connect, the
+        // NO-CLIENT/corner bookkeeping degrades gracefully — the terminals still
+        // fill their corners — and we log a loud warning here AND from the
+        // watchdog. We probe for the firefox binary first so the warning is loud
+        // even before any connection attempt.
+        slog("--demo: spawning the curated 4-window perf load (3x foot + 1x vivaldi), one per "
+             "inward-angled corner. HD-video-friendly: 120s default dead-man, FPS HUD + 5s "
+             "min/max fps log.");
+        spawn_client("foot", nullptr, "[foot 1/3]");
+        spawn_client("foot", nullptr, "[foot 2/3]");
+        spawn_client("foot", nullptr, "[foot 3/3]");
+        // vivaldi (Chromium): forced onto Wayland via --ozone-platform=wayland.
+        // Probe PATH for the binary (vivaldi-stable / vivaldi / vivaldi-snapshot)
+        // so a missing browser is a loud warning, not a silently-empty corner.
+        const char* vivaldi_bin = nullptr;
+        if (const char* path = getenv("PATH"); path != nullptr) {
+            static const char* const kNames[] = {"vivaldi-stable", "vivaldi", "vivaldi-snapshot"};
+            std::string p = path, dir;
+            std::size_t i = 0;
+            while (i <= p.size() && vivaldi_bin == nullptr) {
+                if (i == p.size() || p[i] == ':') {
+                    for (const char* name : kNames) {
+                        if (!dir.empty() && ::access((dir + "/" + name).c_str(), X_OK) == 0) {
+                            vivaldi_bin = name;
+                            break;
+                        }
+                    }
+                    dir.clear();
+                } else {
+                    dir.push_back(p[i]);
+                }
+                ++i;
+            }
+        }
+        if (vivaldi_bin != nullptr) {
+            const std::string cmd =
+                std::string(vivaldi_bin) + " --ozone-platform=wayland --ozone-platform-hint=auto";
+            spawn_client(cmd.c_str(), nullptr, "[vivaldi 1/1, Wayland]");
+        } else {
+            slog("*** WARNING: vivaldi NOT found on PATH (tried vivaldi-stable/vivaldi/"
+                 "vivaldi-snapshot) — the browser corner (slot %d, %s) will stay empty. "
+                 "Continuing with the 3 foot terminals. ***",
+                 kFirefoxCorner, kCorners[kFirefoxCorner].name);
+        }
+    } else if (startup_cmd != nullptr && startup_cmd[0] != '\0') {
+        spawn_client(startup_cmd, nullptr, "[--run client]");
     } else {
         slog("no startup command — connect your own client to WAYLAND_DISPLAY=%s", socket);
     }
@@ -1493,7 +1937,13 @@ auto run_real_seat(const char* startup_cmd) -> int {
         wl_event_source_remove(r.sigterm_src);
     }
     wl_display_destroy(r.display);
-    slog("=== rml-compositing-spike --run EXIT 0 (VT restored) ===");
+    if (r.fps_log != nullptr) {
+        std::fflush(r.fps_log);
+        ::fsync(::fileno(r.fps_log));
+        std::fclose(r.fps_log);
+        r.fps_log = nullptr;
+    }
+    slog("=== rml-compositing-spike --%s EXIT 0 (VT restored) ===", demo ? "demo" : "run");
     log_close();
     return 0;
 }
