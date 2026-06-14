@@ -119,6 +119,17 @@ struct GlBridge {
     PFNEGLCLIENTWAITSYNCKHRPROC wait_sync = nullptr;
     PFNEGLDESTROYSYNCKHRPROC destroy_sync = nullptr;
 
+    // GPU timer queries (EXT_disjoint_timer_query) — Stage-0 perf instrumentation.
+    // Used to measure the REAL GPU cost of ctx->Render() without a glFinish stall
+    // (results read back a frame late, non-blocking). nullptr/false when absent.
+    bool timer_ok = false;
+    PFNGLGENQUERIESEXTPROC gen_queries = nullptr;
+    PFNGLDELETEQUERIESEXTPROC delete_queries = nullptr;
+    PFNGLBEGINQUERYEXTPROC begin_query = nullptr;
+    PFNGLENDQUERYEXTPROC end_query = nullptr;
+    PFNGLGETQUERYOBJECTUIVEXTPROC get_query_uiv = nullptr;
+    PFNGLGETQUERYOBJECTUI64VEXTPROC get_query_ui64v = nullptr;
+
     auto make_current() -> bool {
         saved_ctx = eglGetCurrentContext();
         saved_draw = eglGetCurrentSurface(EGL_DRAW);
@@ -177,6 +188,23 @@ struct GlBridge {
         fence_ok = exts != nullptr && std::strstr(exts, "EGL_KHR_fence_sync") != nullptr &&
                    create_sync != nullptr && wait_sync != nullptr && destroy_sync != nullptr;
 
+        gen_queries =
+            reinterpret_cast<PFNGLGENQUERIESEXTPROC>(eglGetProcAddress("glGenQueriesEXT"));
+        delete_queries =
+            reinterpret_cast<PFNGLDELETEQUERIESEXTPROC>(eglGetProcAddress("glDeleteQueriesEXT"));
+        begin_query =
+            reinterpret_cast<PFNGLBEGINQUERYEXTPROC>(eglGetProcAddress("glBeginQueryEXT"));
+        end_query = reinterpret_cast<PFNGLENDQUERYEXTPROC>(eglGetProcAddress("glEndQueryEXT"));
+        get_query_uiv = reinterpret_cast<PFNGLGETQUERYOBJECTUIVEXTPROC>(
+            eglGetProcAddress("glGetQueryObjectuivEXT"));
+        get_query_ui64v = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(
+            eglGetProcAddress("glGetQueryObjectui64vEXT"));
+        const char* gl_exts = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+        timer_ok = gl_exts != nullptr &&
+                   std::strstr(gl_exts, "GL_EXT_disjoint_timer_query") != nullptr &&
+                   gen_queries != nullptr && delete_queries != nullptr && begin_query != nullptr &&
+                   end_query != nullptr && get_query_uiv != nullptr && get_query_ui64v != nullptr;
+
         if (!RmlGL3::Initialize(nullptr)) {
             restore_current();
             return false;
@@ -198,8 +226,8 @@ struct GlBridge {
         }
         restore_current();
         ok = true;
-        std::fprintf(stderr, "[spike] GL bridge up (dmabuf_import=%d fence=%d)\n", dmabuf_ok,
-                     fence_ok);
+        std::fprintf(stderr, "[spike] GL bridge up (dmabuf_import=%d fence=%d gpu_timer=%d)\n",
+                     dmabuf_ok, fence_ok, timer_ok);
         return true;
     }
 
@@ -384,6 +412,18 @@ struct LiveTexture {
 };
 
 // --- The RmlUi-FBO -> wlr_buffer present target (criterion 7) -----------------
+// Stage-0 per-frame budget breakdown (milliseconds). CPU phases are wall-clock
+// around the GL calls (the submit cost, not the GPU work); `gpu_ms` is the REAL
+// GPU time of ctx->Render() from a timer query, read back a frame late so it
+// never stalls the pipeline (-1 until the first result lands / if unsupported).
+struct RenderTimings {
+    double clear_ms = 0.0;
+    double update_ms = 0.0;
+    double render_ms = 0.0; // CPU submit time of BeginFrame+Render+EndFrame
+    double present_ms = 0.0;
+    double gpu_ms = -1.0;
+};
+
 struct PresentTarget {
     GlBridge* gl = nullptr;
     wlr_allocator* allocator = nullptr;
@@ -394,6 +434,14 @@ struct PresentTarget {
     GLuint shm_tex = 0;
     wlr_swapchain* swapchain = nullptr;
     std::unordered_map<wlr_buffer*, std::pair<EGLImageKHR, GLuint>> slot_gl;
+
+    // GPU timer-query ring (2-deep): begin/end around ctx->Render() each frame,
+    // read the OTHER slot's result non-blocking so the answer is one frame late
+    // but never serializes the GPU. last_gpu_ms holds the most recent reading.
+    GLuint gpu_q[2] = {0, 0};
+    bool gpu_q_active[2] = {false, false};
+    int gpu_q_write = 0;
+    double last_gpu_ms = -1.0;
 
     DataBuffer* shm = nullptr;
     std::vector<std::uint8_t> readback;
@@ -406,6 +454,9 @@ struct PresentTarget {
         width = w;
         height = h;
         glGenFramebuffers(1, &fbo);
+        if (gl->timer_ok) {
+            gl->gen_queries(2, gpu_q);
+        }
         if (gl->dmabuf_ok && (allocator->buffer_caps & WLR_BUFFER_CAP_DMABUF) != 0) {
             wlr_drm_format fmt{};
             fmt.format = kArgb8888;
@@ -437,7 +488,7 @@ struct PresentTarget {
         return true;
     }
 
-    auto render(Rml::Context* ctx) -> wlr_buffer* {
+    auto render(Rml::Context* ctx, RenderTimings* tm = nullptr) -> wlr_buffer* {
         GLuint target = fbo;
         wlr_buffer* dmabuf_target = nullptr;
         if (dmabuf) {
@@ -491,16 +542,49 @@ struct PresentTarget {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
 
+        const double t_clear0 = now_sec();
         gl->render->SetViewport(width, height);
         gl->render->SetOutputFramebuffer(target, /*flip_y=*/true);
         glBindFramebuffer(GL_FRAMEBUFFER, target);
         glClearColor(0.f, 0.f, 0.f, 0.f);
         glClear(GL_COLOR_BUFFER_BIT);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        const double t_update0 = now_sec();
         ctx->Update();
+
+        // Drain the previous frame's GPU timer (non-blocking) before opening a new
+        // one, then bracket the actual draw (BeginFrame..EndFrame == the fill).
+        if (gl->timer_ok) {
+            const int prev = gpu_q_write ^ 1;
+            if (gpu_q_active[prev]) {
+                GLuint avail = 0;
+                gl->get_query_uiv(gpu_q[prev], GL_QUERY_RESULT_AVAILABLE_EXT, &avail);
+                if (avail != 0) {
+                    GLuint64 ns = 0;
+                    gl->get_query_ui64v(gpu_q[prev], GL_QUERY_RESULT_EXT, &ns);
+                    last_gpu_ms = static_cast<double>(ns) / 1.0e6;
+                    gpu_q_active[prev] = false;
+                }
+            }
+            gl->begin_query(GL_TIME_ELAPSED_EXT, gpu_q[gpu_q_write]);
+        }
+        const double t_render0 = now_sec();
         gl->render->BeginFrame();
         ctx->Render();
         gl->render->EndFrame();
+        if (gl->timer_ok) {
+            gl->end_query(GL_TIME_ELAPSED_EXT);
+            gpu_q_active[gpu_q_write] = true;
+            gpu_q_write ^= 1;
+        }
+        const double t_present0 = now_sec();
+        if (tm != nullptr) {
+            tm->clear_ms = (t_update0 - t_clear0) * 1000.0;
+            tm->update_ms = (t_render0 - t_update0) * 1000.0;
+            tm->render_ms = (t_present0 - t_render0) * 1000.0;
+            tm->gpu_ms = last_gpu_ms;
+        }
 
         if (dmabuf) {
             gl->submit_sync();
@@ -508,6 +592,9 @@ struct PresentTarget {
                 wlr_scene_buffer_set_buffer(scene_buffer, dmabuf_target);
             }
             wlr_buffer_unlock(dmabuf_target);
+            if (tm != nullptr) {
+                tm->present_ms = (now_sec() - t_present0) * 1000.0;
+            }
             return dmabuf_target;
         }
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -522,6 +609,9 @@ struct PresentTarget {
         }
         if (scene_buffer != nullptr) {
             wlr_scene_buffer_set_buffer(scene_buffer, &shm->base);
+        }
+        if (tm != nullptr) {
+            tm->present_ms = (now_sec() - t_present0) * 1000.0;
         }
         return &shm->base;
     }
@@ -542,6 +632,9 @@ struct PresentTarget {
             }
         }
         slot_gl.clear();
+        if (gl != nullptr && gl->timer_ok && gpu_q[0] != 0) {
+            gl->delete_queries(2, gpu_q);
+        }
         if (shm_tex != 0) {
             glDeleteTextures(1, &shm_tex);
         }

@@ -327,6 +327,18 @@ struct Runner {
     int frames_skipped_idle = 0;
     double last_report = 0.0;
 
+    // Stage-0 per-phase budget accumulators (summed per rendered frame, averaged
+    // and reset in the ~1s [perf] report). `import` = client buffer re-import +
+    // element layout; the rest come from PresentTarget::render's RenderTimings.
+    // gpu_ms is summed only over frames that produced a timer-query result.
+    double sum_import_ms = 0.0;
+    double sum_clear_ms = 0.0;
+    double sum_update_ms = 0.0;
+    double sum_render_ms = 0.0;
+    double sum_present_ms = 0.0;
+    double sum_gpu_ms = 0.0;
+    int gpu_samples = 0;
+
     // Commit/present heartbeat (criterion B): a count of output commits so the
     // log shows the present loop is actually ticking even on a static scene.
     long commits = 0;
@@ -609,6 +621,7 @@ auto composite_frame(Runner& r, bool force) -> double {
     const double t0 = spike::now_sec();
 
     const bool cur = r.gl.make_current();
+    const double t_import0 = spike::now_sec();
     for (LiveSurface& s : r.surfaces) {
         if (!s.mapped || s.surface == nullptr) {
             continue;
@@ -646,12 +659,24 @@ auto composite_frame(Runner& r, bool force) -> double {
             layout_surface_element(r, s);
         }
     }
-    wlr_buffer* presented = r.present.render(r.ctx);
+    const double t_import_ms = (spike::now_sec() - t_import0) * 1000.0;
+    spike::RenderTimings tm;
+    wlr_buffer* presented = r.present.render(r.ctx, &tm);
     if (cur) {
         r.gl.restore_current();
     }
     if (presented != nullptr && r.present_node != nullptr) {
         wlr_scene_buffer_set_buffer(r.present_node, presented);
+    }
+
+    r.sum_import_ms += t_import_ms;
+    r.sum_clear_ms += tm.clear_ms;
+    r.sum_update_ms += tm.update_ms;
+    r.sum_render_ms += tm.render_ms;
+    r.sum_present_ms += tm.present_ms;
+    if (tm.gpu_ms >= 0.0) {
+        r.sum_gpu_ms += tm.gpu_ms;
+        ++r.gpu_samples;
     }
 
     const double dt_ms = (spike::now_sec() - t0) * 1000.0;
@@ -1276,6 +1301,24 @@ void on_frame(Runner& r) {
              "(~%.0f fps budget)",
              r.frames_rendered, r.frames_skipped_idle, r.commits, avg, p95, v.back(),
              avg > 0 ? 1000.0 / avg : 0.0);
+        // Stage-0 budget split (per-rendered-frame averages over this window).
+        // CPU phases are submit wall-clock; gpu= is the REAL GPU fill from a timer
+        // query (the number that tells us if we're fill-bound and damage limiting
+        // will pay off). 'n/a' if EXT_disjoint_timer_query is unavailable.
+        const std::size_t nf = v.size();
+        char gpu[24];
+        if (r.gpu_samples > 0) {
+            std::snprintf(gpu, sizeof(gpu), "%.2fms", r.sum_gpu_ms / r.gpu_samples);
+        } else {
+            std::snprintf(gpu, sizeof(gpu), "n/a");
+        }
+        slog("[perf-split] per-frame CPU: import=%.2f clear=%.2f update=%.2f render=%.2f "
+             "present=%.2f ms | GPU fill (ctx->Render)=%s",
+             r.sum_import_ms / nf, r.sum_clear_ms / nf, r.sum_update_ms / nf, r.sum_render_ms / nf,
+             r.sum_present_ms / nf, gpu);
+        r.sum_import_ms = r.sum_clear_ms = r.sum_update_ms = 0.0;
+        r.sum_render_ms = r.sum_present_ms = r.sum_gpu_ms = 0.0;
+        r.gpu_samples = 0;
         r.frame_ms.clear();
         r.last_report = t;
         (void)dt;
