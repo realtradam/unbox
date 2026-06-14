@@ -98,6 +98,12 @@ struct Server::Impl : detail::DisableSink {
     wlr_surface* test_last_client_surface = nullptr; // last surface with a buffer
     std::unique_ptr<SurfaceElement> test_surface_element; // built on demand by the probe
 
+    // ---- surface-element input-back test seam (kernel suite only) ----
+    // A minimal virtual keyboard added to the seat on demand (headless has no
+    // input), so SurfaceElement::focus_keyboard can deliver a wl_keyboard enter +
+    // a forwarded key. Owned here; finished/freed in shutdown() before the seat.
+    wlr_keyboard* test_keyboard = nullptr;
+
     // Ordered scene-tree z-bands (SceneLayer order). Created once over
     // scene->tree in stacking order so background < … < overlay. Extensions
     // attach nodes via Host::scene_layer(); the kernel owns them.

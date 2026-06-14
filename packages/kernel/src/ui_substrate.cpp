@@ -1,6 +1,7 @@
 #include "ui_substrate.hpp"
 
 #include "file_watcher.hpp"
+#include "input_core.hpp" // pure surface-element input-back geometry (place_child_box)
 #include "listener.hpp" // RAII wl_listener for the surface-element commit hook
 #include "rmlui_renderer_gl3.h"
 
@@ -27,6 +28,10 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2ext.h> // glEGLImageTargetTexture2DOES
 #include <GLES3/gl32.h>
+
+// BTN_LEFT for the surface-element input-back pointer-button forward. A pure
+// value header (input-event codes), not a wlroots/GL effect surface.
+#include <linux/input-event-codes.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -611,43 +616,74 @@ struct PreviewState {
     bool dmabuf = false;               // true once a dmabuf import succeeded
 };
 
-// ---- SurfaceElementState ----------------------------------------------------
+// ---- SurfaceElementState (a surface TREE) -----------------------------------
 //
-// A LIVE surface element: a client wl_surface's CURRENT committed buffer
-// imported zero-copy as a sampled GL texture in the RMLUi sibling context and
-// registered under an "unbox-surface://N" URI — the live sibling of
-// PreviewState. Ports spike `LiveTexture` (src/spike/spike_gl.hpp) into the real
-// substrate: the seq-gated re-import (§0d frozen-frame fix) + the double-buffered
-// wlr_buffer lock/unlock lifecycle (at most ONE buffer pinned). Re-import +
-// frame-done run on the sibling context inside tick_all (the caller makes it
-// current); the RAII commit Listener (kernel-private, never crosses the
-// contract) marks the element dirty + asks the kernel to schedule a frame.
-// Lives in Substrate::Impl::surface_elements (stable addresses).
-struct SurfaceElementState {
-    Substrate::Impl* owner = nullptr;
-    int id = 0;
-    std::string uri;
+// A LIVE surface element: a client wl_surface ROOT + its subsurfaces + (if it is
+// an xdg surface) its xdg popups, each imported zero-copy as its OWN sampled GL
+// texture in the RMLUi sibling context and registered under its OWN
+// "unbox-surface://N" / "unbox-surface://N.K" URI — the live sibling of
+// PreviewState, generalised to a TREE (Wave 1b). Ports spike `LiveTexture`
+// (src/spike/spike_gl.hpp) + the per-LiveSurface subsurface/popup model
+// (rml_compositing_spike_run.cpp): the seq-gated re-import (§0d frozen-frame fix)
+// + the double-buffered wlr_buffer lock/unlock lifecycle (at most ONE buffer
+// pinned PER NODE). Re-import + frame-done run on the sibling context inside
+// tick_all (the caller makes it current); the RAII commit Listener (kernel-
+// private, never crosses the contract) marks the element dirty + asks the kernel
+// to schedule a frame. Lives in Substrate::Impl::surface_elements (stable addrs).
 
-    wlr_surface* surface = nullptr; // BORROW; caller outlives the element (ui.hpp)
-    int width = 0;
+// One node of the surface tree: a single wl_surface's live import (root, a
+// subsurface, or a popup's surface). Its `surface` is a BORROW valid only while
+// the node exists in the tree — the substrate re-enumerates the live tree each
+// frame (adopt_surface_element) and drops a node the instant its surface stops
+// appearing in the walk, so it never holds a freed child surface across frames.
+struct SurfaceNode {
+    wlr_surface* surface = nullptr; // BORROW (see above)
+    std::string uri;                // this node's <img src> URI
+    int width = 0;                  // node surface natural px (tracks commits)
     int height = 0;
+    int sx = 0;                     // tree offset within the ROOT surface (px)
+    int sy = 0;
+    bool is_popup = false;          // popups are NOT parent-clipped (spike crit 4)
 
-    // The live import (ported from spike LiveTexture). `current` is the buffer we
+    // The live import (port of spike LiveTexture). `current` is the buffer we
     // hold LOCKED + have imported; `current_seq` its surface commit seq.
     wlr_buffer* current = nullptr;
     std::uint32_t current_seq = 0;
     bool have_seq = false;             // false until the first adopt()
     EGLImageKHR image = EGL_NO_IMAGE_KHR;
     GLuint tex = 0;
-    bool dmabuf = false;               // last import took the dmabuf path
-    int reimports = 0;                 // REAL re-imports (seq advances) — test probe
-    int frame_done_sends = 0;          // frame-done calls — test probe
 
-    // RAII commit hook: a client wl_surface.commit dirties this element + kicks
-    // the dirty-gate. Destruction (element drop) unsubscribes — never a bare
-    // wl_listener across the contract (.unbox/rules/listener-lifetime.md).
+    bool seen = false;                 // tree-walk mark (this frame) — GC sweep
+};
+
+struct SurfaceElementState {
+    Substrate::Impl* owner = nullptr;
+    int id = 0;
+
+    // The ROOT node. `root.surface` is the wl_surface passed to
+    // create_surface_element — a BORROW the caller outlives (ui.hpp). `root.uri`
+    // is the element's source_uri() (the single <img src> a consumer authors);
+    // child nodes get sibling URIs and the substrate places their <img> elements
+    // relative to the root's resolved box (parent-relative child placement).
+    SurfaceNode root;
+    // Per-subsurface / per-popup child nodes, in TREE (= composite) order. Each
+    // its own live texture + URI; placed at its tree offset relative to the root.
+    std::list<SurfaceNode> children;
+    int next_child_id = 0;             // numbers child URIs "unbox-surface://N.K"
+
+    bool dmabuf = false;               // last import (any node) took the dmabuf path
+    int reimports = 0;                 // REAL re-imports across ALL nodes — test probe
+    int frame_done_sends = 0;          // frame-done calls across ALL nodes — test probe
+
+    // RAII commit hook on the ROOT surface: a client commit dirties this element
+    // + kicks the dirty-gate (the whole tree is re-walked + re-imported next
+    // tick). Destruction (element drop) unsubscribes — never a bare wl_listener
+    // across the contract (.unbox/rules/listener-lifetime.md).
     Listener commit_l;
-    bool needs_reimport = true;        // a commit happened => re-adopt next tick
+    bool needs_reimport = true;        // a commit happened => re-walk + re-adopt next tick
+
+    // Convenience: the element's stable source_uri() (== root.uri).
+    [[nodiscard]] auto uri() const -> const std::string& { return root.uri; }
 };
 
 // ---- Substrate::Impl --------------------------------------------------------
@@ -656,6 +692,11 @@ struct Substrate::Impl {
     GlBridge gl;
     wlr_allocator* allocator = nullptr;
     wlr_renderer* renderer = nullptr;
+    // The kernel's seat — a BORROW (the seat is destroyed with the wl_display,
+    // AFTER the substrate, so it outlives every input-back call). Used ONLY by
+    // surface-element input-back (route_* forwarding a pick to the client via
+    // wlr_seat_pointer/touch/keyboard_notify_*). May be null (no seat / test).
+    wlr_seat* seat = nullptr;
     SubstrateDisableFn disable;
     // Ask the kernel to schedule an output frame (the dirty-gate kick for live
     // surface elements: a client commit, or the continuous frame-callback loop
@@ -699,12 +740,18 @@ struct Substrate::Impl {
     bool last_preview_dmabuf = false; // test probe: last import took the dmabuf path
     int resize_realloc_count = 0;     // test probe: # of set_size GL-target reallocs
 
-    // Live surface elements (RML compositing Wave 1): stable addresses
+    // Live surface elements (RML compositing Wave 1/1b): stable addresses
     // (SurfaceElementHandle borrows a SurfaceElementState*). next_surface_id
-    // numbers the "unbox-surface://N" URIs.
+    // numbers the "unbox-surface://N" URIs (root nodes).
     std::list<SurfaceElementState> surface_elements;
     int next_surface_id = 0;
     bool last_surface_element_dmabuf = false; // test probe: last import path
+
+    // The wl_surface that currently holds keyboard focus via a surface element
+    // (set by SurfaceElement::focus_keyboard, cleared when that element/its node
+    // is destroyed). A BORROW used only to clear focus on destroy; never deref'd
+    // for routing. Focus POLICY is a later wave — this is only the mechanism.
+    wlr_surface* keyboard_focus = nullptr;
 
     // Pointer implicit grab: the consumer of the first button press owns the
     // whole press..release stream (standard seat behavior). `pointer_grab`
@@ -784,15 +831,55 @@ struct Substrate::Impl {
     bool import_snapshot(PreviewState& p);
     void destroy_preview(PreviewState* p);
 
-    // Surface elements (RML compositing Wave 1). adopt_surface_element re-imports
-    // `s`'s surface's CURRENT buffer if (and only if) the commit seq advanced
-    // (seq-gate); it manages the double-buffered wlr_buffer lock and registers
-    // the URI. Caller holds the sibling context current. Returns true if the
-    // sampled texture reflects the current buffer afterwards. destroy_surface_
-    // element drops the import (texture/EGLImage/held lock), the URI, and the
-    // element from the list.
-    bool adopt_surface_element(SurfaceElementState& s);
+    // Surface elements (RML compositing Wave 1/1b).
+    //
+    // adopt_node re-imports ONE node's surface CURRENT buffer iff its commit seq
+    // advanced (seq-gate); manages the double-buffered wlr_buffer lock + registers
+    // the node URI. Caller holds the sibling context current. Returns true if the
+    // node's sampled texture reflects its current buffer afterwards.
+    bool adopt_node(SurfaceElementState& el, SurfaceNode& node);
+    // Re-walk `el`'s live surface TREE (root + subsurfaces + xdg popups): create
+    // child nodes for newly-appeared surfaces, drop nodes whose surface vanished,
+    // refresh each node's tree offset, and re-import every node (seq-gated). This
+    // is the Wave-1b tree generalisation of adopt: composite order = tree order,
+    // popups NOT parent-clipped. Caller holds the sibling context current.
+    bool adopt_surface_element(SurfaceElementState& el);
+    // Drop ONE node's GL import (texture/EGLImage/held lock) + URI registration.
+    // Caller holds the sibling context current for the GL/URI part.
+    void destroy_node(SurfaceNode& node);
+    // Drop the whole element: every node's import + the root commit listener, and
+    // clear keyboard focus if it pointed at any of this element's surfaces.
     void destroy_surface_element(SurfaceElementState* s);
+    // Place the per-node child <img> elements in EVERY ui surface document that
+    // hosts this element's root <img src=root.uri>, at each child's tree offset
+    // relative to the root's resolved box (parent-relative placement). Removes a
+    // child <img> whose node is gone. Pure DOM glue (no GL); called from tick_all
+    // after the tree was re-walked. Idempotent per frame.
+    void layout_surface_element_children(SurfaceElementState& el);
+
+    // ---- surface-element input-back ----
+    // Resolve a hovered RmlUi element to the surface-element NODE it samples (its
+    // <img src> is a node URI), walking up parents. Returns null if the pick is
+    // not over a surface element (then normal ui routing / data-events apply).
+    // `out_el` receives the owning element. Borrows valid only during the call.
+    auto node_for_hovered(Rml::Element* hovered, SurfaceElementState*& out_el) -> SurfaceNode*;
+    // Forward a transform-aware pick on `surf`'s context at surface-local doc
+    // coords (lx-s.x, ly-s.y) to the client surface under it, via the seat, at
+    // surface-LOCAL px (Element::Project through the node <img>'s real transform,
+    // then box->surface scale — the spike route_point fix). Returns true if a
+    // client surface was found + entered (so the caller knows a client was hit).
+    // `pressed`/`is_button` drive the pointer button + implicit-grab semantics.
+    enum class PointerKind { motion, button_down, button_up };
+    auto forward_pointer_to_client(Surface& surf, double lx, double ly, PointerKind kind,
+                                   std::uint32_t button, std::uint32_t time_msec) -> bool;
+    auto forward_touch_to_client(Surface& surf, double lx, double ly, std::int32_t id,
+                                 bool down, std::uint32_t time_msec) -> bool;
+    // Keyboard-focus PRIMITIVE (mechanism only — focus POLICY is a later wave).
+    // Give `el`'s ROOT client surface seat keyboard focus + send the enter with
+    // the active keyboard's pressed keys + modifiers, so the kernel's existing
+    // key passthrough (input.cpp) routes subsequent keys to it. Idempotent.
+    // Clearing focus on element/node destroy is handled in destroy_*.
+    void focus_keyboard(SurfaceElementState& el);
 
     // Forward a synthesized pointer event into a surface's Rml context. Returns
     // whether RmlUi (or our hit-test) treats it as consumed.
@@ -1443,7 +1530,7 @@ void Substrate::Impl::destroy_preview(PreviewState* p) {
 
 // ---- Surface elements: seq-gated live import (port of spike LiveTexture) -----
 //
-// The client surface's CURRENT committed buffer is `surface->buffer` — a
+// Each NODE's CURRENT committed buffer is `node.surface->buffer` — a
 // wlr_client_buffer (the renderer-side import; wlroots has ALREADY released the
 // client's underlying pool wl_buffer, so reading/locking it can never starve the
 // client). We re-import it ONLY when the surface commit SEQUENCE advances
@@ -1452,47 +1539,47 @@ void Substrate::Impl::destroy_preview(PreviewState* p) {
 // re-commits the SAME wlr_buffer pointer with NEW contents and a bumped seq =>
 // re-import (the §0d frozen-frame fix). The buffer we import is LOCKED for the
 // import+sample lifetime and the PREVIOUS one unlocked once the new import is
-// live — double-buffered, at most one buffer pinned, balanced in EVERY case incl.
-// the pooled same-pointer re-commit (prev == buf: net +1 then -1).
+// live — double-buffered, at most one buffer pinned PER NODE, balanced in EVERY
+// case incl. the pooled same-pointer re-commit (prev == buf: net +1 then -1).
 
-bool Substrate::Impl::adopt_surface_element(SurfaceElementState& s) {
-    if (s.surface == nullptr) {
-        return s.tex != 0;
+bool Substrate::Impl::adopt_node(SurfaceElementState& el, SurfaceNode& node) {
+    if (node.surface == nullptr) {
+        return node.tex != 0;
     }
     wlr_buffer* buf = nullptr;
-    if (s.surface->buffer != nullptr) {
-        buf = &s.surface->buffer->base;
+    if (node.surface->buffer != nullptr) {
+        buf = &node.surface->buffer->base;
     }
     if (buf == nullptr) {
         // No buffer committed yet (e.g. a 0x0 configure-ack commit) — nothing to
         // import; keep any prior texture. Not a failure.
-        return s.tex != 0;
+        return node.tex != 0;
     }
-    const std::uint32_t seq = s.surface->current.seq;
-    if (!surface_element_needs_reimport(s.have_seq, s.current_seq, seq, buf == s.current,
-                                        s.tex != 0)) {
+    const std::uint32_t seq = node.surface->current.seq;
+    if (!surface_element_needs_reimport(node.have_seq, node.current_seq, seq, buf == node.current,
+                                        node.tex != 0)) {
         return true; // truly unchanged surface state: zero re-import, zero copy
     }
 
     // Lock the buffer we are about to sample (its dmabuf FDs / shm storage must
     // stay valid for the whole import+sample); release the PREVIOUS one once the
-    // new import is live (double-buffered: at most one buffer pinned).
-    wlr_buffer* prev = s.current;
+    // new import is live (double-buffered: at most one buffer pinned per node).
+    wlr_buffer* prev = node.current;
     wlr_buffer_lock(buf);
 
     auto commit = [&](bool is_dmabuf) {
-        s.current = buf;
-        s.current_seq = seq;
-        s.have_seq = true;
-        s.dmabuf = is_dmabuf;
+        node.current = buf;
+        node.current_seq = seq;
+        node.have_seq = true;
+        el.dmabuf = is_dmabuf;
         last_surface_element_dmabuf = is_dmabuf;
-        ++s.reimports;
+        ++el.reimports;
         if (prev != nullptr) {
             wlr_buffer_unlock(prev); // prev may == buf (pooled re-commit): net +1/-1
         }
         if (gl.render_iface) {
-            gl.render_iface->register_preview_texture(s.uri, s.tex,
-                                                      Rml::Vector2i(s.width, s.height));
+            gl.render_iface->register_preview_texture(node.uri, node.tex,
+                                                      Rml::Vector2i(node.width, node.height));
         }
     };
 
@@ -1513,24 +1600,24 @@ bool Substrate::Impl::adopt_surface_element(SurfaceElementState& s) {
             gl.egl_create_image(gl.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, ia);
         if (img != EGL_NO_IMAGE_KHR) {
             // Drop the old GL objects, build the new texture from the EGLImage.
-            if (s.tex != 0) {
-                glDeleteTextures(1, &s.tex);
-                s.tex = 0;
+            if (node.tex != 0) {
+                glDeleteTextures(1, &node.tex);
+                node.tex = 0;
             }
-            if (s.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
-                gl.egl_destroy_image(gl.egl_display, s.image);
+            if (node.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+                gl.egl_destroy_image(gl.egl_display, node.image);
             }
-            glGenTextures(1, &s.tex);
-            glBindTexture(GL_TEXTURE_2D, s.tex);
+            glGenTextures(1, &node.tex);
+            glBindTexture(GL_TEXTURE_2D, node.tex);
             gl.gl_image_target_texture(GL_TEXTURE_2D, static_cast<GLeglImageOES>(img));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glBindTexture(GL_TEXTURE_2D, 0);
-            s.image = img;
-            s.width = attribs.width;
-            s.height = attribs.height;
+            node.image = img;
+            node.width = attribs.width;
+            node.height = attribs.height;
             commit(true);
             return true;
         }
@@ -1544,18 +1631,18 @@ bool Substrate::Impl::adopt_surface_element(SurfaceElementState& s) {
     if (!wlr_buffer_begin_data_ptr_access(buf, WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &fmt,
                                           &stride)) {
         wlr_buffer_unlock(buf); // import failed: drop the lock we just took
-        return s.tex != 0;
+        return node.tex != 0;
     }
-    if (s.tex != 0) {
-        glDeleteTextures(1, &s.tex);
-        s.tex = 0;
+    if (node.tex != 0) {
+        glDeleteTextures(1, &node.tex);
+        node.tex = 0;
     }
-    if (s.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
-        gl.egl_destroy_image(gl.egl_display, s.image);
-        s.image = EGL_NO_IMAGE_KHR;
+    if (node.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+        gl.egl_destroy_image(gl.egl_display, node.image);
+        node.image = EGL_NO_IMAGE_KHR;
     }
-    glGenTextures(1, &s.tex);
-    glBindTexture(GL_TEXTURE_2D, s.tex);
+    glGenTextures(1, &node.tex);
+    glBindTexture(GL_TEXTURE_2D, node.tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(stride / 4));
@@ -1568,45 +1655,429 @@ bool Substrate::Impl::adopt_surface_element(SurfaceElementState& s) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glBindTexture(GL_TEXTURE_2D, 0);
     wlr_buffer_end_data_ptr_access(buf);
-    s.width = buf->width;
-    s.height = buf->height;
+    node.width = buf->width;
+    node.height = buf->height;
     commit(false);
     return true;
 }
 
+namespace {
+// Tree-walk scratch: collect every (surface, tree-offset, is_popup) under a
+// root, in tree (= composite) order, so adopt_surface_element can reconcile it
+// against the element's existing nodes. wlr_surface_for_each_surface visits the
+// surface + all subsurfaces root->leaves (z-order); xdg popups are walked
+// separately (each its own tree under the toplevel), exactly as the spike's
+// send_frame_done_to_clients walks them. The ROOT itself (sx=sy=0) is the FIRST
+// visited subsurface entry and is handled as el.root, so it is skipped here.
+struct TreeEntry {
+    wlr_surface* surface = nullptr;
+    int sx = 0;
+    int sy = 0;
+    bool is_popup = false;
+};
+struct TreeWalk {
+    wlr_surface* root = nullptr;
+    std::vector<TreeEntry>* out = nullptr;
+    bool popup_pass = false;
+    int popup_ox = 0; // popup tree offset within the root (toplevel coords)
+    int popup_oy = 0;
+};
+void tree_walk_cb(wlr_surface* surface, int sx, int sy, void* data) {
+    auto* w = static_cast<TreeWalk*>(data);
+    if (!w->popup_pass && surface == w->root) {
+        return; // the root is el.root, not a child node
+    }
+    w->out->push_back(TreeEntry{surface, w->popup_ox + sx, w->popup_oy + sy, w->popup_pass});
+}
+} // namespace
+
+// A stable DOM id for a child node's <img> in a hosting document: derived from
+// the node URI (unique per node, stable for the node's life), prefixed so it
+// never collides with author ids. The substrate creates/removes the child <img>
+// under this id; consumers do NOT author or address it (the element represents
+// the whole tree — ui.hpp). Defined here so destroy_surface_element +
+// layout_surface_element_children agree on the id.
+namespace {
+auto child_dom_id(const SurfaceElementState& /*el*/, const SurfaceNode& node) -> std::string {
+    // node.uri is "unbox-surface://N.K"; turn the scheme-y chars into id-safe
+    // ones so RmlUi's id lookup is well-formed.
+    std::string id = "unbox-se-child-";
+    for (char ch : node.uri) {
+        id.push_back((ch == ':' || ch == '/' || ch == '.') ? '-' : ch);
+    }
+    return id;
+}
+} // namespace
+
+bool Substrate::Impl::adopt_surface_element(SurfaceElementState& el) {
+    // 1) Re-import the ROOT node first (seq-gated).
+    bool any = adopt_node(el, el.root);
+
+    if (el.root.surface == nullptr) {
+        return any;
+    }
+
+    // 2) Walk the live tree: subsurfaces (any surface) + xdg popups (if the root
+    //    is an xdg surface). Collect entries in tree order, then reconcile.
+    std::vector<TreeEntry> entries;
+    TreeWalk walk;
+    walk.root = el.root.surface;
+    walk.out = &entries;
+    wlr_surface_for_each_surface(el.root.surface, tree_walk_cb, &walk);
+
+    if (wlr_xdg_surface* xdg = wlr_xdg_surface_try_from_wlr_surface(el.root.surface)) {
+        // Popups: each popup's surface (+ its own subsurfaces) at coords relative
+        // to the toplevel. wlr_xdg_surface_for_each_popup_surface gives the
+        // popup's surface-tree with sx/sy already in the parent xdg surface's
+        // coordinate space (== root surface space here). Popups are NOT parent-
+        // clipped — they become their own absolutely-placed child <img> (crit 4).
+        walk.popup_pass = true;
+        wlr_xdg_surface_for_each_popup_surface(xdg, tree_walk_cb, &walk);
+    }
+
+    // 3) Reconcile entries -> el.children (match by wlr_surface identity). Mark
+    //    every existing child unseen, walk entries (create/refresh), then sweep
+    //    unseen children (their surface vanished — drop the node + its import).
+    for (SurfaceNode& c : el.children) {
+        c.seen = false;
+    }
+    for (const TreeEntry& e : entries) {
+        SurfaceNode* node = nullptr;
+        for (SurfaceNode& c : el.children) {
+            if (c.surface == e.surface) {
+                node = &c;
+                break;
+            }
+        }
+        if (node == nullptr) {
+            el.children.emplace_back();
+            node = &el.children.back();
+            node->surface = e.surface;
+            node->uri = el.root.uri + "." + std::to_string(++el.next_child_id);
+        }
+        node->sx = e.sx;
+        node->sy = e.sy;
+        node->is_popup = e.is_popup;
+        node->seen = true;
+        any = adopt_node(el, *node) || any;
+    }
+    for (auto it = el.children.begin(); it != el.children.end();) {
+        if (it->seen) {
+            ++it;
+            continue;
+        }
+        // This child's surface left the tree (subsurface/popup destroyed): drop
+        // its import + URI. If it held keyboard focus, clear it (mechanism).
+        if (keyboard_focus == it->surface) {
+            if (seat != nullptr) {
+                wlr_seat_keyboard_notify_clear_focus(seat);
+            }
+            keyboard_focus = nullptr;
+        }
+        destroy_node(*it);
+        it = el.children.erase(it);
+    }
+    return any;
+}
+
+void Substrate::Impl::destroy_node(SurfaceNode& node) {
+    if (gl.render_iface) {
+        gl.render_iface->unregister_preview_texture(node.uri);
+    }
+    if (node.tex != 0) {
+        glDeleteTextures(1, &node.tex);
+        node.tex = 0;
+    }
+    if (node.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+        gl.egl_destroy_image(gl.egl_display, node.image);
+        node.image = EGL_NO_IMAGE_KHR;
+    }
+    if (node.current != nullptr) {
+        wlr_buffer_unlock(node.current); // release the buffer we held locked
+        node.current = nullptr;
+    }
+    node.have_seq = false;
+}
+
 void Substrate::Impl::destroy_surface_element(SurfaceElementState* s) {
     s->commit_l.disconnect(); // stop dirtying after the element is gone
+    // Clear keyboard focus if it pointed at any of this element's surfaces (the
+    // mechanism's clean-up half — never leave the seat focused on a dead surface).
+    auto owns_focus = [&](wlr_surface* f) {
+        if (s->root.surface == f) {
+            return true;
+        }
+        for (const SurfaceNode& c : s->children) {
+            if (c.surface == f) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (keyboard_focus != nullptr && owns_focus(keyboard_focus)) {
+        if (seat != nullptr) {
+            wlr_seat_keyboard_notify_clear_focus(seat);
+        }
+        keyboard_focus = nullptr;
+    }
+    // Remove this element's child <img> elements from every hosting document
+    // (before the URIs are unregistered) so no stale <img src> survives.
+    for (Surface& surf : surfaces) {
+        if (surf.document == nullptr) {
+            continue;
+        }
+        for (const SurfaceNode& c : s->children) {
+            if (Rml::Element* el = surf.document->GetElementById(child_dom_id(*s, c))) {
+                if (Rml::Element* parent = el->GetParentNode()) {
+                    parent->RemoveChild(el);
+                }
+            }
+        }
+    }
     const bool cur = gl.make_current();
-    if (gl.render_iface) {
-        gl.render_iface->unregister_preview_texture(s->uri);
-    }
-    if (s->tex != 0) {
-        glDeleteTextures(1, &s->tex);
-        s->tex = 0;
-    }
-    if (s->image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
-        gl.egl_destroy_image(gl.egl_display, s->image);
-        s->image = EGL_NO_IMAGE_KHR;
+    destroy_node(s->root);
+    for (SurfaceNode& c : s->children) {
+        destroy_node(c);
     }
     if (cur) {
         gl.restore_current();
     }
-    if (s->current != nullptr) {
-        wlr_buffer_unlock(s->current); // release the buffer we held locked
-        s->current = nullptr;
-    }
-    s->have_seq = false;
+    s->children.clear();
     surface_elements.remove_if([s](const SurfaceElementState& e) { return &e == s; });
+}
+
+// ---- Surface-element child placement (parent-relative, Wave 1b) --------------
+
+namespace {
+// Find the <img> in `doc` whose src is exactly `uri` (the root surface-element
+// img the consumer authored, or a child img the substrate created). nullptr if
+// the document does not host it. Cheap linear scan over <img> (documents have a
+// handful). `src` resolution: RmlUi keeps the raw attribute, so an exact string
+// match identifies the surface element's image robustly across reloads.
+auto find_img_by_src(Rml::ElementDocument* doc, const std::string& uri) -> Rml::Element* {
+    if (doc == nullptr) {
+        return nullptr;
+    }
+    Rml::ElementList imgs;
+    doc->GetElementsByTagName(imgs, "img");
+    for (Rml::Element* img : imgs) {
+        if (img->GetAttribute<Rml::String>("src", "") == uri) {
+            return img;
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
+void Substrate::Impl::layout_surface_element_children(SurfaceElementState& el) {
+    // Pure DOM glue (no GL). For every ui surface document that hosts this
+    // element's ROOT <img src=root.uri>, ensure each child node has its own
+    // <img> placed at the child's tree offset relative to the root img's resolved
+    // box (place_child_box — parent-relative placement so a moving/resized parent
+    // drags its children). Composite order = tree order: we append child imgs in
+    // el.children order (= the tree walk order) AFTER the root img, so later
+    // (higher z) nodes draw on top. Popups are NOT parent-clipped — the child img
+    // is an absolutely-positioned sibling of the root img (no overflow clip).
+    for (Surface& surf : surfaces) {
+        Rml::ElementDocument* doc = surf.document;
+        Rml::Element* root_img = find_img_by_src(doc, el.root.uri);
+        if (root_img == nullptr) {
+            continue; // this document does not host the element
+        }
+        Rml::Element* container = root_img->GetParentNode();
+        if (container == nullptr) {
+            continue;
+        }
+        // The root img's resolved box (content area, the texture's drawn box) in
+        // the container's coordinate space: place children relative to THIS.
+        const Rml::Vector2f roff = root_img->GetAbsoluteOffset(Rml::BoxArea::Content);
+        const Rml::Vector2f coff = container->GetAbsoluteOffset(Rml::BoxArea::Content);
+        const double px = roff.x - coff.x;
+        const double py = roff.y - coff.y;
+        const double pw = root_img->GetClientWidth();
+        const double ph = root_img->GetClientHeight();
+
+        for (const SurfaceNode& node : el.children) {
+            const std::string id = child_dom_id(el, node);
+            Rml::Element* img = doc->GetElementById(id);
+            if (img == nullptr) {
+                Rml::ElementPtr created = doc->CreateElement("img");
+                created->SetId(id);
+                created->SetAttribute("src", node.uri);
+                created->SetProperty("position", "absolute");
+                created->SetProperty("display", "block");
+                img = container->AppendChild(std::move(created));
+            }
+            if (img == nullptr) {
+                continue;
+            }
+            const ChildBox box = place_child_box(px, py, pw, ph, el.root.width, el.root.height,
+                                                 node.sx, node.sy, node.width, node.height);
+            img->SetProperty("left", std::to_string(box.x) + "px");
+            img->SetProperty("top", std::to_string(box.y) + "px");
+            img->SetProperty("width", std::to_string(box.w) + "px");
+            img->SetProperty("height", std::to_string(box.h) + "px");
+        }
+    }
+}
+
+// ---- Surface-element input-back (pick -> surface-local -> wl_seat) -----------
+//
+// Port of the spike's route_point: the substrate already feeds pointer/touch
+// into a ui surface's Rml context (for bind_event/bind_drag). After a move, the
+// hovered element is RmlUi's transform-aware pick. If that element is a surface
+// element's <img> (root OR a child node), map the point THROUGH the img's own
+// transform with Element::Project() (a no-op when untransformed; the spike fix),
+// then box->surface-local scale, and forward to THAT client surface via the seat
+// at surface-LOCAL px. A pick that lands on normal RML is untouched (data-events
+// fire as before) — only surface-element picks forward to clients.
+
+auto Substrate::Impl::node_for_hovered(Rml::Element* hovered, SurfaceElementState*& out_el)
+    -> SurfaceNode* {
+    for (Rml::Element* el = hovered; el != nullptr; el = el->GetParentNode()) {
+        const Rml::String src = el->GetAttribute<Rml::String>("src", "");
+        if (src.empty()) {
+            continue;
+        }
+        for (SurfaceElementState& se : surface_elements) {
+            if (se.root.uri == src) {
+                out_el = &se;
+                return &se.root;
+            }
+            for (SurfaceNode& c : se.children) {
+                if (c.uri == src) {
+                    out_el = &se;
+                    return &c;
+                }
+            }
+        }
+    }
+    out_el = nullptr;
+    return nullptr;
+}
+
+auto Substrate::Impl::forward_pointer_to_client(Surface& surf, double lx, double ly, PointerKind kind,
+                                                std::uint32_t button, std::uint32_t time_msec)
+    -> bool {
+    if (seat == nullptr || surf.context == nullptr) {
+        return false;
+    }
+    // The caller has ALREADY fed this surface's context the move (ctx_motion), so
+    // RmlUi's transform-aware hover pick is current; read it.
+    SurfaceElementState* el = nullptr;
+    SurfaceNode* node = node_for_hovered(surf.context->GetHoverElement(), el);
+    if (node == nullptr || node->surface == nullptr) {
+        // Not over a client surface (over plain RML / a gap): clear client
+        // pointer focus so a stale client does not keep the pointer. The ui
+        // surface still got the move above (data-events / hover unaffected).
+        wlr_seat_pointer_notify_clear_focus(seat);
+        return false;
+    }
+    // Project the screen point onto the node img's OWN (possibly 3D-transformed)
+    // plane FIRST (Element::Project: the spike fix; no-op when untransformed),
+    // then box->surface-local scale. The point fed to the context was in
+    // surface-local doc coords; Project()/GetAbsoluteOffset work in the same
+    // (untransformed) document space, so we project the SAME doc point.
+    Rml::Element* img = find_img_by_src(surf.document, node->uri);
+    if (img == nullptr) {
+        return false;
+    }
+    Rml::Vector2f p(static_cast<float>(lx - surf.x), static_cast<float>(ly - surf.y));
+    if (!img->Project(p)) {
+        return false; // edge-on: ray parallel to the element plane, no valid hit
+    }
+    const Rml::Vector2f off = img->GetAbsoluteOffset(Rml::BoxArea::Content);
+    const float bw = img->GetClientWidth();
+    const float bh = img->GetClientHeight();
+    if (bw <= 0 || bh <= 0) {
+        return false;
+    }
+    const double fx = std::clamp((p.x - off.x) / bw, 0.0F, 1.0F);
+    const double fy = std::clamp((p.y - off.y) / bh, 0.0F, 1.0F);
+    const double sx = fx * node->width;
+    const double sy = fy * node->height;
+    // Implicit-grab discipline (mirror src/input.cpp / the spike): enter before
+    // button, frame after. notify_enter is idempotent for the already-entered
+    // surface, so calling it each event keeps focus + sends the up-to-date coords.
+    wlr_seat_pointer_notify_enter(seat, node->surface, sx, sy);
+    if (kind == PointerKind::motion) {
+        wlr_seat_pointer_notify_motion(seat, time_msec, sx, sy);
+    } else {
+        wlr_seat_pointer_notify_button(
+            seat, time_msec, button,
+            kind == PointerKind::button_down ? WL_POINTER_BUTTON_STATE_PRESSED
+                                             : WL_POINTER_BUTTON_STATE_RELEASED);
+    }
+    wlr_seat_pointer_notify_frame(seat);
+    return true;
+}
+
+auto Substrate::Impl::forward_touch_to_client(Surface& surf, double lx, double ly, std::int32_t id,
+                                              bool down, std::uint32_t time_msec) -> bool {
+    if (seat == nullptr || surf.context == nullptr) {
+        return false;
+    }
+    // The caller has ALREADY fed this surface's context the move (ctx_motion).
+    SurfaceElementState* el = nullptr;
+    SurfaceNode* node = node_for_hovered(surf.context->GetHoverElement(), el);
+    if (node == nullptr || node->surface == nullptr) {
+        return false;
+    }
+    Rml::Element* img = find_img_by_src(surf.document, node->uri);
+    if (img == nullptr) {
+        return false;
+    }
+    Rml::Vector2f p(static_cast<float>(lx - surf.x), static_cast<float>(ly - surf.y));
+    if (!img->Project(p)) {
+        return false;
+    }
+    const Rml::Vector2f off = img->GetAbsoluteOffset(Rml::BoxArea::Content);
+    const float bw = img->GetClientWidth();
+    const float bh = img->GetClientHeight();
+    if (bw <= 0 || bh <= 0) {
+        return false;
+    }
+    const double sx = std::clamp((p.x - off.x) / bw, 0.0F, 1.0F) * node->width;
+    const double sy = std::clamp((p.y - off.y) / bh, 0.0F, 1.0F) * node->height;
+    if (down) {
+        wlr_seat_touch_notify_down(seat, node->surface, time_msec, id, sx, sy);
+    } else {
+        wlr_seat_touch_notify_motion(seat, time_msec, id, sx, sy);
+    }
+    return true;
+}
+
+void Substrate::Impl::focus_keyboard(SurfaceElementState& el) {
+    // Mechanism only (focus POLICY is Wave 3). Mirror src/input.cpp /
+    // ext-xdg-shell discipline: pick the seat's current keyboard, set it on the
+    // seat (so the enter ships the keymap), and notify_enter the root client
+    // surface with the keyboard's currently-pressed keys + modifiers. The
+    // kernel's key handler (input.cpp) already forwards subsequent keys to
+    // whatever surface holds seat keyboard focus, so this is the whole primitive.
+    if (seat == nullptr || el.root.surface == nullptr) {
+        return;
+    }
+    wlr_keyboard* kb = wlr_seat_get_keyboard(seat);
+    if (kb == nullptr) {
+        // No keyboard device on the seat yet: enter with no keys/mods so the
+        // client still receives focus (the keymap follows when a keyboard is set).
+        wlr_seat_keyboard_notify_enter(seat, el.root.surface, nullptr, 0, nullptr);
+    } else {
+        wlr_seat_keyboard_notify_enter(seat, el.root.surface, kb->keycodes, kb->num_keycodes,
+                                       &kb->modifiers);
+    }
+    keyboard_focus = el.root.surface;
 }
 
 // ---- Substrate (private surface) --------------------------------------------
 
 auto Substrate::create(EGLDisplay egl_display, wlr_allocator* allocator, wlr_renderer* renderer,
-                       FileWatcher* watcher, SubstrateDisableFn disable, SubstrateScheduleFn schedule)
-    -> std::unique_ptr<Substrate> {
+                       wlr_seat* seat, FileWatcher* watcher, SubstrateDisableFn disable,
+                       SubstrateScheduleFn schedule) -> std::unique_ptr<Substrate> {
     auto impl = std::make_unique<Impl>();
     impl->allocator = allocator;
     impl->renderer = renderer;
+    impl->seat = seat; // borrow: surface-element input-back forwards picks here
     impl->disable = std::move(disable);
     impl->schedule = std::move(schedule); // dirty-gate kick for live surface elements
     impl->watcher = watcher; // shared kernel-owned file watcher (asset hot-reload)
@@ -1750,12 +2221,12 @@ auto Substrate::create_surface_element(wlr_surface* client) -> std::unique_ptr<S
     SurfaceElementState& s = impl_->surface_elements.back();
     s.owner = impl_.get();
     s.id = ++impl_->next_surface_id;
-    s.uri = surface_element_uri(s.id);
-    s.surface = client;
+    s.root.surface = client;
+    s.root.uri = surface_element_uri(s.id); // == source_uri()
 
-    // Import the client's current buffer now (so source_uri()/width()/height()
-    // are valid immediately, like create_preview). The sibling context must be
-    // current for the EGLImage/texture/RmlUi-registration work.
+    // Import the client's current buffer + walk its tree now (so source_uri()/
+    // width()/height() are valid immediately, like create_preview). The sibling
+    // context must be current for the EGLImage/texture/RmlUi-registration work.
     if (!impl_->gl.make_current()) {
         impl_->destroy_surface_element(&s);
         return nullptr;
@@ -1763,7 +2234,7 @@ auto Substrate::create_surface_element(wlr_surface* client) -> std::unique_ptr<S
     const bool imported = impl_->adopt_surface_element(s);
     impl_->gl.restore_current();
     s.needs_reimport = false;
-    if (!imported || s.tex == 0) {
+    if (!imported || s.root.tex == 0) {
         // The surface may simply have no buffer yet (pre-first-commit); that is a
         // valid live element that will import on its first commit. Only fail if
         // there is no GL path to ever import on — but available() already gated
@@ -1795,19 +2266,40 @@ auto Substrate::has_surface_elements() const -> bool {
     return !impl_->surface_elements.empty();
 }
 
+namespace {
+// Frame-done tree-walk (spike §0c send_frame_done_to_clients): visit the root +
+// every subsurface + every xdg popup tree, calling wlr_surface_send_frame_done
+// on each mapped surface. wlr_surface_for_each_surface covers the root +
+// subsurfaces; xdg popups are walked separately, as the spike does.
+struct FrameDoneWalk {
+    timespec* now = nullptr;
+    int* counter = nullptr;
+};
+void frame_done_cb(wlr_surface* surface, int /*sx*/, int /*sy*/, void* data) {
+    auto* w = static_cast<FrameDoneWalk*>(data);
+    wlr_surface_send_frame_done(surface, w->now);
+    ++*w->counter;
+}
+} // namespace
+
 void Substrate::send_frame_done_to_surface_elements(const timespec& now) {
     // Frame-callback duty (the stuck-frame fix, spike §0c
     // send_frame_done_to_clients): tell every live-element-backing surface "now
     // is a good time to draw your next frame", so the client keeps producing
-    // buffers. Wave 1 is single-surface — one wl_surface per element — so we send
-    // frame-done to that surface directly (subsurface/popup tree-walking is Wave
-    // 1b). Sent UNCONDITIONALLY per composited output frame (like
+    // buffers. Wave 1b walks the WHOLE TREE (root + subsurfaces +
+    // xdg popups), exactly as the spike does — not just the root. Sent
+    // UNCONDITIONALLY per composited output frame (like
     // wlr_scene_output_send_frame_done), NOT gated by re-render: the client needs
     // callbacks to progress regardless of whether WE re-rendered.
+    timespec t = now;
     for (SurfaceElementState& s : impl_->surface_elements) {
-        if (s.surface != nullptr) {
-            wlr_surface_send_frame_done(s.surface, const_cast<timespec*>(&now));
-            ++s.frame_done_sends;
+        if (s.root.surface == nullptr) {
+            continue;
+        }
+        FrameDoneWalk w{&t, &s.frame_done_sends};
+        wlr_surface_for_each_surface(s.root.surface, frame_done_cb, &w);
+        if (wlr_xdg_surface* xdg = wlr_xdg_surface_try_from_wlr_surface(s.root.surface)) {
+            wlr_xdg_surface_for_each_popup_surface(xdg, frame_done_cb, &w);
         }
     }
 }
@@ -1870,6 +2362,8 @@ void Substrate::tick_all() {
     for (SurfaceElementState& s : impl_->surface_elements) {
         if (s.needs_reimport) {
             const int before = s.reimports;
+            // Re-walk the tree + re-import every node (seq-gated). A subsurface/
+            // popup added or removed since the last tick is reconciled here.
             impl_->adopt_surface_element(s);
             // Clear the flag only once the seq actually caught up: adopt is
             // seq-gated, so if it did nothing (no new buffer) leaving the flag set
@@ -1877,10 +2371,16 @@ void Substrate::tick_all() {
             // (or a no-op on an unchanged seq with a live texture) means we are
             // current, so clear it. Keep it set only when there is still no
             // texture (pre-first-buffer) so the first real buffer is picked up.
-            if (s.reimports != before || s.tex != 0) {
+            if (s.reimports != before || s.root.tex != 0) {
                 s.needs_reimport = false;
             }
         }
+        // Place per-node child <img> elements in every hosting document at their
+        // tree offset relative to the root img's resolved box (parent-relative
+        // placement). Pure DOM glue; cheap (no-op when there are no children or
+        // no hosting document yet). Done EVERY tick so a moved/resized parent
+        // drags its children, and a child created this tick gets an <img>.
+        impl_->layout_surface_element_children(s);
     }
     for (Surface& s : impl_->surfaces) {
         if (s.is_visible) {
@@ -1915,13 +2415,24 @@ void Substrate::route_pointer_motion(double lx, double ly, std::uint32_t time_ms
             s.context->ProcessMouseLeave();
         }
     }
+    // Surface-element input-back: if the move's transform-aware pick on the target
+    // ui surface lands on a surface element <img>, forward the motion to THAT
+    // client at surface-local coords via the seat (the move was just fed above).
+    // A pick on normal RML clears client pointer focus (handled inside) — the ui
+    // surface's own data-events/hover already fired, so this only ADDS the client
+    // forward, never regresses existing routing.
+    if (target != nullptr) {
+        (void)impl_->forward_pointer_to_client(*target, lx, ly,
+                                               Substrate::Impl::PointerKind::motion, 0, time_msec);
+    }
 }
 
-auto Substrate::route_pointer_button(double lx, double ly, bool pressed, std::uint32_t /*time*/)
+auto Substrate::route_pointer_button(double lx, double ly, bool pressed, std::uint32_t time_msec)
     -> bool {
     if (!impl_->available()) {
         return false;
     }
+    using PK = Substrate::Impl::PointerKind;
     if (pressed) {
         // The press decides (or joins) the grab. Owner is fixed at the first
         // press of the stream; this press routes to that owner.
@@ -1936,6 +2447,11 @@ auto Substrate::route_pointer_button(double lx, double ly, bool pressed, std::ui
         if (impl_->pointer_grab_surface != nullptr) {
             impl_->ctx_motion(*impl_->pointer_grab_surface, lx, ly);
             impl_->ctx_button(*impl_->pointer_grab_surface, true);
+            // Surface-element input-back: forward the press to the client under the
+            // pick (enter-before-button, frame-after — done inside the helper),
+            // mirroring the spike / src/input.cpp implicit-grab discipline.
+            (void)impl_->forward_pointer_to_client(*impl_->pointer_grab_surface, lx, ly,
+                                                   PK::button_down, BTN_LEFT, time_msec);
         }
         return true; // consumed by the substrate
     }
@@ -1948,6 +2464,8 @@ auto Substrate::route_pointer_button(double lx, double ly, bool pressed, std::ui
     if (impl_->pointer_grab_surface != nullptr) {
         impl_->ctx_motion(*impl_->pointer_grab_surface, lx, ly);
         impl_->ctx_button(*impl_->pointer_grab_surface, false);
+        (void)impl_->forward_pointer_to_client(*impl_->pointer_grab_surface, lx, ly, PK::button_up,
+                                               BTN_LEFT, time_msec);
     }
     if (!impl_->pointer_grab.active()) {
         impl_->pointer_grab_surface = nullptr; // grab ended
@@ -1984,6 +2502,9 @@ auto Substrate::route_touch_down(std::int32_t id, double lx, double ly, std::uin
     impl_->touch_capture[id] = hit;
     impl_->ctx_motion(*hit, lx, ly);
     impl_->ctx_button(*hit, true);
+    // Surface-element input-back: forward the touch-down to the client under the
+    // pick at surface-local coords (the move was just fed above).
+    (void)impl_->forward_touch_to_client(*hit, lx, ly, id, /*down=*/true, time_msec);
     return true;
 }
 
@@ -1998,10 +2519,11 @@ auto Substrate::route_touch_motion(std::int32_t id, double lx, double ly, std::u
     }
     impl_->touch_mode_tracker.on_touch(time_msec);
     impl_->ctx_motion(*it->second, lx, ly);
+    (void)impl_->forward_touch_to_client(*it->second, lx, ly, id, /*down=*/false, time_msec);
     return true;
 }
 
-auto Substrate::route_touch_up(std::int32_t id, std::uint32_t /*time*/) -> bool {
+auto Substrate::route_touch_up(std::int32_t id, std::uint32_t time_msec) -> bool {
     if (!impl_->available()) {
         return false;
     }
@@ -2010,6 +2532,12 @@ auto Substrate::route_touch_up(std::int32_t id, std::uint32_t /*time*/) -> bool 
         return false;
     }
     impl_->ctx_button(*it->second, false);
+    // Surface-element input-back: end the touch point on the client too. The seat
+    // tracks the down's surface per id, so a bare notify_up is enough (it is a
+    // no-op for a point that was never forwarded to a client).
+    if (impl_->seat != nullptr) {
+        wlr_seat_touch_notify_up(impl_->seat, time_msec, id);
+    }
     impl_->touch_capture.erase(it);
     return true;
 }
@@ -2582,8 +3110,10 @@ SurfaceElementHandle::~SurfaceElementHandle() {
     substrate_->impl_->destroy_surface_element(state_);
 }
 
-auto SurfaceElementHandle::source_uri() const -> std::string { return state_->uri; }
-auto SurfaceElementHandle::width() const -> int { return state_->width; }
-auto SurfaceElementHandle::height() const -> int { return state_->height; }
+auto SurfaceElementHandle::source_uri() const -> std::string { return state_->root.uri; }
+auto SurfaceElementHandle::width() const -> int { return state_->root.width; }
+auto SurfaceElementHandle::height() const -> int { return state_->root.height; }
+
+void SurfaceElementHandle::focus_keyboard() { substrate_->impl_->focus_keyboard(*state_); }
 
 } // namespace unbox::kernel

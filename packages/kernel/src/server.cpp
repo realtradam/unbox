@@ -1,5 +1,7 @@
 #include "server_impl.hpp"
 
+#include <xkbcommon/xkbcommon.h> // virtual-keyboard test seam keymap
+
 #include <ctime>
 #include <stdexcept>
 #include <unistd.h>
@@ -150,6 +152,78 @@ auto Server::ui_drag_element(const char* tag, int index, double dx, double dy) -
 
 auto Server::ui_reload_surface() -> bool {
     return impl_->substrate != nullptr && impl_->substrate->reload_first_surface();
+}
+
+void Server::ui_route_pointer_motion_for_test(double lx, double ly, unsigned int time_msec) {
+    if (impl_->substrate != nullptr) {
+        impl_->substrate->route_pointer_motion(lx, ly, time_msec);
+    }
+}
+
+void Server::ui_route_pointer_button_for_test(double lx, double ly, bool pressed,
+                                              unsigned int time_msec) {
+    if (impl_->substrate != nullptr) {
+        // A button needs a hover first (the cursor is already at (lx,ly) on a real
+        // seat); feed a motion so the substrate's pick is current, then the button.
+        impl_->substrate->route_pointer_motion(lx, ly, time_msec);
+        (void)impl_->substrate->route_pointer_button(lx, ly, pressed, time_msec);
+    }
+}
+
+void Server::ui_route_touch_down_for_test(int id, double lx, double ly, unsigned int time_msec) {
+    if (impl_->substrate != nullptr) {
+        (void)impl_->substrate->route_touch_down(id, lx, ly, time_msec);
+    }
+}
+
+void Server::ui_route_touch_up_for_test(int id, unsigned int time_msec) {
+    if (impl_->substrate != nullptr) {
+        (void)impl_->substrate->route_touch_up(id, time_msec);
+    }
+}
+
+namespace {
+// A no-op wlr_keyboard impl for the virtual test keyboard (it never produces LED
+// updates; the seat only needs a keyboard object + keymap to ship an enter).
+const wlr_keyboard_impl kTestKeyboardImpl = {
+    .name = "unbox-test-keyboard",
+    .led_update = nullptr,
+};
+} // namespace
+
+void Server::ui_add_test_keyboard() {
+    if (impl_->test_keyboard != nullptr || impl_->seat == nullptr) {
+        return;
+    }
+    auto* kb = new wlr_keyboard();
+    wlr_keyboard_init(kb, &kTestKeyboardImpl, "unbox-test-keyboard");
+    xkb_context* ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    xkb_keymap* keymap = xkb_keymap_new_from_names(ctx, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    wlr_keyboard_set_keymap(kb, keymap);
+    xkb_keymap_unref(keymap);
+    xkb_context_unref(ctx);
+    impl_->test_keyboard = kb;
+    // Advertise the keyboard capability + set it on the seat so an enter ships
+    // the keymap (mirrors input.cpp::new_keyboard's seat wiring).
+    wlr_seat_set_capabilities(impl_->seat, WL_SEAT_CAPABILITY_POINTER |
+                                               WL_SEAT_CAPABILITY_TOUCH |
+                                               WL_SEAT_CAPABILITY_KEYBOARD);
+    wlr_seat_set_keyboard(impl_->seat, kb);
+}
+
+void Server::ui_send_key_for_test(unsigned int keycode, bool pressed) {
+    if (impl_->seat == nullptr) {
+        return;
+    }
+    // The post-filter equivalent of input.cpp's key path: the seat forwards the
+    // key to whatever surface holds keyboard focus (set by focus_keyboard()).
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const std::uint32_t t = static_cast<std::uint32_t>(now.tv_sec) * 1000U +
+                            static_cast<std::uint32_t>(now.tv_nsec) / 1000000U;
+    wlr_seat_keyboard_notify_key(impl_->seat, t, keycode,
+                                 pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
+                                         : WL_KEYBOARD_KEY_STATE_RELEASED);
 }
 
 void Server::ui_set_touch_override(UiTouchOverride ov) {
@@ -446,7 +520,7 @@ void Server::Impl::start_substrate() {
     // isolation path the bus uses (Server::Impl is the DisableSink). The
     // substrate uses the kernel's ONE shared FileWatcher for (UNBOX_DEV-gated)
     // asset hot-reload — the same watcher Host::watch_file uses for config.
-    substrate = Substrate::create(display_egl, allocator, renderer, file_watcher(),
+    substrate = Substrate::create(display_egl, allocator, renderer, seat, file_watcher(),
                                   [this](ExtensionId who) { disable(who); },
                                   [this] { schedule_driver_frame(); });
 }
@@ -502,6 +576,13 @@ void Server::Impl::shutdown() {
     test_new_surface.disconnect();
     test_surface_commits.clear();
     test_last_client_surface = nullptr;
+    // The virtual test keyboard (if added) is finished + freed before the seat /
+    // display die (a wlr_keyboard outliving the seat it was set on is UB).
+    if (test_keyboard != nullptr) {
+        wlr_keyboard_finish(test_keyboard);
+        delete test_keyboard;
+        test_keyboard = nullptr;
+    }
 
     // The ui substrate owns scene nodes + GL objects on a sibling context and
     // borrows scene/renderer/allocator: tear it down before they die. (Its asset

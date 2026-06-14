@@ -108,6 +108,7 @@ public:
     [[nodiscard]] auto source_uri() const -> std::string override;
     [[nodiscard]] auto width() const -> int override;
     [[nodiscard]] auto height() const -> int override;
+    void focus_keyboard() override;
 
 private:
     Substrate* substrate_;
@@ -172,7 +173,7 @@ public:
     // FileWatcher, used (dev only, UNBOX_DEV-gated) for asset hot-reload; pass
     // nullptr to disable watching. Never throws.
     static auto create(EGLDisplay egl_display, wlr_allocator* allocator,
-                       wlr_renderer* renderer, FileWatcher* watcher,
+                       wlr_renderer* renderer, wlr_seat* seat, FileWatcher* watcher,
                        SubstrateDisableFn disable, SubstrateScheduleFn schedule)
         -> std::unique_ptr<Substrate>;
 

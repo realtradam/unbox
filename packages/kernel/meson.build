@@ -84,15 +84,39 @@ kernel_dep = declare_dependency(
 
 # wayland-client (TEST-ONLY): the surface-element integration test spins an
 # in-process Wayland CLIENT thread that connects to the headless server, creates
-# a wl_surface + wl_shm buffer, and commits — the only in-process way to get a
-# REAL wlr_surface with an advancing commit seq to exercise the live import.
-# It is NOT a kernel-library dependency (the kernel is a compositor, never a
-# client); scoped to the test executable only.
+# a wl_surface + wl_shm buffer (+ a subsurface + an xdg toplevel/popup for the
+# Wave-1b surface-TREE test), and commits — the only in-process way to get a
+# REAL wlr_surface tree with an advancing commit seq to exercise the live import
+# + input-back. It is NOT a kernel-library dependency (the kernel is a
+# compositor, never a client); scoped to the test executable only.
 wayland_client_dep = dependency('wayland-client')
+
+# CLIENT-side xdg-shell bindings for the Wave-1b surface-tree test (a real xdg
+# popup is a tree child element). Generated from the canonical xdg-shell.xml the
+# same way ext-xdg-shell's client test does (header + private-code-as-header,
+# #included once by the single test TU). The SERVER side runs in a TEST
+# extension via wlr_xdg_shell (kernel-private wlr.hpp), so the kernel itself
+# still names no shell — xdg-shell stays a feature, provided by a test ext.
+wayland_protocols_dir = dependency('wayland-protocols').get_variable('pkgdatadir')
+xdg_shell_xml = wayland_protocols_dir / 'stable' / 'xdg-shell' / 'xdg-shell.xml'
+xdg_shell_client_header = custom_target(
+  'kernel-xdg-shell-client-header',
+  input: xdg_shell_xml,
+  output: 'xdg-shell-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+xdg_shell_client_code = custom_target(
+  'kernel-xdg-shell-client-code',
+  input: xdg_shell_xml,
+  output: 'xdg-shell-client-protocol-code.h',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
 
 kernel_test = executable(
   'kernel-tests',
   'tests/test_kernel.cpp',
+  xdg_shell_client_header,
+  xdg_shell_client_code,
   dependencies: [kernel_dep, doctest_dep, wayland_client_dep],
 )
 test('kernel', kernel_test, suite: 'kernel')

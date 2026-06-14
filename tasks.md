@@ -26,16 +26,24 @@ out of the shipped binary. **CONTRACT DECISION (user): RCSS is the single source
 of truth for ALL layout + animation; C++ drives the document via a TYPED
 substrate API.** PHASE 2 on `feat/rml-compositing` (off main; spike sources carried
 as in-tree reference, `build_by_default:false`, deleted when the waves land).
-**Wave 1 DONE + verified**: kernel `SurfaceElement` (live sibling of `Preview`) —
-zero-copy seq-gated import, frame-callback duty, dirty-gate; public contract in
-`ui.hpp` (`create_surface_element(wlr_surface*)`); kernel suite + asan green
-(test-only `wayland-client` dep accepted, scoped to kernel-tests). Wave plan
-refined: **Wave 1** = the live primitive (done); **Wave 1b** = input-back
-(pick→surface-local→wl_seat via `Element::Project`) + subsurface/popup child
-trees; **Wave 2** = ext-xdg-shell (`Toplevel::wl_surface()`, retire scene
-compositing) + ext-layer-shell; **Wave 3** = NEW `ext-window-field` (window list +
-RCSS layout); **Wave 4** = ext-stage-dock; **Wave 5** = damage limiting (Option B)
-+ scanout bypass. NEXT ACTION: **Wave 1b** (kernel input-back + surface trees).
+**Waves 1 + 1b DONE + verified** (kernel): `SurfaceElement` (live sibling of
+`Preview`) — zero-copy seq-gated import, frame-callback duty, dirty-gate, public
+`create_surface_element(wlr_surface*)`; **surface trees** (subsurface/popup child
+elements, whole-tree frame-done, parent-relative placement); **input-back**
+(pointer/touch → surface-local via `Element::Project`, pure inversion core
+doctested) + `SurfaceElement::focus_keyboard()` primitive. Kernel suite (72c/375a)
++ asan green; test-only `wayland-client`/xdg-shell-client codegen accepted
+(kernel-tests scope). Wave plan: **W1/W1b** done; **W2** = ext-xdg-shell (ADD
+`Toplevel::wl_surface()`; keep scene compositing for now — retire behind the flag
+in W3) + ext-layer-shell (expose its surface); **W3** = NEW `ext-window-field`
+(window list + RCSS layout + focus policy via `focus_keyboard()`, flips the flag);
+**W4** = ext-stage-dock; **W5** = damage limiting (Option B) + scanout bypass.
+NEXT ACTION: **Wave 2** (ext-xdg-shell + ext-layer-shell, disjoint/parallel).
+TRACKED BUG (pre-existing, baseline-confirmed, NOT from these waves): the
+`ext-stage-dock-glue` + `ext-xdg-shell-client` test suites abort at teardown on a
+wlroots `wl_list_empty(...commit.listener_list)` assertion (a listener-lifetime
+teardown-order bug in those units' tests) — fix `ext-xdg-shell-client` in W2,
+`ext-stage-dock-glue` in W4.
 Tiling (slice 7) is DEFERRED behind this (becomes RCSS over surface elements;
 pure layout core in `notes/tiling-spec.md` carries over). Stage dock (slice 10)
 real-seat feel check is paused under this pivot.

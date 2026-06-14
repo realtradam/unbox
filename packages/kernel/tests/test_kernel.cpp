@@ -4,6 +4,7 @@
 #include <unbox/kernel/extension.hpp>
 #include <unbox/kernel/hooks.hpp>
 #include <unbox/kernel/host.hpp>
+#include <unbox/kernel/listener.hpp> // RAII wl_listener for the Wave-1b tree test extension
 #include <unbox/kernel/kernel.hpp>
 #include <unbox/kernel/server.hpp>
 #include <unbox/kernel/surface_registry.hpp>
@@ -13,6 +14,10 @@
 // state machine, implicit-grab ownership, hit-test geometry) are doctest-ed
 // directly, no wlroots.
 #include "../src/ui_core.hpp"
+// The PRODUCTION surface-element input-back PURE core (the port of the spike's
+// screen->surface-local inversion + the parent-relative child-placement helper),
+// doctest-ed here as the strict-core half of Wave 1b. No wlroots/GL/RMLUi.
+#include "../src/input_core.hpp"
 // The VT-switch escape hatch's pure core (keysym -> VT number), no wlroots.
 #include "../src/vt_core.hpp"
 // SPIKE (rml-compositing, Phase 0): the throwaway spike's PURE input-inversion
@@ -39,6 +44,14 @@
 // commit seq). wayland-client is a test-executable-only dep (the kernel is a
 // compositor, never a client) — see packages/kernel/meson.build.
 #include <wayland-client.h>
+
+// Wave-1b surface-tree test: a real xdg popup is a tree child, so the test needs
+// CLIENT-side xdg-shell bindings (generated; see packages/kernel/meson.build) and
+// the SERVER side runs xdg-shell in a TEST extension via the kernel's wlr wrapper
+// (xdg-shell stays a feature, provided by an extension — the kernel names none).
+#include <unbox/kernel/wlr.hpp>
+#include "xdg-shell-client-protocol.h"
+#include "xdg-shell-client-protocol-code.h" // private code: included by ONE TU only
 
 #include <atomic>
 #include <chrono>
@@ -2670,6 +2683,82 @@ TEST_CASE("spike(rml-compositing): an edge-on (90deg) transform collapses the el
 }
 
 // ============================================================================
+// RML compositing Wave 1b: surface-element input-back PURE CORE (src/input_core.
+// hpp) — the PRODUCTION port of the spike's screen->surface-local inversion the
+// live wl_seat translation rides on, doctest-ed here (criterion-3 round-trip)
+// plus the parent-relative child-placement helper. Strict core, zero mocks.
+// ============================================================================
+
+namespace {
+namespace ic = unbox::kernel;
+
+// Forward-project a surface-local point through `t`, invert, assert recovery.
+auto kernel_roundtrip_err(const ic::Mat4& t, double lx, double ly) -> double {
+    const ic::ScreenPoint s = ic::project_to_screen(t, lx, ly);
+    const auto back = ic::unproject_to_local(t, s.x, s.y);
+    if (!back) {
+        return 1e9;
+    }
+    return std::hypot(back->x - lx, back->y - ly);
+}
+} // namespace
+
+TEST_CASE("input-back core: screen->surface-local inverts perspective+rotateY (<0.01px)") {
+    // The criterion-3 case in the PRODUCTION core: a 256x256 surface element with
+    // perspective(800) + rotateY about the 50% origin (what RCSS computes). The
+    // inverse is a ray/plane intersection (non-affine); recovery must be sub-
+    // 0.01px across the element — the geometry the live Element::Project()-based
+    // forward + wl_seat surface-local notify depends on.
+    const double origin = 128.0;
+    for (double deg : {15.0, 35.0, 60.0, -45.0}) {
+        const ic::Mat4 t = ic::rcss_transform_about_origin(
+            ic::mul(ic::perspective(800.0), ic::rotate_y(deg * std::numbers::pi / 180.0)), origin,
+            origin);
+        CHECK(kernel_roundtrip_err(t, 128.0, 128.0) < 1e-6); // center: on the axis
+        CHECK(kernel_roundtrip_err(t, 32.0, 64.0) < 0.01);   // near edge (foreshortened)
+        CHECK(kernel_roundtrip_err(t, 224.0, 200.0) < 0.01); // far edge
+        CHECK(kernel_roundtrip_err(t, 64.0, 96.0) < 0.01);   // arbitrary interior
+    }
+    // A plain translate (affine): exact everywhere.
+    const ic::Mat4 tr = ic::translate(120.0, -40.0);
+    CHECK(kernel_roundtrip_err(tr, 0.0, 0.0) < 1e-9);
+    CHECK(kernel_roundtrip_err(tr, 200.0, 150.0) < 1e-9);
+}
+
+TEST_CASE("input-back core: place_child_box maps a tree offset into the parent's resolved box") {
+    using unbox::kernel::place_child_box;
+    // Parent <img> resolved box (px) == surface natural size (1:1 scale): a child
+    // at tree offset (10,20) sized 30x40 lands at exactly (10,20,30,40).
+    {
+        const auto b = place_child_box(/*px*/ 0, /*py*/ 0, /*pw*/ 200, /*ph*/ 100,
+                                       /*surf_w*/ 200, /*surf_h*/ 100, /*sx*/ 10, /*sy*/ 20,
+                                       /*cw*/ 30, /*ch*/ 40);
+        CHECK(b.x == doctest::Approx(10.0));
+        CHECK(b.y == doctest::Approx(20.0));
+        CHECK(b.w == doctest::Approx(30.0));
+        CHECK(b.h == doctest::Approx(40.0));
+    }
+    // A parent rendered at HALF its natural size (a resized window): the offset +
+    // child size scale by 0.5, and the parent's box origin is added (a moving
+    // parent drags the child). surf 200x100 drawn into a 100x50 box at (40,30).
+    {
+        const auto b = place_child_box(/*px*/ 40, /*py*/ 30, /*pw*/ 100, /*ph*/ 50,
+                                       /*surf_w*/ 200, /*surf_h*/ 100, /*sx*/ 20, /*sy*/ 40,
+                                       /*cw*/ 60, /*ch*/ 20);
+        CHECK(b.x == doctest::Approx(50.0));  // 40 + 20*0.5
+        CHECK(b.y == doctest::Approx(50.0));  // 30 + 40*0.5
+        CHECK(b.w == doctest::Approx(30.0));  // 60*0.5
+        CHECK(b.h == doctest::Approx(10.0));  // 20*0.5
+    }
+    // Degenerate (zero surface size): no NaN — falls back to a 1:1 scale.
+    {
+        const auto b = place_child_box(5, 5, 0, 0, 0, 0, 7, 8, 9, 10);
+        CHECK(b.x == doctest::Approx(12.0)); // 5 + 7
+        CHECK(b.y == doctest::Approx(13.0)); // 5 + 8
+    }
+}
+
+// ============================================================================
 // RML compositing Wave 1: surface-element PURE CORES (ui_core.hpp). The URI
 // minting and the seq-gate decision predicate are pure (no wlroots/GL), so they
 // are doctest-ed here with nothing running — the strict-core half of the
@@ -2961,6 +3050,649 @@ TEST_CASE("surface-element: live import + seq-gate + frame-done against a real c
     CHECK(server->ui_surface_element_frame_done_count() == 0);
     pump(*server, 20);
     CHECK(server->ui_surface_element_frame_done_count() == 0);
+
+    client.join();
+    unsetenv("WLR_HEADLESS_OUTPUTS");
+}
+
+// ============================================================================
+// RML compositing Wave 1b: surface-TREE + INPUT-BACK + KEYBOARD-FOCUS headless
+// integration test. A real client maps an xdg toplevel ROOT with a SUBSURFACE
+// and an xdg POPUP; a test extension builds a SurfaceElement from the root and
+// hosts it in a ui surface's <img src=root_uri>. The suite asserts (via the
+// public Host::ui() path + kernel test seams, since headless has no input
+// devices): (A) the subsurface + popup become per-node child <img> elements and
+// frame-done reaches EVERY node (the tree-walk); (B) a pointer motion/button (+
+// a touch down) over the element forwards to the client at the EXPECTED surface-
+// LOCAL coords through the element's transform (Element::Project); (C) focusing
+// the element delivers a wl_keyboard enter + a forwarded key. xdg-shell is
+// provided by the TEST extension (the kernel names no shell), exactly as
+// ext-xdg-shell will in Wave 2.
+// ============================================================================
+
+namespace {
+
+// Server-side: a test extension that runs xdg-shell (via the kernel's wlr
+// wrapper) + the subcompositor is the kernel's own (it always creates one), and
+// turns the first mapped toplevel into a SurfaceElement shown in a ui surface.
+class TreeTestExtension : public unbox::kernel::Extension {
+public:
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        host_ = &host;
+        xdg_shell_ = wlr_xdg_shell_create(host.display(), 3);
+        if (xdg_shell_ == nullptr) {
+            return;
+        }
+        new_toplevel_.connect(xdg_shell_->events.new_toplevel, [this](void* data) {
+            on_new_toplevel(static_cast<wlr_xdg_toplevel*>(data));
+        });
+        new_popup_.connect(xdg_shell_->events.new_popup, [this](void* data) {
+            on_new_popup(static_cast<wlr_xdg_popup*>(data));
+        });
+    }
+
+    // Drive the surface element + ui surface once the root toplevel maps. The ui
+    // surface hosts <img id=se src=root_uri> filling its box 1:1 with the
+    // toplevel buffer, at a NON-ZERO layout origin (proves coords are surface-
+    // local). `transform_deg` (set before map by the test) tilts the hosting img.
+    void on_map() {
+        if (root_surface_ == nullptr || element_ != nullptr) {
+            return;
+        }
+        element_ = host_->ui().create_surface_element(root_surface_);
+        if (element_ == nullptr) {
+            return;
+        }
+        std::string xform;
+        if (transform_deg_ != 0.0) {
+            xform = "#se { transform: perspective(800px) rotateY(" +
+                    std::to_string(transform_deg_) +
+                    "deg); transform-origin: 50% 50%; }";
+        }
+        std::string rml =
+            "<rml><head><style>body{margin:0px;background-color:transparent;"
+            "width:200px;height:200px;} #se{display:block;position:absolute;"
+            "left:0px;top:0px;width:200px;height:200px;} " +
+            xform + "</style></head><body data-model=\"ui\">"
+                    "<img id=\"se\" src=\"" +
+            element_->source_uri() + "\"/></body></rml>";
+        UiSurfaceSpec spec;
+        spec.rml_inline = rml;
+        spec.x = kSurfX;
+        spec.y = kSurfY;
+        spec.width = 200;
+        spec.height = 200;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host_->ui().create_surface(spec);
+    }
+
+    void set_transform(double deg) { transform_deg_ = deg; }
+    void focus() {
+        if (element_ != nullptr) {
+            element_->focus_keyboard();
+        }
+    }
+    [[nodiscard]] auto has_element() const -> bool { return element_ != nullptr; }
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+    static constexpr int kSurfX = 40;
+    static constexpr int kSurfY = 30;
+
+private:
+    void on_new_toplevel(wlr_xdg_toplevel* toplevel) {
+        wlr_xdg_surface* xdg = toplevel->base;
+        root_surface_ = xdg->surface;
+        map_.connect(xdg->surface->events.map, [this](void*) { on_map(); });
+        commit_.connect(xdg->surface->events.commit, [this, xdg](void*) {
+            if (xdg->initial_commit) {
+                wlr_xdg_toplevel_set_size(xdg->toplevel, 0, 0);
+            }
+        });
+    }
+    void on_new_popup(wlr_xdg_popup* popup) {
+        wlr_xdg_surface* xdg = popup->base;
+        popup_commit_.connect(xdg->surface->events.commit, [xdg](void*) {
+            if (xdg->initial_commit) {
+                wlr_xdg_surface_schedule_configure(xdg);
+            }
+        });
+    }
+
+    Manifest manifest_{"tree-test", Tier::standard, {}};
+    Host* host_ = nullptr;
+    wlr_xdg_shell* xdg_shell_ = nullptr;
+    wlr_surface* root_surface_ = nullptr;
+    double transform_deg_ = 0.0;
+    unbox::kernel::Listener new_toplevel_, new_popup_, map_, commit_, popup_commit_;
+    std::unique_ptr<unbox::kernel::SurfaceElement> element_;
+    std::unique_ptr<UiSurface> surface_;
+};
+
+// Client-side: a real Wayland client that maps an xdg toplevel + a subsurface +
+// an xdg popup, and records what its wl_pointer / wl_touch / wl_keyboard receive
+// (so the test can assert the input-back surface-local coords). On its own thread.
+struct TreeClient {
+    std::thread thread;
+    std::atomic<bool> ready{false};      // toplevel + subsurface + popup committed
+    std::atomic<bool> stop{false};
+    std::string socket;
+
+    // Recorded client input (atomics: read from the test thread).
+    std::atomic<int> ptr_enters{0};
+    std::atomic<int> ptr_motions{0};
+    std::atomic<int> ptr_buttons{0};
+    std::atomic<int> touch_downs{0};
+    std::atomic<int> kbd_enters{0};
+    std::atomic<int> keys{0};
+    std::atomic<double> last_ptr_x{-1.0};
+    std::atomic<double> last_ptr_y{-1.0};
+    std::atomic<double> last_touch_x{-1.0};
+    std::atomic<double> last_touch_y{-1.0};
+    // Which of our surfaces the pointer/touch entered (so we can assert it hit
+    // the EXPECTED node — root vs subsurface vs popup).
+    std::atomic<int> ptr_enter_surface{-1}; // 0=root 1=subsurface 2=popup -1=none
+
+    explicit TreeClient(std::string sock) : socket(std::move(sock)) {}
+    void start() { thread = std::thread([this] { run(); }); }
+    void join() {
+        stop = true;
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    wl_display* dpy = nullptr;
+    wl_registry* registry = nullptr;
+    wl_compositor* compositor = nullptr;
+    wl_subcompositor* subcompositor = nullptr;
+    wl_shm* shm = nullptr;
+    wl_seat* seat = nullptr;
+    xdg_wm_base* wm_base = nullptr;
+    wl_pointer* pointer = nullptr;
+    wl_touch* touch = nullptr;
+    wl_keyboard* keyboard = nullptr;
+
+    wl_surface* root = nullptr;        // the toplevel surface (node 0)
+    wl_surface* sub = nullptr;         // the subsurface (node 1)
+    wl_surface* pop = nullptr;         // the popup surface (node 2)
+    xdg_surface* xsurf = nullptr;
+    xdg_toplevel* xtop = nullptr;
+    xdg_surface* xpopsurf = nullptr;
+    xdg_popup* xpop = nullptr;
+    bool configured = false;
+
+    auto surface_index(wl_surface* s) const -> int {
+        if (s == root) {
+            return 0;
+        }
+        if (s == sub) {
+            return 1;
+        }
+        if (s == pop) {
+            return 2;
+        }
+        return -1;
+    }
+
+    static auto make_buffer(wl_shm* shm, int w, int h, uint32_t argb) -> wl_buffer* {
+        const int stride = w * 4;
+        const int size = stride * h;
+        int fd = memfd_create("unbox-tree-test", MFD_CLOEXEC);
+        if (fd < 0) {
+            return nullptr;
+        }
+        if (ftruncate(fd, size) < 0) {
+            close(fd);
+            return nullptr;
+        }
+        auto* px = static_cast<uint32_t*>(
+            mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+        if (px == MAP_FAILED) {
+            close(fd);
+            return nullptr;
+        }
+        for (int i = 0; i < w * h; ++i) {
+            px[i] = argb;
+        }
+        munmap(px, size);
+        wl_shm_pool* pool = wl_shm_create_pool(shm, fd, size);
+        wl_buffer* buf = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
+        wl_shm_pool_destroy(pool);
+        close(fd);
+        return buf;
+    }
+
+    // --- listeners ---
+    static void reg_global(void* data, wl_registry* reg, uint32_t name, const char* iface,
+                           uint32_t ver) {
+        auto* self = static_cast<TreeClient*>(data);
+        if (std::strcmp(iface, "wl_compositor") == 0) {
+            self->compositor = static_cast<wl_compositor*>(
+                wl_registry_bind(reg, name, &wl_compositor_interface, 4));
+        } else if (std::strcmp(iface, "wl_subcompositor") == 0) {
+            self->subcompositor = static_cast<wl_subcompositor*>(
+                wl_registry_bind(reg, name, &wl_subcompositor_interface, 1));
+        } else if (std::strcmp(iface, "wl_shm") == 0) {
+            self->shm = static_cast<wl_shm*>(wl_registry_bind(reg, name, &wl_shm_interface, 1));
+        } else if (std::strcmp(iface, "wl_seat") == 0) {
+            self->seat = static_cast<wl_seat*>(
+                wl_registry_bind(reg, name, &wl_seat_interface, std::min<uint32_t>(ver, 5)));
+        } else if (std::strcmp(iface, "xdg_wm_base") == 0) {
+            self->wm_base = static_cast<xdg_wm_base*>(
+                wl_registry_bind(reg, name, &xdg_wm_base_interface, 1));
+        }
+    }
+    static void reg_remove(void*, wl_registry*, uint32_t) {}
+
+    static void wm_ping(void*, xdg_wm_base* b, uint32_t serial) { xdg_wm_base_pong(b, serial); }
+
+    static void xsurf_configure(void* data, xdg_surface* s, uint32_t serial) {
+        auto* self = static_cast<TreeClient*>(data);
+        xdg_surface_ack_configure(s, serial);
+        self->configured = true;
+    }
+    static void xtop_configure(void*, xdg_toplevel*, int32_t, int32_t, wl_array*) {}
+    static void xtop_close(void*, xdg_toplevel*) {}
+
+    static void xpopsurf_configure(void* data, xdg_surface* s, uint32_t serial) {
+        xdg_surface_ack_configure(s, serial);
+        (void)data;
+    }
+    static void xpop_configure(void*, xdg_popup*, int32_t, int32_t, int32_t, int32_t) {}
+    static void xpop_done(void*, xdg_popup*) {}
+
+    // pointer
+    static void p_enter(void* data, wl_pointer*, uint32_t, wl_surface* surf, wl_fixed_t sx,
+                        wl_fixed_t sy) {
+        auto* self = static_cast<TreeClient*>(data);
+        ++self->ptr_enters;
+        self->ptr_enter_surface = self->surface_index(surf);
+        self->last_ptr_x = wl_fixed_to_double(sx);
+        self->last_ptr_y = wl_fixed_to_double(sy);
+    }
+    static void p_leave(void*, wl_pointer*, uint32_t, wl_surface*) {}
+    static void p_motion(void* data, wl_pointer*, uint32_t, wl_fixed_t sx, wl_fixed_t sy) {
+        auto* self = static_cast<TreeClient*>(data);
+        ++self->ptr_motions;
+        self->last_ptr_x = wl_fixed_to_double(sx);
+        self->last_ptr_y = wl_fixed_to_double(sy);
+    }
+    static void p_button(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t) {
+        ++static_cast<TreeClient*>(data)->ptr_buttons;
+    }
+    static void p_axis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
+    static void p_frame(void*, wl_pointer*) {}
+    static void p_axis_source(void*, wl_pointer*, uint32_t) {}
+    static void p_axis_stop(void*, wl_pointer*, uint32_t, uint32_t) {}
+    static void p_axis_discrete(void*, wl_pointer*, uint32_t, int32_t) {}
+    static void p_axis_value120(void*, wl_pointer*, uint32_t, int32_t) {}
+    static void p_axis_relative_direction(void*, wl_pointer*, uint32_t, uint32_t) {}
+
+    // touch
+    static void t_down(void* data, wl_touch*, uint32_t, uint32_t, wl_surface*, int32_t,
+                       wl_fixed_t x, wl_fixed_t y) {
+        auto* self = static_cast<TreeClient*>(data);
+        ++self->touch_downs;
+        self->last_touch_x = wl_fixed_to_double(x);
+        self->last_touch_y = wl_fixed_to_double(y);
+    }
+    static void t_up(void*, wl_touch*, uint32_t, uint32_t, int32_t) {}
+    static void t_motion(void*, wl_touch*, uint32_t, int32_t, wl_fixed_t, wl_fixed_t) {}
+    static void t_frame(void*, wl_touch*) {}
+    static void t_cancel(void*, wl_touch*) {}
+    static void t_shape(void*, wl_touch*, int32_t, wl_fixed_t, wl_fixed_t) {}
+    static void t_orientation(void*, wl_touch*, int32_t, wl_fixed_t) {}
+
+    // keyboard
+    static void k_keymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    static void k_enter(void* data, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {
+        ++static_cast<TreeClient*>(data)->kbd_enters;
+    }
+    static void k_leave(void*, wl_keyboard*, uint32_t, wl_surface*) {}
+    static void k_key(void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t) {
+        ++static_cast<TreeClient*>(data)->keys;
+    }
+    static void k_mods(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}
+    static void k_repeat(void*, wl_keyboard*, int32_t, int32_t) {}
+
+    std::atomic<uint32_t> seat_caps{0};
+    static void seat_caps_cb(void* data, wl_seat*, uint32_t caps) {
+        static_cast<TreeClient*>(data)->seat_caps = caps;
+    }
+    static void seat_name_cb(void*, wl_seat*, const char*) {}
+
+    // Bind pointer/touch/keyboard only once the seat advertises the capability
+    // (newer libwayland enforces it). The kernel advertises POINTER|TOUCH|
+    // KEYBOARD via the ui_add_test_keyboard seam before the client connects.
+    void bind_seat() {
+        static const wl_seat_listener sl = {seat_caps_cb, seat_name_cb};
+        wl_seat_add_listener(seat, &sl, this);
+        wl_display_roundtrip(dpy); // deliver the capabilities event
+        static const wl_pointer_listener pl = {
+            p_enter, p_leave, p_motion, p_button, p_axis, p_frame, p_axis_source,
+            p_axis_stop, p_axis_discrete, p_axis_value120, p_axis_relative_direction};
+        static const wl_touch_listener tl = {t_down, t_up, t_motion, t_frame,
+                                             t_cancel, t_shape, t_orientation};
+        static const wl_keyboard_listener kl = {k_keymap, k_enter, k_leave, k_key, k_mods, k_repeat};
+        const uint32_t caps = seat_caps.load();
+        if ((caps & WL_SEAT_CAPABILITY_POINTER) != 0) {
+            pointer = wl_seat_get_pointer(seat);
+            wl_pointer_add_listener(pointer, &pl, this);
+        }
+        if ((caps & WL_SEAT_CAPABILITY_TOUCH) != 0) {
+            touch = wl_seat_get_touch(seat);
+            wl_touch_add_listener(touch, &tl, this);
+        }
+        if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) != 0) {
+            keyboard = wl_seat_get_keyboard(seat);
+            wl_keyboard_add_listener(keyboard, &kl, this);
+        }
+    }
+
+    void run() {
+        dpy = wl_display_connect(socket.c_str());
+        if (dpy == nullptr) {
+            return;
+        }
+        registry = wl_display_get_registry(dpy);
+        static const wl_registry_listener reg_l = {reg_global, reg_remove};
+        wl_registry_add_listener(registry, &reg_l, this);
+        wl_display_roundtrip(dpy); // bind globals
+        // wl_seat capabilities arrive async; roundtrip again so get_keyboard works
+        // once the kernel advertises a (test) keyboard.
+        if (compositor == nullptr || shm == nullptr || subcompositor == nullptr ||
+            wm_base == nullptr || seat == nullptr) {
+            wl_display_disconnect(dpy);
+            return;
+        }
+        static const xdg_wm_base_listener wm_l = {wm_ping};
+        xdg_wm_base_add_listener(wm_base, &wm_l, this);
+        bind_seat();
+
+        // --- toplevel root ---
+        root = wl_compositor_create_surface(compositor);
+        xsurf = xdg_wm_base_get_xdg_surface(wm_base, root);
+        static const xdg_surface_listener xs_l = {xsurf_configure};
+        xdg_surface_add_listener(xsurf, &xs_l, this);
+        xtop = xdg_surface_get_toplevel(xsurf);
+        static const xdg_toplevel_listener xt_l = {xtop_configure, xtop_close};
+        xdg_toplevel_add_listener(xtop, &xt_l, this);
+        wl_surface_commit(root); // initial commit -> server sends configure
+        while (!configured && wl_display_dispatch(dpy) != -1) {
+        }
+        wl_buffer* root_buf = make_buffer(shm, 200, 200, 0xff2060c0);
+        wl_surface_attach(root, root_buf, 0, 0);
+        wl_surface_damage(root, 0, 0, 200, 200);
+
+        // --- subsurface (node 1): 40x40 at tree offset (20,30) ---
+        sub = wl_compositor_create_surface(compositor);
+        wl_subsurface* subsurface = wl_subcompositor_get_subsurface(subcompositor, sub, root);
+        wl_subsurface_set_position(subsurface, 20, 30);
+        wl_subsurface_set_desync(subsurface);
+        wl_buffer* sub_buf = make_buffer(shm, 40, 40, 0xff60c020);
+        wl_surface_attach(sub, sub_buf, 0, 0);
+        wl_surface_damage(sub, 0, 0, 40, 40);
+        wl_surface_commit(sub);
+        wl_surface_commit(root); // apply the subsurface
+        wl_display_roundtrip(dpy);
+
+        // --- popup (node 2): a 60x50 popup positioned at (80,90) off the root ---
+        pop = wl_compositor_create_surface(compositor);
+        xpopsurf = xdg_wm_base_get_xdg_surface(wm_base, pop);
+        static const xdg_surface_listener xps_l = {xpopsurf_configure};
+        xdg_surface_add_listener(xpopsurf, &xps_l, this);
+        xdg_positioner* pos = xdg_wm_base_create_positioner(wm_base);
+        xdg_positioner_set_size(pos, 60, 50);
+        xdg_positioner_set_anchor_rect(pos, 80, 90, 1, 1);
+        xpop = xdg_surface_get_popup(xpopsurf, xsurf, pos);
+        xdg_positioner_destroy(pos);
+        static const xdg_popup_listener xp_l = {xpop_configure, xpop_done};
+        xdg_popup_add_listener(xpop, &xp_l, this);
+        static const xdg_surface_listener xps2 = {xpopsurf_configure};
+        (void)xps2;
+        wl_surface_commit(pop); // initial popup commit -> configure
+        wl_display_roundtrip(dpy);
+        wl_buffer* pop_buf = make_buffer(shm, 60, 50, 0xff2080e0);
+        wl_surface_attach(pop, pop_buf, 0, 0);
+        wl_surface_damage(pop, 0, 0, 60, 50);
+        wl_surface_commit(pop);
+
+        // Map the root last so the extension's map handler builds the element with
+        // the subsurface + popup already in the tree.
+        wl_surface_commit(root);
+        wl_display_flush(dpy);
+        ready = true;
+
+        while (!stop) {
+            if (wl_display_dispatch_pending(dpy) == -1) {
+                break;
+            }
+            wl_display_flush(dpy);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
+        // Teardown: destroy every proxy before disconnect (asan leak-clean).
+        if (pop_buf != nullptr) {
+            wl_buffer_destroy(pop_buf);
+        }
+        if (sub_buf != nullptr) {
+            wl_buffer_destroy(sub_buf);
+        }
+        if (root_buf != nullptr) {
+            wl_buffer_destroy(root_buf);
+        }
+        if (xpop != nullptr) {
+            xdg_popup_destroy(xpop);
+        }
+        if (xpopsurf != nullptr) {
+            xdg_surface_destroy(xpopsurf);
+        }
+        if (pop != nullptr) {
+            wl_surface_destroy(pop);
+        }
+        if (subsurface != nullptr) {
+            wl_subsurface_destroy(subsurface);
+        }
+        if (sub != nullptr) {
+            wl_surface_destroy(sub);
+        }
+        if (xtop != nullptr) {
+            xdg_toplevel_destroy(xtop);
+        }
+        if (xsurf != nullptr) {
+            xdg_surface_destroy(xsurf);
+        }
+        if (root != nullptr) {
+            wl_surface_destroy(root);
+        }
+        if (pointer != nullptr) {
+            wl_pointer_destroy(pointer);
+        }
+        if (touch != nullptr) {
+            wl_touch_destroy(touch);
+        }
+        if (keyboard != nullptr) {
+            wl_keyboard_destroy(keyboard);
+        }
+        if (seat != nullptr) {
+            wl_seat_destroy(seat);
+        }
+        if (wm_base != nullptr) {
+            xdg_wm_base_destroy(wm_base);
+        }
+        if (subcompositor != nullptr) {
+            wl_subcompositor_destroy(subcompositor);
+        }
+        if (compositor != nullptr) {
+            wl_compositor_destroy(compositor);
+        }
+        if (shm != nullptr) {
+            wl_shm_destroy(shm);
+        }
+        if (registry != nullptr) {
+            wl_registry_destroy(registry);
+        }
+        wl_display_flush(dpy);
+        wl_display_disconnect(dpy);
+    }
+};
+
+} // namespace
+
+TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard focus") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new TreeTestExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    // A virtual keyboard on the seat (headless has none) so focus_keyboard can
+    // deliver a wl_keyboard enter; added before the client binds the seat.
+    server->ui_add_test_keyboard();
+
+    TreeClient client(server->socket_name());
+    client.start();
+
+    const bool ok = pump_until_se(*server, [&] { return client.ready.load(); }, 800) &&
+                    pump_until_se(*server, [&] { return ext->has_surface(); }, 800);
+    if (!ok || !ext->has_element() || server->ui_frame_count() == 0) {
+        // No GL path on this box, or the client could not map: skip (mirrors the
+        // other GL-gated tests). The pure-core input math is asserted separately.
+        client.join();
+        return;
+    }
+    pump(*server, 40); // let the tree re-walk + child <img> placement settle
+
+    // (A) TREE: the root + the subsurface + the popup compose as per-node <img>
+    // elements (root authored; subsurface + popup created by the substrate).
+    INFO("img count = ", server->ui_element_count("img"));
+    CHECK(server->ui_element_count("img") >= 3);
+
+    // (A) FRAME-DONE walks the WHOLE tree: the count climbs by MORE than one per
+    // composited frame (root + subsurface + popup each get a frame-done).
+    const int fd0 = server->ui_surface_element_frame_done_count();
+    pump(*server, 20);
+    const int fd1 = server->ui_surface_element_frame_done_count();
+    CHECK(fd1 > fd0);
+    CHECK(fd1 - fd0 >= 3); // >= one per node (root + subsurface + popup)
+
+    // (B) INPUT-BACK pointer: drive a motion at a known layout point over the
+    // ROOT region of the element. Surface at (40,30); the root img fills 200x200
+    // 1:1 with the 200x200 buffer, so layout (40+50, 30+60) => surface-local
+    // (50,60) on the root client surface.
+    using DK = unbox::kernel::Server::UiTouchOverride; // (unused; keep includes warm)
+    (void)DK::automatic;
+    server->ui_route_pointer_motion_for_test(TreeTestExtension::kSurfX + 50.0,
+                                             TreeTestExtension::kSurfY + 60.0, 1000);
+    pump_until_se(*server, [&] { return client.ptr_enters.load() > 0; }, 200);
+    CHECK(client.ptr_enters.load() > 0);
+    CHECK(client.ptr_enter_surface.load() == 0); // hit the ROOT node
+    CHECK(client.last_ptr_x.load() == doctest::Approx(50.0).epsilon(0.05));
+    CHECK(client.last_ptr_y.load() == doctest::Approx(60.0).epsilon(0.05));
+
+    // (B) INPUT-BACK pointer over the SUBSURFACE node: the subsurface is 40x40 at
+    // tree offset (20,30); a point at layout (40+30, 30+45) => surface-local
+    // (30,45) on the root, which lands inside the subsurface (its <img> spans
+    // (20,30)..(60,70)). The pick must hit the SUBSURFACE node and report coords
+    // LOCAL TO THE SUBSURFACE: (30-20, 45-30) = (10,15).
+    server->ui_route_pointer_motion_for_test(TreeTestExtension::kSurfX + 30.0,
+                                             TreeTestExtension::kSurfY + 45.0, 1010);
+    pump(*server, 5);
+    CHECK(client.ptr_enter_surface.load() == 1); // the subsurface node
+    CHECK(client.last_ptr_x.load() == doctest::Approx(10.0).epsilon(0.1));
+    CHECK(client.last_ptr_y.load() == doctest::Approx(15.0).epsilon(0.1));
+
+    // (B) INPUT-BACK button: a press over the root forwards a wl_pointer button.
+    const int btn0 = client.ptr_buttons.load();
+    server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 50.0,
+                                             TreeTestExtension::kSurfY + 60.0, true, 1020);
+    server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 50.0,
+                                             TreeTestExtension::kSurfY + 60.0, false, 1021);
+    pump_until_se(*server, [&] { return client.ptr_buttons.load() > btn0; }, 200);
+    CHECK(client.ptr_buttons.load() > btn0);
+
+    // (B) INPUT-BACK touch: a touch-down over the root forwards a wl_touch down at
+    // surface-local coords.
+    server->ui_route_touch_down_for_test(7, TreeTestExtension::kSurfX + 50.0,
+                                         TreeTestExtension::kSurfY + 60.0, 1030);
+    pump_until_se(*server, [&] { return client.touch_downs.load() > 0; }, 200);
+    CHECK(client.touch_downs.load() > 0);
+    CHECK(client.last_touch_x.load() == doctest::Approx(50.0).epsilon(0.05));
+    CHECK(client.last_touch_y.load() == doctest::Approx(60.0).epsilon(0.05));
+    server->ui_route_touch_up_for_test(7, 1031);
+
+    // (C) KEYBOARD FOCUS: focusing the element delivers a wl_keyboard enter, then
+    // a forwarded key reaches the client.
+    ext->focus();
+    pump_until_se(*server, [&] { return client.kbd_enters.load() > 0; }, 200);
+    CHECK(client.kbd_enters.load() > 0);
+    const int keys0 = client.keys.load();
+    server->ui_send_key_for_test(/*KEY_A*/ 30, true);
+    server->ui_send_key_for_test(/*KEY_A*/ 30, false);
+    pump_until_se(*server, [&] { return client.keys.load() > keys0; }, 200);
+    CHECK(client.keys.load() > keys0);
+
+    client.join();
+    unsetenv("WLR_HEADLESS_OUTPUTS");
+}
+
+// ============================================================================
+// RML compositing Wave 1b: surface-element input-back through a TRANSFORMED
+// hosting element. A point on the rotation AXIS (the element centre) projects to
+// the surface centre regardless of the rotateY, so we can assert EXACT surface-
+// local coords even under a 3D transform (Element::Project inverts it). This is
+// the live analogue of the pure-core round-trip test above.
+// ============================================================================
+
+TEST_CASE("surface-element: input-back through a 3D-transformed hosting element") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new TreeTestExtension();
+    ext->set_transform(35.0); // perspective + rotateY(35deg) about 50% origin
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    // Advertise seat pointer/touch capabilities (headless adds no input devices,
+    // so update_seat_capabilities never runs); the seam does this as a side effect.
+    server->ui_add_test_keyboard();
+
+    TreeClient client(server->socket_name());
+    client.start();
+
+    const bool ok = pump_until_se(*server, [&] { return client.ready.load(); }, 800) &&
+                    pump_until_se(*server, [&] { return ext->has_surface(); }, 800);
+    if (!ok || !ext->has_element() || server->ui_frame_count() == 0) {
+        client.join();
+        return;
+    }
+    pump(*server, 40);
+
+    // The element box is 200x200 at layout (40,30); its centre is layout
+    // (40+100, 30+100). Under perspective+rotateY about the 50% origin the centre
+    // sits on the rotation axis, so it projects to surface-local (100,100) — the
+    // transform-aware Element::Project recovers the centre exactly. (An untilted
+    // build would give the same answer; the point is the tilt does NOT shift the
+    // axis point, proving the projection — not a naive axis-aligned map — runs.)
+    server->ui_route_pointer_motion_for_test(TreeTestExtension::kSurfX + 100.0,
+                                             TreeTestExtension::kSurfY + 100.0, 2000);
+    pump_until_se(*server, [&] { return client.ptr_enters.load() > 0; }, 200);
+    REQUIRE(client.ptr_enters.load() > 0);
+    CHECK(client.ptr_enter_surface.load() == 0); // the root node
+    CHECK(client.last_ptr_x.load() == doctest::Approx(100.0).epsilon(0.03));
+    CHECK(client.last_ptr_y.load() == doctest::Approx(100.0).epsilon(0.03));
 
     client.join();
     unsetenv("WLR_HEADLESS_OUTPUTS");

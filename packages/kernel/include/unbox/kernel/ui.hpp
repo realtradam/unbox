@@ -322,17 +322,35 @@ protected:
 // extension via unique_ptr; destruction drops the import, ends the
 // frame-callback duty, and unregisters the URI. Event-loop thread only.
 //
+// REPRESENTS THE WHOLE SURFACE TREE. create_surface_element(root) transparently
+// manages the root wl_surface AND its subsurfaces AND (for an xdg surface) its
+// xdg popups as per-subsurface CHILD elements, each its own live texture at its
+// tree offset; the substrate places the child <img> elements itself (relative to
+// the root img's resolved box, so a moving/resized parent drags them; popups are
+// NOT parent-clipped). A consumer authors only ONE <img src=source_uri()> for
+// the root — it does NOT (and cannot) address the children; the element is the
+// whole tree. source_uri()/width()/height() describe the ROOT surface.
+//
+// INPUT-BACK IS AUTOMATIC. When a pointer/touch event's transform-aware pick on
+// a hosting ui surface lands on this element (root OR a subsurface/popup child),
+// the substrate forwards it to that client surface at surface-LOCAL coordinates
+// via the kernel's wl_seat — through the element's real RCSS transform (no extra
+// wiring; the cursor stays a wlr hardware plane). Keyboard focus is opt-in via
+// focus_keyboard() (the seat MECHANISM only — which window gets focus is a wm
+// policy, a later wave).
+//
 // HOW IT DIFFERS FROM Preview (which it otherwise mirrors):
-//  - LIVE, not frozen: it re-imports the client's current buffer every commit
+//  - LIVE, not frozen: it re-imports each node's current buffer every commit
 //    (seq-gated — a static client costs ZERO work, an updating one costs one
-//    re-import per committed frame), so there is NO refresh(): it updates
-//    itself.
+//    re-import per committed frame per changed node), so there is NO refresh():
+//    it updates itself.
 //  - It DRIVES the client's frame callbacks: while the element exists the
-//    substrate sends the backing wl_surface its frame-done each composited
-//    frame, so the client keeps producing buffers (without this a client draws
-//    once and waits forever — the spike's stuck-frame fix).
-//  - A client commit DIRTIES the hosting ui surface(s): the next frame
-//    re-renders the updated texture (a static client schedules nothing).
+//    substrate sends the WHOLE TREE its frame-done each composited frame, so the
+//    client keeps producing buffers (without this a client draws once and waits
+//    forever — the spike's stuck-frame fix).
+//  - A client commit DIRTIES the hosting ui surface(s): the next frame re-walks
+//    the tree + re-renders the updated textures (a static client schedules
+//    nothing).
 //
 // LIFETIME (part of the contract — see .unbox/rules/listener-lifetime.md). The
 // wl_surface passed to create_surface_element is a BORROW: the substrate samples
@@ -340,21 +358,33 @@ protected:
 // element the moment the surface unmaps or is destroyed (extensions already
 // track map/unmap). Sampling a surface element after its wl_surface has been
 // destroyed is UNDEFINED BEHAVIOUR — the substrate cannot detect a freed
-// wl_surface. (Wave 1 is SINGLE-SURFACE: one element per wl_surface, no
-// subsurface/popup child trees yet — that is Wave 1b.)
+// wl_surface. Subsurfaces/popups are managed internally (the substrate drops a
+// child node the instant its surface leaves the tree), so the caller tracks only
+// the ROOT surface's lifetime.
 class SurfaceElement {
 public:
     virtual ~SurfaceElement() = default;
     SurfaceElement(const SurfaceElement&) = delete;
     auto operator=(const SurfaceElement&) -> SurfaceElement& = delete;
 
-    // The <img src> value resolving to this surface's LIVE texture inside any ui
-    // surface of this substrate (e.g. "unbox-surface://7"). Stable for life.
+    // The <img src> value resolving to this surface's LIVE (ROOT) texture inside
+    // any ui surface of this substrate (e.g. "unbox-surface://7"). Stable for
+    // life. The substrate derives child node URIs from this and places their
+    // <img> elements itself — do NOT author them.
     [[nodiscard]] virtual auto source_uri() const -> std::string = 0;
-    // The client surface's current pixel size (tracks commits). 0 until the
+    // The ROOT client surface's current pixel size (tracks commits). 0 until the
     // first buffer has been imported.
     [[nodiscard]] virtual auto width() const -> int = 0;
     [[nodiscard]] virtual auto height() const -> int = 0;
+
+    // Give this element's ROOT client surface keyboard focus on the kernel's
+    // seat: subsequent keys route to it (via the seat the kernel already drives).
+    // This is the seat MECHANISM only — focus POLICY (which window, click-to-
+    // focus) is a window-manager extension's job (a later wave). Idempotent.
+    // Calling it on an element whose root surface is unmapped is harmless. The
+    // substrate clears this focus automatically when the element is destroyed, so
+    // the seat never stays focused on a dead surface.
+    virtual void focus_keyboard() = 0;
 
     // NO refresh() (unlike Preview): a surface element updates itself every
     // client commit (seq-gated re-import) and drives the client's frame
@@ -411,16 +441,23 @@ public:
     //
     // CONTRAST WITH create_preview: a Preview is a FROZEN one-shot snapshot of a
     // scene subtree that you refresh() manually; a SurfaceElement is LIVE and
-    // SELF-UPDATING — it re-imports `client`'s current buffer on every commit
-    // (seq-gated, so a static client is free) and the substrate DRIVES
-    // `client`'s frame callbacks while the element exists, so the client keeps
-    // drawing. There is no refresh().
+    // SELF-UPDATING — it re-imports `client`'s (and its subsurfaces'/popups')
+    // current buffers on every commit (seq-gated, so a static client is free) and
+    // the substrate DRIVES the whole tree's frame callbacks while the element
+    // exists, so the client keeps drawing. There is no refresh().
     //
-    // LIFETIME: `client` is a BORROW. The caller guarantees it outlives the
-    // returned element and MUST drop the element on the surface's unmap/destroy
-    // (see SurfaceElement above + .unbox/rules/listener-lifetime.md). Wave 1 is
-    // single-surface (one element per wl_surface; subsurface/popup child trees
-    // are Wave 1b).
+    // `client` is the ROOT of a surface TREE: the returned element transparently
+    // manages the root's subsurfaces and xdg popups as per-subsurface child
+    // elements (each its own live texture at its tree offset, placed by the
+    // substrate), and routes pointer/touch back to whichever node the pick lands
+    // on (see SurfaceElement above). The consumer authors only the root's
+    // <img src=source_uri()>.
+    //
+    // LIFETIME: `client` (the ROOT) is a BORROW. The caller guarantees it
+    // outlives the returned element and MUST drop the element on the root
+    // surface's unmap/destroy (see SurfaceElement above +
+    // .unbox/rules/listener-lifetime.md). Subsurfaces/popups are managed
+    // internally — the caller tracks only the root.
     [[nodiscard]] virtual auto create_surface_element(wlr_surface* client)
         -> std::unique_ptr<SurfaceElement> = 0;
 

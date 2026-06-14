@@ -172,6 +172,23 @@ public:
     // is kept). Test instrumentation; single-thread only.
     auto ui_reload_surface() -> bool;
 
+    // ---- surface-element input-back test seams (kernel suite only) ----
+    // Headless has no input devices, so these drive the substrate's input
+    // routing directly (the same route_* the cursor/touch handlers call) at a
+    // known layout point, so a test can assert a surface element forwards the
+    // pick to its client at surface-LOCAL coords via the seat. Single-thread only.
+    void ui_route_pointer_motion_for_test(double lx, double ly, unsigned int time_msec);
+    void ui_route_pointer_button_for_test(double lx, double ly, bool pressed,
+                                          unsigned int time_msec);
+    void ui_route_touch_down_for_test(int id, double lx, double ly, unsigned int time_msec);
+    void ui_route_touch_up_for_test(int id, unsigned int time_msec);
+    // Add a minimal virtual keyboard to the seat (headless has none) so the
+    // keyboard-focus primitive can deliver a wl_keyboard enter, then inject a key
+    // the seat forwards to the focused surface (the post-filter equivalent of the
+    // input.cpp key path). Lets the suite prove SurfaceElement::focus_keyboard.
+    void ui_add_test_keyboard();
+    void ui_send_key_for_test(unsigned int keycode, bool pressed);
+
     // Pin the substrate's touch-mode for tests (none = automatic). Mirrors
     // UiSubstrate::TouchModeOverride; lets the suite drive the state machine and
     // its on_touch_mode_changed notification. Test instrumentation;

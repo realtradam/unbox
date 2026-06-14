@@ -50,6 +50,13 @@ extern "C" {
 #include <wlr/render/wlr_renderer.h>
 // Producer-side interface for the spike's custom data-ptr wlr_buffer (Plan B).
 #include <wlr/interfaces/wlr_buffer.h>
+// Producer-side interface for the kernel-suite virtual keyboard test seam
+// (wlr_keyboard_init/finish + wlr_keyboard_impl): headless has no input devices,
+// so the surface-element keyboard-focus test creates a minimal wlr_keyboard to
+// give the seat a keyboard. Plain declarations + a 2-field struct; no header-
+// inline function with a function-local static, so the `#define static` blanking
+// above is inert across it (re-audited, same as wlr_buffer's interface header).
+#include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_data_device.h>
