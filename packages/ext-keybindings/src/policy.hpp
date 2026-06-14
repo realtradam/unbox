@@ -246,13 +246,19 @@ public:
         // --- Tap state machine for Super ---
         if (is_super_keysym(keysym)) {
             if (pressed) {
-                // A fresh Super press arms the tap (only if nothing else was
-                // already held that would make this not a clean tap). Re-press
-                // while armed (auto-repeat) keeps the armed state.
-                if (!super_down_) {
-                    super_down_ = true;
-                    super_used_ = false;
-                }
+                // A genuine Super press ALWAYS (re)arms a fresh clean tap. We
+                // reset `super_used_` even when `super_down_` was already set:
+                // wlroots never emits auto-repeat as key events, so every press
+                // we see is a real physical press. If a prior Super RELEASE was
+                // dropped (a lost event, or the parent compositor swallowing it
+                // in nested dev), the SM would otherwise be stuck "down" — and
+                // because the old guard ignored re-presses, a later stray key
+                // could latch `super_used_` and silently eat the next tap. A
+                // physical press is authoritative: start from a clean slate.
+                // (Robustness only — the real "Super takes several presses"
+                // report was a layer-shell configure-loop, fixed elsewhere.)
+                super_down_ = true;
+                super_used_ = false;
             } else {
                 // Super release: fire the bare-Super tap iff it was a clean tap.
                 Outcome out{};
@@ -323,7 +329,7 @@ private:
 //
 // The out-of-the-box bindings, matching the sample unbox.toml the orchestrator
 // commits at repo root EXACTLY (brief):
-//   Super              -> spawn fuzzel
+//   Super              -> toggle fuzzel (pkill -x fuzzel || fuzzel)
 //   Alt+Tab            -> focus-next
 //   Alt+Shift+Tab      -> focus-prev
 //   Alt+F1             -> focus-next   (was ext-xdg-shell's Alt+F1 cycle)
@@ -337,7 +343,11 @@ private:
             out.push_back(Binding{.combo = *c, .action = action, .command = std::move(command)});
         }
     };
-    add("Super", Action::spawn, "fuzzel");
+    // Tap Super toggles the launcher: close fuzzel if it is already open,
+    // otherwise launch it. `pkill -x` returns 0 when it killed a running fuzzel
+    // (so `|| fuzzel` is skipped) and non-zero when none was running (so fuzzel
+    // launches). Runs via `/bin/sh -c`.
+    add("Super", Action::spawn, "pkill -x fuzzel || fuzzel");
     add("Alt+Tab", Action::focus_next, {});
     add("Alt+Shift+Tab", Action::focus_prev, {});
     add("Alt+F1", Action::focus_next, {});

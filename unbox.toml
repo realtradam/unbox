@@ -16,9 +16,13 @@
 #   command (spawn only) shell line, run via `sh -c`, so args/quoting work.
 
 [[keybind]]
-keys    = "Super"             # tap the Windows key
+keys    = "Super"             # tap the Windows key: toggle the launcher
 action  = "spawn"
-command = "fuzzel"
+# Toggle: if fuzzel is already open, close it; otherwise launch it. `pkill -x`
+# matches the exact process name and returns 0 when it killed something (so the
+# `|| fuzzel` is skipped); when nothing was running it returns non-zero and
+# fuzzel launches. Runs via `sh -c`.
+command = "pkill -x fuzzel || fuzzel"
 
 [[keybind]]
 keys   = "Alt+Tab"           # next window (all windows, wraps around)

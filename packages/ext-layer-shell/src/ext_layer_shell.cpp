@@ -397,11 +397,23 @@ LayerSurface::LayerSurface(LayerShellExt& owner, wlr_layer_surface_v1* surface,
     // RAII handle is a member; it unregisters when this LayerSurface dies.
     host_reg_ = owner_.host().host_surface(surface_->surface, scene_->tree);
 
-    // Re-arrange this surface's output on every commit (covers the mandatory
-    // initial-commit configure and any later anchor/zone/size change), then
-    // re-evaluate keyboard focus.
+    // Re-arrange this surface's output ONLY when the arrangement could have
+    // changed: the mandatory initial-commit configure, or a commit that changed
+    // a layout-relevant field (anchor / desired size / exclusive zone / margin /
+    // layer / exclusive edge — i.e. current.committed != 0). A plain buffer or
+    // frame commit changes none of these (committed == 0, not the initial
+    // commit) and MUST NOT trigger a configure: arrange() unconditionally calls
+    // wlr_scene_layer_surface_v1_configure, and in wlroots 0.20 that emits a
+    // fresh configure event every call. Reconfiguring on every commit created a
+    // configure -> ack_configure -> apply-commit -> configure feedback loop that
+    // flooded the client's 4 KiB connection buffer ("Data too big for buffer")
+    // and got it killed mid-handshake — the intermittent "fuzzel needs several
+    // Super presses to open" bug. Keyboard focus is still re-evaluated every
+    // commit (cheap; it only acts once mapped).
     commit_.connect(surface_->surface->events.commit, [this](void*) {
-        owner_.arrange(surface_->output);
+        if (surface_->initial_commit || surface_->current.committed != 0) {
+            owner_.arrange(surface_->output);
+        }
         update_keyboard_focus();
     });
 

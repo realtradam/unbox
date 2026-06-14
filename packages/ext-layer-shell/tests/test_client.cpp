@@ -53,6 +53,7 @@ struct Client {
     bool configured = false;
     bool closed = false;
     std::uint32_t configure_serial = 0;
+    int configure_count = 0;
 };
 
 void registry_global(void* data, wl_registry* reg, std::uint32_t name,
@@ -88,6 +89,24 @@ void ls_closed(void* data, zwlr_layer_surface_v1*) {
 }
 const zwlr_layer_surface_v1_listener kLayerSurfaceListener{ls_configure,
                                                            ls_closed};
+
+// A configure handler that mimics a real client (fuzzel) APPLYING its configure:
+// ack, then commit the surface to apply it. Counts how many configures arrive.
+void ls_configure_apply(void* data, zwlr_layer_surface_v1* ls,
+                        std::uint32_t serial, std::uint32_t, std::uint32_t) {
+    auto* c = static_cast<Client*>(data);
+    c->configured = true;
+    c->configure_serial = serial;
+    c->configure_count++;
+    zwlr_layer_surface_v1_ack_configure(ls, serial);
+    // The apply-commit: this re-enters the server's surface commit handler.
+    // Before the fix that handler unconditionally re-configured, so this commit
+    // produced ANOTHER configure -> ack -> commit ... an unbounded loop that
+    // overflowed the 4 KiB client connection buffer and killed the client.
+    wl_surface_commit(c->surface);
+}
+const zwlr_layer_surface_v1_listener kLayerSurfaceApplyListener{ls_configure_apply,
+                                                                ls_closed};
 
 // Pump server and client once, without blocking the client read.
 void pump(unbox::kernel::Server& server, wl_display* client) {
@@ -161,6 +180,85 @@ TEST_CASE("a real client's nil-output layer surface receives a configure") {
     CHECK(c.configured);          // the fix: a configure was sent
     CHECK_FALSE(c.closed);        // the bug: surface closed with no configure
     CHECK(c.configure_serial != 0);
+
+    if (c.layer_surface != nullptr) {
+        zwlr_layer_surface_v1_destroy(c.layer_surface);
+    }
+    if (c.surface != nullptr) {
+        wl_surface_destroy(c.surface);
+    }
+    if (c.layer_shell != nullptr) {
+        zwlr_layer_shell_v1_destroy(c.layer_shell);
+    }
+    if (c.output != nullptr) {
+        wl_output_destroy(c.output);
+    }
+    if (c.compositor != nullptr) {
+        wl_compositor_destroy(c.compositor);
+    }
+    if (c.registry != nullptr) {
+        wl_registry_destroy(c.registry);
+    }
+    wl_display_flush(c.display);
+    pump(*server, c.display);
+    wl_display_disconnect(c.display);
+}
+
+TEST_CASE("INVARIANT: applying configures keeps the configure count bounded") {
+    // Context: the fuzzel "needs several Super presses to open" bug was a
+    // configure -> ack -> commit -> configure feedback loop (the commit handler
+    // reconfigured on EVERY commit) that flooded the client's connection buffer
+    // and got it killed mid-handshake. The fix only re-arranges on the initial
+    // commit or a layout-state change (current.committed != 0).
+    //
+    // HONEST CAVEAT: this cooperative in-process headless harness does NOT
+    // reproduce the live loop (it passes with and without the fix) — the loop
+    // needed the real DRM/event-loop timing. This case is kept as a cheap
+    // INVARIANT guard: a client that faithfully acks + applies its configures
+    // must not be driven into an unbounded configure storm. A future change that
+    // reintroduces per-commit reconfiguration in a way the harness CAN provoke
+    // will trip the bound below.
+    auto server = make_headless_server();
+    server->install(unbox::ext_layer_shell::create());
+    server->activate_extensions();
+    REQUIRE(!server->socket_name().empty());
+
+    Client c;
+    c.display = wl_display_connect(server->socket_name().c_str());
+    REQUIRE(c.display != nullptr);
+    c.registry = wl_display_get_registry(c.display);
+    wl_registry_add_listener(c.registry, &kRegistryListener, &c);
+    for (int i = 0; i < 50 && (c.compositor == nullptr || c.layer_shell == nullptr);
+         ++i) {
+        pump(*server, c.display);
+    }
+    REQUIRE(c.compositor != nullptr);
+    REQUIRE(c.layer_shell != nullptr);
+
+    c.surface = wl_compositor_create_surface(c.compositor);
+    c.layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+        c.layer_shell, c.surface, /*output=*/nullptr,
+        ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "launcher");
+    REQUIRE(c.layer_surface != nullptr);
+    // The APPLY listener: acks AND commits on every configure (real client).
+    zwlr_layer_surface_v1_add_listener(c.layer_surface, &kLayerSurfaceApplyListener,
+                                       &c);
+    zwlr_layer_surface_v1_set_size(c.layer_surface, 382, 386);
+    zwlr_layer_surface_v1_set_anchor(c.layer_surface, 0);
+    wl_surface_commit(c.surface); // mandatory initial commit
+
+    // Pump generously. With the bug, configure_count would explode (the client
+    // re-commits on each configure); with the fix it settles after the first.
+    for (int i = 0; i < 200 && !c.closed; ++i) {
+        pump(*server, c.display);
+    }
+
+    CHECK(c.configured);   // got the initial configure
+    CHECK_FALSE(c.closed); // not killed by a buffer overflow
+    // The crux: a bounded number of configures. Correct behaviour is exactly 1
+    // (the initial); allow slack for an incidental re-arrange. The BUG produced
+    // hundreds-to-thousands here.
+    CHECK(c.configure_count <= 3);
 
     if (c.layer_surface != nullptr) {
         zwlr_layer_surface_v1_destroy(c.layer_surface);

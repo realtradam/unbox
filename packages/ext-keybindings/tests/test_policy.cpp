@@ -169,7 +169,7 @@ TEST_CASE("compiled defaults match the documented out-of-the-box set") {
     CHECK(d[0].combo.is_tap);
     CHECK(d[0].combo.modifiers == pol::mod_logo);
     CHECK(d[0].action == Action::spawn);
-    CHECK(d[0].command == "fuzzel");
+    CHECK(d[0].command == "pkill -x fuzzel || fuzzel"); // tap-Super toggles fuzzel
     CHECK(d[1].combo == parse_combo("Alt+Tab").value());
     CHECK(d[1].action == Action::focus_next);
     CHECK(d[2].combo == parse_combo("Alt+Shift+Tab").value());
@@ -350,7 +350,7 @@ TEST_CASE("REAL-SEAT: lone Super_L press->release fires spawn (modifiers == 0 bo
     auto up = m.feed(0xffeb /*Super_L*/, 0, false);
     REQUIRE(up.fired != Matcher::npos);
     CHECK(m.bindings()[up.fired].action == Action::spawn);
-    CHECK(m.bindings()[up.fired].command == "fuzzel");
+    CHECK(m.bindings()[up.fired].command == "pkill -x fuzzel || fuzzel");
     CHECK_FALSE(up.consume);
 }
 
@@ -365,7 +365,7 @@ TEST_CASE("REAL-SEAT: lone Super_L press->release fires spawn (WLR_MODIFIER_LOGO
     auto up = m.feed(0xffeb /*Super_L*/, pol::mod_logo, false);
     REQUIRE(up.fired != Matcher::npos);
     CHECK(m.bindings()[up.fired].action == Action::spawn);
-    CHECK(m.bindings()[up.fired].command == "fuzzel");
+    CHECK(m.bindings()[up.fired].command == "pkill -x fuzzel || fuzzel");
     CHECK_FALSE(up.consume);
 }
 
@@ -389,6 +389,27 @@ TEST_CASE("REAL-SEAT suppression: Super down, a down, a up, Super up -> NO tap")
     m.feed(kD, pol::mod_logo, false); // 'a'/'d' up (release never fires anyway)
     auto up = m.feed(0xffeb /*Super_L*/, pol::mod_logo, false);
     CHECK(up.fired == Matcher::npos); // tap suppressed
+}
+
+TEST_CASE("tap-Super resync: a dropped Super release does not eat the next tap") {
+    // Regression: "Super sometimes takes several presses to open fuzzel."
+    // Simulate a LOST release: Super goes down, but its release event never
+    // arrives (dropped on the real seat / swallowed by the parent compositor in
+    // nested dev). Then the user types a normal key, which under the old guard
+    // latched super_used_ while super_down_ was still stuck true. A subsequent
+    // genuine Super tap MUST still fire on its first press->release.
+    auto m = make_matcher();
+    m.feed(pol::keysym_super_l, pol::mod_logo, true); // Super down
+    // ... release LOST (never fed) ...
+    m.feed(kD, 0, true);  // user types a key while SM still thinks Super is held
+    m.feed(kD, 0, false);
+    // Fresh, clean Super tap:
+    auto down = m.feed(pol::keysym_super_l, pol::mod_logo, true);
+    CHECK(down.fired == Matcher::npos);
+    auto up = m.feed(pol::keysym_super_l, 0, false);
+    REQUIRE(up.fired != Matcher::npos); // tap fires on the FIRST clean attempt
+    CHECK(m.bindings()[up.fired].action == Action::spawn);
+    CHECK(m.bindings()[up.fired].command == "pkill -x fuzzel || fuzzel");
 }
 
 TEST_CASE("tap-Super gated: another key pressed while held suppresses the tap") {
