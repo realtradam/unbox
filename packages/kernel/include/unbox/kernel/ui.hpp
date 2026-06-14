@@ -102,6 +102,40 @@ public:
     // extension (its surfaces + subscriptions dropped) — never the session.
     virtual void bind_event(std::string_view name, std::function<void()> callback) = 0;
 
+    // Drag phase for bind_drag (a single captured pointer/touch drag stream).
+    enum class DragPhase { start, move, end };
+
+    // Bind a named RML drag interaction to a C++ callback. The document opts an
+    // element into dragging with the RCSS `drag` property and authors the event on
+    // it (e.g. data-event-dragstart / data-event-drag / data-event-dragend all
+    // naming <name>); the substrate routes RMLUi's Dragstart/Drag/Dragend for that
+    // element to ONE callback, tagged with the phase. `x`/`y` are the pointer
+    // position in THIS surface's LOCAL document coordinates (px, origin = surface
+    // top-left), so an extension can map travel to a fraction directly. Invoked on
+    // the event-loop thread; a throwing callback is caught at the substrate boundary
+    // and disables YOUR extension only — never the session. Call before the first
+    // frame (same rule as bind_event); re-binding the same name replaces it.
+    // A tap (press-release with no drag past RmlUi's threshold) does NOT fire this —
+    // it still fires data-event-click — so tap-to-restore and drag-to-close coexist.
+    //
+    // RML AUTHORING SHAPE (the substrate hooks NONE of these implicitly — author
+    // all three you want; binding one name to several phases is the whole point):
+    //
+    //   <... style="drag: drag;"
+    //        data-event-dragstart="<name>"
+    //        data-event-drag="<name>"
+    //        data-event-dragend="<name>">
+    //
+    // The RCSS `drag: drag;` on the element is REQUIRED — without it RMLUi emits no
+    // drag events at all (the captured pointer stream stays a plain click/tap). All
+    // three data-event-drag{start,,end} attributes name the SAME <name>; the
+    // substrate delivers each to your one callback with phase start/move/end
+    // respectively. Omit `data-event-dragstart`/`-dragend` if you only need the
+    // phase(s) you author — but the dock close needs all three (start = arm,
+    // move = live slide percent, end = snap), so author all three.
+    virtual void bind_drag(std::string_view name,
+                           std::function<void(DragPhase phase, double x, double y)> callback) = 0;
+
     // React to a touch-mode flip on THIS surface. `callback(touch)` is invoked
     // (event-loop thread) when the substrate's touch-mode changes — touch ==
     // true for finger mode. The substrate itself does NOTHING visual on a flip;

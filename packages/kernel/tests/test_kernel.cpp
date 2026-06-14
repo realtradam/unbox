@@ -808,6 +808,132 @@ TEST_CASE("substrate: data-for list renders N rows, re-renders on dirty, routes 
 }
 
 // ============================================================================
+// DRAG-EVENT BINDING (coordinate-carrying). A ui surface element opts into
+// dragging with RCSS `drag: drag;` and authors data-event-dragstart / -drag /
+// -dragend all naming ONE callback bound via UiSurface::bind_drag. The
+// substrate routes RMLUi's Dragstart/Drag/Dragend to that callback tagged with
+// DragPhase {start,move,end}, carrying the pointer position in SURFACE-LOCAL px
+// (origin top-left). The full path needs RmlUi to GENERATE drag events from a
+// real pointer-down→move-past-threshold→up sequence on the GL context, so it is
+// GL-path only (pixman has a null substrate, headless+gles2 exercises it). The
+// Server::ui_drag_element seam drives exactly that sequence (no input device).
+// ============================================================================
+
+namespace {
+
+// One full-bleed, drag-enabled box. `drag: drag;` is what makes RmlUi emit the
+// drag events; without it the same gesture is just a click. The box fills the
+// surface so the drag seam's centre-press always lands on it.
+const char* kDragRml = R"RML(<rml>
+<head>
+<style>
+body { background-color: #1e2230; width: 200px; height: 200px; margin: 0px; }
+#grip { display: block; position: absolute; left: 0px; top: 0px;
+        width: 200px; height: 200px; background-color: #3a4670; drag: drag; }
+</style>
+</head>
+<body data-model="ui">
+<div id="grip"
+     data-event-dragstart="slide"
+     data-event-drag="slide"
+     data-event-dragend="slide"></div>
+</body>
+</rml>)RML";
+
+// Records every drag phase + coordinate the callback receives.
+class DragTestExtension : public unbox::kernel::Extension {
+public:
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        UiSurfaceSpec spec;
+        spec.rml_inline = kDragRml;
+        spec.x = 40; // a non-zero surface origin: proves coords are surface-LOCAL
+        spec.y = 30; // (NOT layout-space), i.e. the substrate subtracted s.x/s.y.
+        spec.width = 200;
+        spec.height = 200;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+        if (surface_ != nullptr) {
+            surface_->bind_drag("slide",
+                                [this](UiSurface::DragPhase phase, double x, double y) {
+                                    phases.push_back(phase);
+                                    last_x = x;
+                                    last_y = y;
+                                    if (phase == UiSurface::DragPhase::start) {
+                                        start_x = x;
+                                        start_y = y;
+                                    }
+                                });
+        }
+    }
+
+    std::vector<UiSurface::DragPhase> phases;
+    double start_x = -1.0;
+    double start_y = -1.0;
+    double last_x = -1.0;
+    double last_y = -1.0;
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    Manifest manifest_{"drag-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+} // namespace
+
+TEST_CASE("substrate: bind_drag routes Dragstart/Drag/Dragend with surface-local coords") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new DragTestExtension();
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 60); // load + lay out the document so the grip has geometry
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM"); // no GL path on this box: skip
+        return;
+    }
+
+    using DP = UiSurface::DragPhase;
+
+    // Drag the grip by (+30,+20) from its centre. The seam presses at the box
+    // centre (100,100 in surface-local px), then moves past RmlUi's threshold.
+    REQUIRE(server->ui_drag_element("div", 0, 30.0, 20.0));
+
+    // (1) The callback saw a start, then move(s), then an end — in that order.
+    REQUIRE(ext->phases.size() >= 3);
+    CHECK(ext->phases.front() == DP::start);
+    CHECK(ext->phases.back() == DP::end);
+    bool saw_move = false;
+    for (std::size_t i = 1; i + 1 < ext->phases.size(); ++i) {
+        if (ext->phases[i] == DP::move) {
+            saw_move = true;
+        }
+    }
+    CHECK(saw_move);
+
+    // (2) Coordinates are SURFACE-LOCAL px (origin = surface top-left), NOT
+    // layout-space: the surface sits at layout (40,30) but the centre-press
+    // reports ~ (100,100), the grip's local centre — proof the substrate mapped
+    // mouse_x/mouse_y into the surface's own coordinate system.
+    CHECK(ext->start_x == doctest::Approx(100.0).epsilon(0.05));
+    CHECK(ext->start_y == doctest::Approx(100.0).epsilon(0.05));
+
+    // (3) The final (dragend) coordinate followed the travel: centre + 2*delta
+    // (the seam issues two moves of (dx,dy) and 2*(dx,dy)). So last ~ (160,140).
+    CHECK(ext->last_x == doctest::Approx(160.0).epsilon(0.05));
+    CHECK(ext->last_y == doctest::Approx(140.0).epsilon(0.05));
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+}
+
+// ============================================================================
 // slice-10 / ui-surface ALPHA (transparency). A ui surface composites with
 // per-pixel alpha: a pixel the document does NOT paint is transparent (the
 // scene below shows through), while a painted opaque box stays solid. The

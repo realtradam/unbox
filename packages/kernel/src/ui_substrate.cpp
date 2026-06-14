@@ -9,7 +9,9 @@
 #include <RmlUi/Core/DataVariable.h>
 #include <RmlUi/Core/Element.h>
 #include <RmlUi/Core/ElementDocument.h>
+#include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/Factory.h>
+#include <RmlUi/Core/ID.h>
 #include <RmlUi/Core/SystemInterface.h>
 #include <RmlUi/Core/Variant.h>
 
@@ -403,6 +405,18 @@ struct Surface {
         Substrate::Impl* owner;
     };
     std::list<EventBinding> event_bindings;
+    // Drag bindings: one callback fed by RMLUi's Dragstart/Drag/Dragend for the
+    // element(s) authoring data-event-drag{start,,end}=<name>. The phase is read
+    // off the live Rml::Event id; x/y are the event's mouse_x/mouse_y which the
+    // substrate already feeds the context in surface-LOCAL coords (ctx_motion
+    // subtracts s.x/s.y), so they ARE surface-local px (origin top-left). Same
+    // error-isolation boundary as EventBinding.
+    struct DragBinding {
+        std::function<void(UiSurface::DragPhase, double, double)> cb;
+        ExtensionId who;
+        Substrate::Impl* owner;
+    };
+    std::list<DragBinding> drag_bindings;
 
     // List bindings (slice 10 / b2). A bound list is a runtime-sized indexed
     // sequence the document iterates with data-for; each row exposes named
@@ -857,8 +871,10 @@ void Substrate::Impl::unwatch_surface(Surface* s) {
 
 bool Substrate::Impl::reload_surface(Surface& s) {
     // Only file-backed, already-loaded surfaces reload. The data model + the
-    // extension's registered bind_*/bind_list*/bind_event getters are CONTEXT-
-    // and substrate-owned, so they survive — we never touch s.ctor/s.*_bindings.
+    // extension's registered bind_*/bind_list*/bind_event/bind_drag getters are
+    // CONTEXT- and substrate-owned, so they survive — we never touch
+    // s.ctor/s.*_bindings (the reloaded document re-binds data-event-drag* to
+    // the still-present model callback by name).
     if (s.context == nullptr || s.resolved_path.empty() || !s.doc_loaded) {
         return false;
     }
@@ -1762,6 +1778,36 @@ auto Substrate::click_element(const char* tag, int index) -> bool {
     return false;
 }
 
+auto Substrate::drag_element(const char* tag, int index, double dx, double dy) -> bool {
+    for (Surface& s : impl_->surfaces) {
+        if (s.document == nullptr || s.context == nullptr) {
+            continue;
+        }
+        Rml::ElementList elements;
+        s.document->GetElementsByTagName(elements, Rml::String(tag));
+        if (index < 0 || index >= static_cast<int>(elements.size())) {
+            return false;
+        }
+        Rml::Element* el = elements[static_cast<std::size_t>(index)];
+        // The element's content-box centre in context (= surface-local) coords:
+        // the same space ctx_motion feeds and the same space mouse_x/mouse_y are
+        // reported in, so the delivered drag coords should match these moves.
+        const Rml::Vector2f origin = el->GetAbsoluteOffset(Rml::BoxArea::Content);
+        const int cx = static_cast<int>(origin.x + el->GetClientWidth() / 2.0F);
+        const int cy = static_cast<int>(origin.y + el->GetClientHeight() / 2.0F);
+        // Press at the centre, then move PAST RmlUi's drag threshold so it emits
+        // Dragstart + Drag; a second move proves move tracks travel; release ends.
+        s.context->ProcessMouseMove(cx, cy, 0);
+        s.context->ProcessMouseButtonDown(0, 0);
+        s.context->ProcessMouseMove(cx + static_cast<int>(dx), cy + static_cast<int>(dy), 0);
+        s.context->ProcessMouseMove(cx + static_cast<int>(dx) * 2,
+                                    cy + static_cast<int>(dy) * 2, 0);
+        s.context->ProcessMouseButtonUp(0, 0);
+        return true;
+    }
+    return false;
+}
+
 auto Substrate::reload_first_surface() -> bool {
     for (Surface& s : impl_->surfaces) {
         return impl_->reload_surface(s);
@@ -1920,6 +1966,58 @@ void SurfaceHandle::bind_event(std::string_view name, std::function<void()> call
                 if (binding->cb) {
                     binding->cb();
                 }
+            } catch (...) {
+                if (binding->owner->disable) {
+                    binding->owner->disable(binding->who);
+                }
+            }
+        });
+}
+
+namespace {
+// Map a live RMLUi drag event to the public DragPhase. Pure: only the three
+// drag ids are routed here (the binding hooks no other event), so an unknown id
+// is treated as a move (the safe middle phase) rather than dropped. Returns
+// false for an id we should ignore entirely (none currently).
+auto drag_phase_for(Rml::EventId id, UiSurface::DragPhase& out) -> bool {
+    switch (id) {
+    case Rml::EventId::Dragstart: out = UiSurface::DragPhase::start; return true;
+    case Rml::EventId::Dragend: out = UiSurface::DragPhase::end; return true;
+    case Rml::EventId::Drag: out = UiSurface::DragPhase::move; return true;
+    default: out = UiSurface::DragPhase::move; return true;
+    }
+}
+} // namespace
+
+void SurfaceHandle::bind_drag(std::string_view name,
+                              std::function<void(UiSurface::DragPhase, double, double)> callback) {
+    Surface& s = *surface_;
+    if (!s.ctor) {
+        return;
+    }
+    s.drag_bindings.push_back({std::move(callback), s.who, s.owner});
+    Surface::DragBinding* binding = &s.drag_bindings.back();
+    // One model callback name carries all three phases; the document authors
+    // data-event-dragstart / data-event-drag / data-event-dragend all naming
+    // <name> on a drag-enabled element (RCSS `drag: drag;`). The phase is read
+    // off the live event id; mouse_x/mouse_y are already surface-local px
+    // (ctx_motion feeds the context coords relative to the surface origin), so
+    // they pass straight through as x/y. Same error-isolation boundary as
+    // bind_event (a throw disables the owning extension only). Survives dev
+    // hot-reload like every other binding: registered once on the open ctor,
+    // re-applied by the substrate against the reloaded document.
+    s.ctor.BindEventCallback(
+        std::string(name),
+        [binding](Rml::DataModelHandle, Rml::Event& ev, const Rml::VariantList&) {
+            try {
+                if (!binding->cb) {
+                    return;
+                }
+                UiSurface::DragPhase phase = UiSurface::DragPhase::move;
+                drag_phase_for(ev.GetId(), phase);
+                const double x = static_cast<double>(ev.GetParameter<float>("mouse_x", 0.0F));
+                const double y = static_cast<double>(ev.GetParameter<float>("mouse_y", 0.0F));
+                binding->cb(phase, x, y);
             } catch (...) {
                 if (binding->owner->disable) {
                     binding->owner->disable(binding->who);

@@ -105,6 +105,10 @@ auto Server::ui_click_element(const char* tag, int index) -> bool {
     return impl_->substrate != nullptr && impl_->substrate->click_element(tag, index);
 }
 
+auto Server::ui_drag_element(const char* tag, int index, double dx, double dy) -> bool {
+    return impl_->substrate != nullptr && impl_->substrate->drag_element(tag, index, dx, dy);
+}
+
 auto Server::ui_reload_surface() -> bool {
     return impl_->substrate != nullptr && impl_->substrate->reload_first_surface();
 }

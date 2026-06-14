@@ -102,6 +102,8 @@ public:
     void bind_bool(std::string_view name, std::function<bool()> getter) override;
     void bind_string(std::string_view name, std::function<std::string()> getter) override;
     void bind_event(std::string_view name, std::function<void()> callback) override;
+    void bind_drag(std::string_view name,
+                   std::function<void(DragPhase, double, double)> callback) override;
     void bind_list(std::string_view name, std::function<std::size_t()> count) override;
     void bind_list_string(std::string_view list, std::string_view field,
                           std::function<std::string(std::size_t)> getter) override;
@@ -212,6 +214,14 @@ public:
     // Click the index-th `tag` element in the first surface's document (fires
     // its data-event-click). False if no such element. Drives a row event.
     auto click_element(const char* tag, int index) -> bool;
+    // Test seam: synthesize a real RmlUi drag on the index-th `tag` element of
+    // the first surface (press at the element's content centre, move PAST RmlUi's
+    // drag threshold by (dx,dy), then release), so a bind_drag callback receives
+    // start/move/end with surface-LOCAL coords — the same path a real captured
+    // pointer/touch drag takes, without an input device. False if no such
+    // element / no document. GL-path only (no-op skip when unavailable). Test
+    // instrumentation; single-thread only.
+    auto drag_element(const char* tag, int index, double dx, double dy) -> bool;
     // Test seam: synchronously reload the first surface's document from its file
     // (the same reload the dev inotify watcher drives), so tests trigger reload
     // deterministically without racing real filesystem events. Returns true if a

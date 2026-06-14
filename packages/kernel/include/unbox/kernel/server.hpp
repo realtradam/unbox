@@ -129,6 +129,14 @@ public:
     // Test instrumentation; single-thread only.
     auto ui_click_element(const char* tag, int index) -> bool;
 
+    // Synthesize a real RmlUi drag on the `index`-th element with tag `tag` in
+    // the first ui surface (press at its centre, move past RmlUi's drag
+    // threshold by (dx,dy), release), so a UiSurface::bind_drag callback receives
+    // start/move/end with surface-local coordinates — the same path a real
+    // captured pointer/touch drag takes, no input device. False if no such
+    // element / no GL document. Test instrumentation; single-thread only.
+    auto ui_drag_element(const char* tag, int index, double dx, double dy) -> bool;
+
     // Synchronously reload the first ui surface's document from its rml_path file
     // — the same reload the dev hot-reload (UNBOX_DEV) inotify watcher drives,
     // exposed so tests trigger it deterministically without racing real
