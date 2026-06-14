@@ -13,7 +13,14 @@ layout/animation/3D effects in RCSS; wlroots stays foundation + cursor plane +
 by OUR dirty-gated rendering (NOT a RMLUi built-in) + a deferred scanout bypass.
 GATED BY A SPIKE before commit. Full spec + acceptance criteria:
 `notes/rml-compositing.md`; decision row in `notes/plan.md` §2.
-NEXT ACTION: write the spike brief (kernel/substrate) and summon it.
+SPIKE RESULT: code-complete + self-verified **GO** on real Haswell+crocus (the
+CF-AX3's GPU class) — all 7 criteria `ALL PASS` headless; surface trees resolved
+to **per-subsurface elements** (RTT escape-hatch for tree-spanning effects);
+present path = FBO→dmabuf swapchain→wlr_scene_buffer + EGL fence. Throwaway
+target `packages/kernel/rml-compositing-spike` (`--verify` / `--run`), kept out
+of the shipped binary. NEXT ACTION: **USER real-seat GO/NO-GO** — 3D/touch feel,
+frame-time @4 windows+video, idle power (runbook in
+`reports/rml-compositing-spike.md` §5). Then Phase 1 (architecture).
 Tiling (slice 7) is DEFERRED behind this (becomes RCSS over surface elements;
 pure layout core in `notes/tiling-spec.md` carries over). Stage dock (slice 10)
 real-seat feel check is paused under this pivot.
@@ -116,7 +123,7 @@ deprecated no-op `Options::ui_spike`, retiring host-bin's demo ui.
 | 10 | **Stage dock** (ext-stage-dock): minimized-window previews on a left-edge swipe (Fork B) | **a1–d1 landed; previews real-seat-verified** | DONE: Super+M minimize→RMLUi-imported preview snapshot→dock slot→hide (previews confirmed rendering on hardware); RCSS dock slide-in + slot settle. NEXT: confirm tap-to-restore + animation feel; 1 boundary call (input-transparent UiSurface flag) → c1 gesture-claim → e1 gesture reveal/drag-out; then config-driven minimize keybind + favicon (XDG icon dep) |
 | 11 | **Status bar** (tent. ext-statusbar): iPad/iOS top bar — clock (left), configurable left/middle/right sections, tray (right) wifi/volume/battery | **IDEA — needs design** | sequenced AFTER slice 7 (tiling); replaces cut taskbar. Details + open questions: `notes/status-bar-home-screen.md` |
 | 12 | **Home screen** (tent. ext-home, iPad springboard): app grid; tap = launch-or-raise (instance picker if >1 open); add/remove apps; swipe-up-from-bottom to enter | **IDEA — needs design** | sequenced AFTER slice 7 (tiling); replaces cut taskbar. Details + open questions: `notes/status-bar-home-screen.md` |
-| 13 | **THE SPIKE: RML compositing** — RMLUi becomes the content compositor (toplevels + layer-shell incl. wallpaper + chrome = RML elements backed by LIVE, SHARED GL textures; layout/animation/3D effects in RCSS). wlroots = foundation + cursor plane + (deferred) fullscreen scanout bypass. | **ACTIVE (core) — spike** | GO/NO-GO on the CF-AX3: (1) live toplevel texture in RmlUi via shared context, ZERO per-frame copy; (2) RCSS 3D transform on it; (3) pointer+touch+keyboard routed back through RmlUi picking → wl_seat; (4) window w/ popup+subsurface composited (decides per-subsurface-elements vs per-window RTT); (5) wallpaper as an element; (6) perf ~4 windows@1080p + idle≈no-work (our dirty-gating) + video cost; (7) present via existing FBO→scene_buffer bridge. Full spec + decision row: `notes/rml-compositing.md`, plan.md §2. |
+| 13 | **THE SPIKE: RML compositing** — RMLUi becomes the content compositor (toplevels + layer-shell incl. wallpaper + chrome = RML elements backed by LIVE, SHARED GL textures; layout/animation/3D effects in RCSS). wlroots = foundation + cursor plane + (deferred) fullscreen scanout bypass. | **spike code-complete; GO (self-verified); pending USER real-seat GO/NO-GO** | All 7 criteria `ALL PASS` headless on Haswell+crocus: (1) zero-copy live dmabuf texture (cached when unchanged); (2) RCSS perspective+rotateY on live pixels (readback); (3) screen→surface-local inversion through the transform = 0.000000px; (4) surface tree composited → **per-subsurface elements** (RTT hook for tree-spanning effects); (5) wallpaper via identical import path; (6) idle dirty-gate = 0 idle renders / 1-per-commit (frame-time @load = real-seat); (7) FBO→dmabuf→wlr_scene_buffer + EGL fence. Spike target `rml-compositing-spike` (`--verify`/`--run`). Report + runbook: `reports/rml-compositing-spike.md`. |
 
 ## Deferred decisions (decide when reached — see notes/plan.md §7)
 

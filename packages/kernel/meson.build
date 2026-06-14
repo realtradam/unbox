@@ -88,3 +88,30 @@ kernel_test = executable(
   dependencies: [kernel_dep, doctest_dep],
 )
 test('kernel', kernel_test, suite: 'kernel')
+
+# ---- SPIKE: RML compositing (Phase 0 GO/NO-GO) -------------------------------
+#
+# A self-contained, RUNNABLE throwaway target (notes/rml-compositing.md §Phase 0,
+# prompts/rml-compositing-spike.md). It is its OWN minimal compositor that maps
+# real clients and composites them as LIVE surface elements inside an RmlUi
+# document, proving the 7 acceptance criteria. Kept OUT of the shipped `unbox`
+# binary: it is NOT in kernel_dep and host-bin never links it; build it
+# explicitly with `ninja -C build rml-compositing-spike`.
+#
+# It reuses the kernel's adapted RmlUi GL3 renderer (src/rmlui_renderer_gl3.cpp)
+# directly, so it needs RMLUi + EGL/GLES (kernel-private deps) AND the same
+# -DUNBOX_RMLUI_GLES native-GLES selection the kernel lib compiles under. The
+# generated layer-shell protocol header rides in via the source list (build
+# order). It links the kernel lib for the renderer + wlr.hpp wrapper.
+rml_compositing_spike = executable(
+  'rml-compositing-spike',
+  'src/spike/rml_compositing_spike.cpp',
+  'src/spike/rml_compositing_spike_run.cpp',
+  'src/rmlui_renderer_gl3.cpp',
+  wlr_layer_shell_protocol_h,
+  cpp_args: ['-DUNBOX_RMLUI_GLES'],
+  include_directories: kernel_inc,
+  dependencies: [wlroots_dep, wayland_server_dep, xkbcommon_dep, rmlui_dep,
+                 egl_dep, glesv2_dep],
+  build_by_default: false,
+)
