@@ -1,4 +1,4 @@
-# Maintainer: user
+# Maintainer: unbox
 #
 # Local PKGBUILD for the unbox Wayland desktop environment. Builds the CURRENT
 # WORKING TREE (the repo this PKGBUILD lives in), not a clean VCS checkout — so

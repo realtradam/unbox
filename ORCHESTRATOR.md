@@ -15,9 +15,8 @@ back-and-forth) is a SIGNAL of a bad contract boundary, not normal work.
 
 This harness is a synthesis of "The AI Harness"
 (https://dev.to/louaiboumediene/the-ai-harness-why-your-ai-coding-agent-is-only-as-smart-as-the-repo-you-put-it-in-cml)
-with the dispatch methodology (reference repo:
-`user@builder:~/projects/internal-methodology/`, principles P1–P8 in
-its `notes/restructure-plan.md` §1). Key imports: tiered-cache context
+with a separate in-house methodology (a private reference repo whose
+principles P1–P8 live in its `notes/restructure-plan.md` §1). Key imports: tiered-cache context
 (tiny always-loaded files, big on-demand files), rules as crystallized scar
 tissue, glossary against synonym drift, skills for fumbled workflows, and
 "never write down what a frontier model already knows" (P6).
@@ -91,7 +90,7 @@ which is the real bug.
 - ccache always on; per-unit ninja targets in loops, never world rebuilds.
 - The RMLUi subproject builds ONCE and is never edited.
 - `build/` (fast, dev) and `build-asan/` (sanitizers) are separate dirs.
-- If local builds still bottleneck: build remotely on builder over ssh,
+- If local builds still bottleneck: build remotely on a fast box over ssh,
   run binaries here (deferred decision — exhaust ccache first).
 
 ## 6. Harness maintenance — HOW THE MD FILES GROW (your standing duty)

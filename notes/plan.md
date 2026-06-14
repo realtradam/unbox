@@ -13,8 +13,8 @@ CF-AX3 Let's Note, equally ergonomic for touchscreen, keyboard, and mouse.
 One process — a **monolithic kernel** (wlroots compositor core + embedded
 RMLUi UI substrate + extension host) — where **every feature is an
 in-process extension** coupled through typed C++ contracts. The methodology
-is imported from dispatch (`user@builder:~/projects/dispatch/
-arch-rewrite/`): minimal kernel, contracts as the only cross-unit surface,
+is imported from a separate in-house project: minimal kernel, contracts
+as the only cross-unit surface,
 one owner-agent per unit, functional core / imperative shell, glossary
 discipline, and the harness-as-deliverable (its principles P1–P8 apply
 here unchanged; see its `notes/restructure-plan.md` §1).
@@ -137,7 +137,7 @@ trusted.
 | Decision | Default until then | Trigger |
 |---|---|---|
 | dlopen extension loading | static linking | third-party extension exists |
-| Remote builds on builder | local + ccache | builds still bottleneck after ccache |
+| Remote builds on a fast box | local + ccache | builds still bottleneck after ccache |
 | OSK injection: wlr_seat direct vs virtual-keyboard protocol | direct injection | external-client IME need |
 | Workspace model (per-output? tags?) | undecided — design at slice 7 | tiling slice starts |
 | clang-format style | defer config to slice 1 | first formatting dispute |
@@ -148,7 +148,7 @@ trusted.
 
 ## 8. References
 
-- Methodology source: `user@builder:~/projects/internal-methodology/`
+- Methodology source: a private in-house reference repo
   (AGENTS.md, ORCHESTRATOR.md, GLOSSARY.md, notes/restructure-plan.md §1
   P1–P8)
 - "The AI Harness" — https://dev.to/louaiboumediene/the-ai-harness-why-your-ai-coding-agent-is-only-as-smart-as-the-repo-you-put-it-in-cml

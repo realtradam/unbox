@@ -100,6 +100,6 @@ deprecated no-op `Options::ui_spike`, retiring host-bin's demo ui.
 
 ## Deferred decisions (decide when reached — see notes/plan.md §7)
 
-dlopen extensions · remote builds on builder · xwayland default ·
+dlopen extensions · remote builds on a fast box · xwayland default ·
 OSK virtual-keyboard protocol vs direct seat injection · workspace model ·
 clang-format style details
