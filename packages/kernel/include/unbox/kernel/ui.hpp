@@ -196,6 +196,32 @@ public:
     virtual void bind_list_event(std::string_view list, std::string_view event,
                                  std::function<void(std::size_t row)> callback) = 0;
 
+    // bind_list_drag(list, name, callback): the per-ROW drag binding — the list
+    // analogue of bind_drag (which targets a single named element). Author it on
+    // a ROW element with the RCSS `drag: drag;` property plus the three
+    // data-event-drag* attributes all naming <name> AND passing the row index:
+    //
+    //   <div ... style="drag: drag;"
+    //        data-event-dragstart="<name>(it_index)"
+    //        data-event-drag="<name>(it_index)"
+    //        data-event-dragend="<name>(it_index)">
+    //
+    // The substrate delivers each of RmlUi's Dragstart/Drag/Dragend for that row
+    // to ONE callback tagged with the phase, the row index (from it_index), and
+    // x/y = the pointer in THIS surface's LOCAL document coordinates (px, origin =
+    // surface top-left), exactly as bind_drag. Use it for per-window move
+    // (titlebar) and resize (grips): the row index identifies which list element
+    // is being dragged. A tap (no travel past RmlUi's threshold) fires
+    // data-event-click, not this — so tap and drag coexist (same rule as
+    // bind_drag). Invoked on the event-loop thread; a throwing callback is caught
+    // at the substrate boundary and disables YOUR extension only — never the
+    // session. Register before the first frame; re-registering the same name
+    // replaces it. `list` is documentary (the event name is model-global, like
+    // bind_list_event) — keep names unique per surface.
+    virtual void bind_list_drag(
+        std::string_view list, std::string_view name,
+        std::function<void(std::size_t row, DragPhase phase, double x, double y)> callback) = 0;
+
     // Mark a bound scalar changed so the substrate re-reads its getter and
     // re-renders on the next frame. dirty() with no name marks ALL bound
     // scalars dirty (use sparingly). For a list, dirty(<list-name>) re-reads
@@ -376,6 +402,25 @@ public:
     // first buffer has been imported.
     [[nodiscard]] virtual auto width() const -> int = 0;
     [[nodiscard]] virtual auto height() const -> int = 0;
+
+    // The on-screen box (px) RCSS laid this element's ROOT <img> out to — the
+    // resolved content rectangle the live texture is actually drawn into, in the
+    // hosting ui surface's local document coordinates (px == dp; the substrate
+    // keeps the dp-ratio at 1.0). This is the kernel READING BACK the rectangle
+    // RCSS computed (the substrate already resolves it to place child popups); it
+    // never lets C++ COMPUTE a window's geometry — layout still lives entirely in
+    // RCSS. A window manager uses it to feed the tile size back to the client as a
+    // render resolution (ext-xdg-shell::Toplevel::set_size), so the client paints
+    // AT the tile box instead of being letterbox-scaled into it.
+    //
+    // Returns 0 when the element is not (yet) hosted by any laid-out document:
+    // before the first frame has rendered, or if no ui surface currently authors
+    // an <img src=source_uri()> for it. If several surfaces host it, the FIRST
+    // found is reported (the window field hosts each element in exactly one). The
+    // value tracks the LIVE layout, so during an RCSS transition it changes each
+    // frame and settles when the animation completes.
+    [[nodiscard]] virtual auto rendered_width() const -> int = 0;
+    [[nodiscard]] virtual auto rendered_height() const -> int = 0;
 
     // Give this element's ROOT client surface keyboard focus on the kernel's
     // seat: subsequent keys route to it (via the seat the kernel already drives).

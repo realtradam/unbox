@@ -108,6 +108,8 @@ public:
     [[nodiscard]] auto source_uri() const -> std::string override;
     [[nodiscard]] auto width() const -> int override;
     [[nodiscard]] auto height() const -> int override;
+    [[nodiscard]] auto rendered_width() const -> int override;
+    [[nodiscard]] auto rendered_height() const -> int override;
     void focus_keyboard() override;
     void on_pressed(std::function<void()> handler) override;
 
@@ -151,6 +153,9 @@ public:
                         std::function<bool(std::size_t)> getter) override;
     void bind_list_event(std::string_view list, std::string_view event,
                          std::function<void(std::size_t)> callback) override;
+    void bind_list_drag(
+        std::string_view list, std::string_view name,
+        std::function<void(std::size_t, DragPhase, double, double)> callback) override;
     void on_touch_mode_changed(std::function<void(bool)> callback) override;
     void dirty(std::string_view name) override;
     void dirty() override;

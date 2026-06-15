@@ -84,6 +84,11 @@ extern "C" {
 #include <wlr/types/wlr_touch.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_shell.h>
+// xdg-decoration (server-side decorations): lets the compositor tell clients NOT
+// to draw their own titlebars (CSD), so the RML window field's chrome is the only
+// decoration. ext-xdg-shell creates the manager + forces SERVER_SIDE when RML
+// compositing draws the chrome. Plain declarations only — static-blanking inert.
+#include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/util/log.h>
 #include <wlr/version.h>
 #undef namespace

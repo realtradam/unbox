@@ -42,6 +42,7 @@
 #include <list>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // The installed asset root, resolved against for a RELATIVE UiSurfaceSpec::
@@ -447,6 +448,15 @@ struct Surface {
         Substrate::Impl* owner;
     };
     std::list<ListEventBinding> list_event_bindings;
+    // Per-row drag callbacks (bind_list_drag): combine the drag phase + surface-
+    // local x/y (like DragBinding) with the row index from the data expression's
+    // first argument (like ListEventBinding). Same error-isolation boundary.
+    struct ListDragBinding {
+        std::function<void(std::size_t, UiSurface::DragPhase, double, double)> cb;
+        ExtensionId who;
+        Substrate::Impl* owner;
+    };
+    std::list<ListDragBinding> list_drag_bindings;
 
     // touch-mode-changed notification (one per surface; see ui.hpp). Fired on a
     // transition, error-isolated to `who`. touch-mode does NO visual scaling
@@ -864,6 +874,13 @@ struct Substrate::Impl {
     // child <img> whose node is gone. Pure DOM glue (no GL); called from tick_all
     // after the tree was re-walked. Idempotent per frame.
     void layout_surface_element_children(SurfaceElementState& el);
+
+    // The resolved on-screen content box (px) of this element's ROOT <img> in the
+    // FIRST ui surface document that hosts it (ui.hpp SurfaceElement::
+    // rendered_width/height — the kernel reading back RCSS's computed rectangle).
+    // {0,0} when no laid-out document hosts the element yet.
+    [[nodiscard]] auto surface_element_rendered_size(const SurfaceElementState& el) const
+        -> std::pair<int, int>;
 
     // ---- surface-element input-back ----
     // Resolve a hovered RmlUi element to the surface-element NODE it samples (its
@@ -1940,6 +1957,25 @@ void Substrate::Impl::layout_surface_element_children(SurfaceElementState& el) {
             img->SetProperty("height", std::to_string(box.h) + "px");
         }
     }
+}
+
+auto Substrate::Impl::surface_element_rendered_size(const SurfaceElementState& el) const
+    -> std::pair<int, int> {
+    // Read back the rectangle RCSS laid the root <img> out to (the same resolved
+    // content box used for child placement above). First hosting document wins;
+    // {0,0} before any document has laid it out. GetClientWidth/Height are the
+    // element's content-box dimensions in document px — exactly the texture's
+    // drawn box. Rounded to whole px (a client buffer size is integral).
+    for (const Surface& surf : surfaces) {
+        Rml::Element* root_img = find_img_by_src(surf.document, el.root.uri);
+        if (root_img == nullptr) {
+            continue;
+        }
+        const int w = static_cast<int>(root_img->GetClientWidth() + 0.5F);
+        const int h = static_cast<int>(root_img->GetClientHeight() + 0.5F);
+        return {w, h};
+    }
+    return {0, 0};
 }
 
 // ---- Surface-element input-back (pick -> surface-local -> wl_seat) -----------
@@ -3061,6 +3097,44 @@ void SurfaceHandle::bind_list_event(std::string_view /*list*/, std::string_view 
         });
 }
 
+void SurfaceHandle::bind_list_drag(
+    std::string_view /*list*/, std::string_view name,
+    std::function<void(std::size_t, UiSurface::DragPhase, double, double)> callback) {
+    // The per-row drag binding = bind_drag (phase from the event id, x/y from the
+    // event's surface-local mouse_x/mouse_y) + bind_list_event (row index from the
+    // data expression's first argument, it_index). The event name is model-global
+    // (like bind_list_event) so `list` is documentary; keep names unique. Survives
+    // dev hot-reload like every binding (registered once on the open ctor).
+    Surface& s = *surface_;
+    if (!s.ctor) {
+        return;
+    }
+    s.list_drag_bindings.push_back({std::move(callback), s.who, s.owner});
+    Surface::ListDragBinding* binding = &s.list_drag_bindings.back();
+    s.ctor.BindEventCallback(
+        std::string(name),
+        [binding](Rml::DataModelHandle, Rml::Event& ev, const Rml::VariantList& args) {
+            try {
+                if (!binding->cb) {
+                    return;
+                }
+                UiSurface::DragPhase phase = UiSurface::DragPhase::move;
+                drag_phase_for(ev.GetId(), phase);
+                std::size_t row = 0;
+                if (!args.empty()) {
+                    row = static_cast<std::size_t>(args[0].Get<int>());
+                }
+                const double x = static_cast<double>(ev.GetParameter<float>("mouse_x", 0.0F));
+                const double y = static_cast<double>(ev.GetParameter<float>("mouse_y", 0.0F));
+                binding->cb(row, phase, x, y);
+            } catch (...) {
+                if (binding->owner->disable) {
+                    binding->owner->disable(binding->who);
+                }
+            }
+        });
+}
+
 void SurfaceHandle::on_touch_mode_changed(std::function<void(bool)> callback) {
     surface_->touch_mode_cb = std::move(callback);
 }
@@ -3169,6 +3243,12 @@ SurfaceElementHandle::~SurfaceElementHandle() {
 auto SurfaceElementHandle::source_uri() const -> std::string { return state_->root.uri; }
 auto SurfaceElementHandle::width() const -> int { return state_->root.width; }
 auto SurfaceElementHandle::height() const -> int { return state_->root.height; }
+auto SurfaceElementHandle::rendered_width() const -> int {
+    return substrate_->impl_->surface_element_rendered_size(*state_).first;
+}
+auto SurfaceElementHandle::rendered_height() const -> int {
+    return substrate_->impl_->surface_element_rendered_size(*state_).second;
+}
 
 void SurfaceElementHandle::focus_keyboard() { substrate_->impl_->focus_keyboard(*state_); }
 
