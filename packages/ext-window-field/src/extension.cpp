@@ -172,6 +172,22 @@ private:
             }
         }
 
+        // Click/tap-to-focus: a press/down routed to this element's tree focuses
+        // its window. The handler captures `tl` (this window's identity, valid
+        // map..unmapped) but is robust — it only acts if that window is STILL
+        // tracked (index_of >= 0), so a stale fire is a harmless no-op. It is
+        // tiny + non-throwing (Toplevel::focus() is no-op if unmapped) and
+        // error-isolated by the substrate. focus() gives keyboard focus + fires
+        // on_toplevel_focused, so focused_ updates and RCSS raises/highlights it.
+        // The stored std::function dies with the element (dropped on unmap).
+        if (w.element != nullptr) {
+            w.element->on_pressed([this, tl] {
+                if (index_of(tl) >= 0) {
+                    tl->focus();
+                }
+            });
+        }
+
         // Take the toplevel OUT of wlr_scene: the surface element is now the ONLY
         // compositor of those pixels (the substrate drives the client's frame
         // callbacks). hide() is NOT unmap — the client stays mapped, its Toplevel*

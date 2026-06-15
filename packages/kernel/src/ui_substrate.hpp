@@ -109,6 +109,7 @@ public:
     [[nodiscard]] auto width() const -> int override;
     [[nodiscard]] auto height() const -> int override;
     void focus_keyboard() override;
+    void on_pressed(std::function<void()> handler) override;
 
 private:
     Substrate* substrate_;
@@ -195,10 +196,13 @@ public:
     auto create_preview(wlr_scene_tree* source) -> std::unique_ptr<Preview>;
 
     // Create a LIVE surface element backed by `client`'s current buffer (the
-    // live sibling of create_preview). Returns nullptr if unavailable or the
-    // initial import failed. `client` is a borrow the caller must outlive (see
-    // ui.hpp UiSubstrate::create_surface_element). Never throws.
-    auto create_surface_element(wlr_surface* client) -> std::unique_ptr<SurfaceElement>;
+    // live sibling of create_preview), owned by `who` (so a throwing on_pressed
+    // handler disables that extension only — error isolation, like create_surface).
+    // Returns nullptr if unavailable or the initial import failed. `client` is a
+    // borrow the caller must outlive (see ui.hpp UiSubstrate::create_surface_element).
+    // Never throws.
+    auto create_surface_element(ExtensionId who, wlr_surface* client)
+        -> std::unique_ptr<SurfaceElement>;
 
     // True while >=1 surface element exists: the kernel keeps a frame scheduled
     // so the frame-callback duty (send_frame_done_to_surface_elements) keeps the

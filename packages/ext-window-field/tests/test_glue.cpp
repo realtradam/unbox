@@ -316,8 +316,13 @@ TEST_CASE("ext-window-field: map tracks a window + hides it; a 2nd grows the lis
     CHECK(probe->focused_index() == 1); // map-focus moved to the 2nd window
 
     // --- on_toplevel_focused flips the focused flag: re-focus the FIRST window
-    // via Toplevel::focus() (exactly what ext-keybindings' Alt+Tab does). The
-    // field's focused index must follow back to window 0.
+    // via Toplevel::focus() (exactly what ext-keybindings' Alt+Tab does AND what
+    // the new click/tap-to-focus on_pressed handler calls). On headless pixman no
+    // surface element exists, so the live element's on_pressed handler cannot be
+    // driven through the probe; the wiring compiles and this assertion proves the
+    // SAME focus mechanism it routes through flips the flag. The press-path itself
+    // is covered by the kernel's own on_pressed test. The field's focused index
+    // must follow back to window 0.
     REQUIRE(observer->first_mapped() == tl1);
     tl1->focus();
     for (int i = 0; i < 50 && probe->focused_index() != 0; ++i) {

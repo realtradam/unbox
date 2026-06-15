@@ -659,6 +659,14 @@ struct SurfaceNode {
 struct SurfaceElementState {
     Substrate::Impl* owner = nullptr;
     int id = 0;
+    // The OWNING extension (for error isolation of on_pressed). A throwing
+    // on_pressed handler disables THIS extension only, via owner->disable(who).
+    ExtensionId who{};
+
+    // The click/tap-to-focus SIGNAL handler (ui.hpp SurfaceElement::on_pressed):
+    // invoked, error-isolated, when a pointer-button PRESS or a touch DOWN is
+    // routed to this element (root OR a child node). Default none (no-op).
+    std::function<void()> on_pressed_cb;
 
     // The ROOT node. `root.surface` is the wl_surface passed to
     // create_surface_element — a BORROW the caller outlives (ui.hpp). `root.uri`
@@ -874,6 +882,12 @@ struct Substrate::Impl {
                                    std::uint32_t button, std::uint32_t time_msec) -> bool;
     auto forward_touch_to_client(Surface& surf, double lx, double ly, std::int32_t id,
                                  bool down, std::uint32_t time_msec) -> bool;
+    // Fire `el`'s on_pressed handler (the click/tap-to-focus SIGNAL), if set.
+    // Called ONLY for a pointer-button PRESS / touch DOWN routed to a surface
+    // element (root OR child) — never on motion/release/miss. Error-isolated to
+    // the owning extension (a throw => disable(el.who)), like the other ui
+    // callbacks; never takes down the session.
+    void fire_pressed(SurfaceElementState& el);
     // Keyboard-focus PRIMITIVE (mechanism only — focus POLICY is a later wave).
     // Give `el`'s ROOT client surface seat keyboard focus + send the enter with
     // the active keyboard's pressed keys + modifiers, so the kernel's existing
@@ -1973,6 +1987,15 @@ auto Substrate::Impl::forward_pointer_to_client(Surface& surf, double lx, double
         wlr_seat_pointer_notify_clear_focus(seat);
         return false;
     }
+    // Click/tap-to-focus SIGNAL (ui.hpp SurfaceElement::on_pressed): a PRESS that
+    // lands on this element (root OR child) notifies the OWNER, in addition to the
+    // client forwarding below. `el` is the owning element (root), so a child-node
+    // press fires the ROOT element's handler. Fired only for button_down (not
+    // motion/release) and only on a hit — and BEFORE the coord projection, so the
+    // focus signal fires even for an edge-on element where no client coord exists.
+    if (kind == PointerKind::button_down && el != nullptr) {
+        fire_pressed(*el);
+    }
     // Project the screen point onto the node img's OWN (possibly 3D-transformed)
     // plane FIRST (Element::Project: the spike fix; no-op when untransformed),
     // then box->surface-local scale. The point fed to the context was in
@@ -2023,6 +2046,13 @@ auto Substrate::Impl::forward_touch_to_client(Surface& surf, double lx, double l
     if (node == nullptr || node->surface == nullptr) {
         return false;
     }
+    // Click/tap-to-focus SIGNAL (mirror forward_pointer_to_client): a touch DOWN
+    // that lands on this element (root OR child) notifies the OWNER too. `el` is
+    // the root element, so a child-node down fires the ROOT element's handler.
+    // Only on a DOWN (not a motion) and only on a hit, before coord projection.
+    if (down && el != nullptr) {
+        fire_pressed(*el);
+    }
     Rml::Element* img = find_img_by_src(surf.document, node->uri);
     if (img == nullptr) {
         return false;
@@ -2045,6 +2075,23 @@ auto Substrate::Impl::forward_touch_to_client(Surface& surf, double lx, double l
         wlr_seat_touch_notify_motion(seat, time_msec, id, sx, sy);
     }
     return true;
+}
+
+void Substrate::Impl::fire_pressed(SurfaceElementState& el) {
+    // The click/tap-to-focus SIGNAL. Error-isolated exactly like the other
+    // substrate callbacks (bind_event / bind_drag): a throwing handler disables
+    // the OWNING extension only (owner->disable(who)), never the session. A
+    // missing handler (default) is a no-op.
+    if (!el.on_pressed_cb) {
+        return;
+    }
+    try {
+        el.on_pressed_cb();
+    } catch (...) {
+        if (disable) {
+            disable(el.who);
+        }
+    }
 }
 
 void Substrate::Impl::focus_keyboard(SurfaceElementState& el) {
@@ -2211,7 +2258,8 @@ auto Substrate::create_preview(wlr_scene_tree* source) -> std::unique_ptr<Previe
 
 auto Substrate::preview_import_is_dmabuf() const -> bool { return impl_->last_preview_dmabuf; }
 
-auto Substrate::create_surface_element(wlr_surface* client) -> std::unique_ptr<SurfaceElement> {
+auto Substrate::create_surface_element(ExtensionId who, wlr_surface* client)
+    -> std::unique_ptr<SurfaceElement> {
     impl_->last_surface_element_dmabuf = false;
     if (!impl_->available() || client == nullptr) {
         return nullptr; // no GL path or no surface: graceful degrade (ui.hpp)
@@ -2220,6 +2268,7 @@ auto Substrate::create_surface_element(wlr_surface* client) -> std::unique_ptr<S
     impl_->surface_elements.emplace_back();
     SurfaceElementState& s = impl_->surface_elements.back();
     s.owner = impl_.get();
+    s.who = who; // for on_pressed error isolation
     s.id = ++impl_->next_surface_id;
     s.root.surface = client;
     s.root.uri = surface_element_uri(s.id); // == source_uri()
@@ -3115,5 +3164,11 @@ auto SurfaceElementHandle::width() const -> int { return state_->root.width; }
 auto SurfaceElementHandle::height() const -> int { return state_->root.height; }
 
 void SurfaceElementHandle::focus_keyboard() { substrate_->impl_->focus_keyboard(*state_); }
+
+void SurfaceElementHandle::on_pressed(std::function<void()> handler) {
+    // One handler per element; re-setting replaces it (the stored std::function
+    // lives in the SurfaceElementState and dies with the element).
+    state_->on_pressed_cb = std::move(handler);
+}
 
 } // namespace unbox::kernel

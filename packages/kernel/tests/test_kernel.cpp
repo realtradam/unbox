@@ -3135,6 +3135,15 @@ public:
             element_->focus_keyboard();
         }
     }
+    // Register the click/tap-to-focus press hook on the element, counting each
+    // fire (so the test can assert it fires once per press/down and never on
+    // motion/miss). Call after the element exists.
+    void install_press_counter() {
+        if (element_ != nullptr) {
+            element_->on_pressed([this] { ++pressed_count_; });
+        }
+    }
+    [[nodiscard]] auto pressed_count() const -> int { return pressed_count_; }
     [[nodiscard]] auto has_element() const -> bool { return element_ != nullptr; }
     [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
 
@@ -3166,6 +3175,7 @@ private:
     wlr_xdg_shell* xdg_shell_ = nullptr;
     wlr_surface* root_surface_ = nullptr;
     double transform_deg_ = 0.0;
+    int pressed_count_ = 0;
     unbox::kernel::Listener new_toplevel_, new_popup_, map_, commit_, popup_commit_;
     std::unique_ptr<unbox::kernel::SurfaceElement> element_;
     std::unique_ptr<UiSurface> surface_;
@@ -3573,6 +3583,11 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
     }
     pump(*server, 40); // let the tree re-walk + child <img> placement settle
 
+    // Install the click/tap-to-focus press hook (ui.hpp SurfaceElement::on_pressed).
+    // It must fire exactly once per pointer PRESS / touch DOWN routed to the
+    // element (root OR a child node), and NEVER on motion or on a miss.
+    ext->install_press_counter();
+
     // (A) TREE: the root + the subsurface + the popup compose as per-node <img>
     // elements (root authored; subsurface + popup created by the substrate).
     INFO("img count = ", server->ui_element_count("img"));
@@ -3600,6 +3615,9 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
     CHECK(client.last_ptr_x.load() == doctest::Approx(50.0).epsilon(0.05));
     CHECK(client.last_ptr_y.load() == doctest::Approx(60.0).epsilon(0.05));
 
+    // (B) PRESS HOOK: a MOTION over the element does NOT fire the press hook.
+    CHECK(ext->pressed_count() == 0);
+
     // (B) INPUT-BACK pointer over the SUBSURFACE node: the subsurface is 40x40 at
     // tree offset (20,30); a point at layout (40+30, 30+45) => surface-local
     // (30,45) on the root, which lands inside the subsurface (its <img> spans
@@ -3614,22 +3632,53 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
 
     // (B) INPUT-BACK button: a press over the root forwards a wl_pointer button.
     const int btn0 = client.ptr_buttons.load();
+    const int pressed0 = ext->pressed_count();
     server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 50.0,
                                              TreeTestExtension::kSurfY + 60.0, true, 1020);
+    // (B) PRESS HOOK: the PRESS fired the hook EXACTLY ONCE (the click/tap-to-
+    // focus signal, in addition to the client forwarding above).
+    CHECK(ext->pressed_count() == pressed0 + 1);
     server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 50.0,
                                              TreeTestExtension::kSurfY + 60.0, false, 1021);
+    // (B) PRESS HOOK: the RELEASE does NOT fire the hook (still one fire total).
+    CHECK(ext->pressed_count() == pressed0 + 1);
     pump_until_se(*server, [&] { return client.ptr_buttons.load() > btn0; }, 200);
     CHECK(client.ptr_buttons.load() > btn0);
 
+    // (B) PRESS HOOK over a CHILD node: a press at layout (40+30, 30+45) lands on
+    // the SUBSURFACE child <img> (its region (20,30)..(60,70) in root-local px),
+    // and STILL fires the ROOT element's handler — the element is the whole tree.
+    const int pressed_child0 = ext->pressed_count();
+    server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 30.0,
+                                             TreeTestExtension::kSurfY + 45.0, true, 1024);
+    server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 30.0,
+                                             TreeTestExtension::kSurfY + 45.0, false, 1025);
+    CHECK(client.ptr_enter_surface.load() == 1);            // the pick hit the subsurface
+    CHECK(ext->pressed_count() == pressed_child0 + 1);      // root handler still fired ONCE
+
+    // (B) PRESS HOOK miss: a press OFF the element (far outside the 200x200 surface)
+    // does NOT fire the hook.
+    const int pressed_miss0 = ext->pressed_count();
+    server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 1000.0,
+                                             TreeTestExtension::kSurfY + 1000.0, true, 1028);
+    server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 1000.0,
+                                             TreeTestExtension::kSurfY + 1000.0, false, 1029);
+    CHECK(ext->pressed_count() == pressed_miss0);
+
     // (B) INPUT-BACK touch: a touch-down over the root forwards a wl_touch down at
     // surface-local coords.
+    const int pressed_touch0 = ext->pressed_count();
     server->ui_route_touch_down_for_test(7, TreeTestExtension::kSurfX + 50.0,
                                          TreeTestExtension::kSurfY + 60.0, 1030);
     pump_until_se(*server, [&] { return client.touch_downs.load() > 0; }, 200);
     CHECK(client.touch_downs.load() > 0);
     CHECK(client.last_touch_x.load() == doctest::Approx(50.0).epsilon(0.05));
     CHECK(client.last_touch_y.load() == doctest::Approx(60.0).epsilon(0.05));
+    // (B) PRESS HOOK: the touch DOWN fired the hook exactly once.
+    CHECK(ext->pressed_count() == pressed_touch0 + 1);
     server->ui_route_touch_up_for_test(7, 1031);
+    // (B) PRESS HOOK: the touch UP does NOT fire the hook.
+    CHECK(ext->pressed_count() == pressed_touch0 + 1);
 
     // (C) KEYBOARD FOCUS: focusing the element delivers a wl_keyboard enter, then
     // a forwarded key reaches the client.

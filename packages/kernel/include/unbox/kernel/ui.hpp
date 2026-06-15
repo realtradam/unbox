@@ -386,6 +386,23 @@ public:
     // the seat never stays focused on a dead surface.
     virtual void focus_keyboard() = 0;
 
+    // The click/tap-to-focus SIGNAL. The substrate invokes `handler` (event-loop
+    // thread, ERROR-ISOLATED to the owning extension like every other ui callback
+    // — a throw disables YOUR extension only, never the session) when a pointer
+    // button PRESS or a touch DOWN is routed to THIS element: its ROOT surface OR
+    // any of its subsurface/popup child nodes (the element is the whole tree). It
+    // fires IN ADDITION to the automatic input-back that forwards the press/down
+    // to the client; it is purely the "this window was pressed" notification a
+    // window manager raises focus on. The handler decides POLICY (e.g. call
+    // ext-xdg-shell::Toplevel::focus()); the kernel signals only WHICH element.
+    //
+    // NOT fired on pointer motion, on a button RELEASE / touch UP, or on a
+    // press/down that MISSES every surface element (lands on plain RML or a gap).
+    // One handler per element; re-setting REPLACES it. Default is none (no-op).
+    // Capture only state that outlives this element (the stored std::function
+    // dies with the element).
+    virtual void on_pressed(std::function<void()> handler) = 0;
+
     // NO refresh() (unlike Preview): a surface element updates itself every
     // client commit (seq-gated re-import) and drives the client's frame
     // callbacks while it exists.

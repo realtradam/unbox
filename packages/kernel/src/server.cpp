@@ -107,7 +107,8 @@ auto Server::ui_create_surface_element_for_test() -> bool {
         return false;
     }
     impl_->test_surface_element =
-        impl_->substrate->create_surface_element(impl_->test_last_client_surface);
+        impl_->substrate->create_surface_element(kernel_extension_id,
+                                                 impl_->test_last_client_surface);
     return impl_->test_surface_element != nullptr;
 }
 
@@ -261,7 +262,7 @@ auto PerExtensionUi::create_surface_element(wlr_surface* client)
     if (server_->substrate == nullptr) {
         return nullptr;
     }
-    return server_->substrate->create_surface_element(client);
+    return server_->substrate->create_surface_element(id_, client);
 }
 
 auto PerExtensionUi::available() const -> bool {
