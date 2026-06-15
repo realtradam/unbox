@@ -1,0 +1,21 @@
+<rml>
+<head>
+<link type="text/rcss" href="field.rcss"/>
+</head>
+<!-- The WINDOW FIELD document (GLOSSARY: "window field"). data-model "ui". The
+     C++ glue (ext-window-field) drives ONLY the data: the bound "wins" list (one
+     row per mapped toplevel, each a live SURFACE ELEMENT) + the per-row `focused`
+     flag. LAYOUT + ANIMATION are RCSS (field.rcss) — the user's contract
+     decision: C++ never computes a window's on-screen rectangle.
+
+     Each row renders one <img src="{{ w.live_uri }}"> = the window's live
+     texture (UiSubstrate::create_surface_element -> SurfaceElement::source_uri()).
+     The kernel manages the toplevel's whole subsurface/popup tree behind that
+     single <img>; the document addresses only the root. data-class-focused keys
+     the RCSS highlight/raise off the focused window. -->
+<body data-model="ui" class="field">
+<div data-for="w : wins" class="win" data-class-focused="w.focused">
+<img class="live" src="{{ w.live_uri }}"/>
+</div>
+</body>
+</rml>

@@ -1,0 +1,77 @@
+/* The WINDOW FIELD layout (GLOSSARY: "window field"). RML compositing Wave 3.
+   LAYOUT + ANIMATION live ENTIRELY here (the user's contract decision): the C++
+   glue only feeds the bound "wins" list + the per-row `focused` flag; this RCSS
+   decides every window's on-screen box and animates changes. Real tiling /
+   stage-manager is a LATER refinement on this same field + list — Wave 3 keeps
+   it SIMPLE but clearly working.
+
+   THE LAYOUT (simple, N-window-safe with no per-index data): the field is a
+   flex row that wraps; every window is a flex tile sharing the space. The
+   FOCUSED window grows to dominate the field (a large flex-basis) and is
+   highlighted + lifted; the rest stay a row of smaller equal tiles. Because it
+   is pure flex keyed only on the `.focused` class, it works for any window
+   count and needs no geometry from C++. A `transition` on flex/transform/border
+   animates focus + map/unmap changes (RmlUi tweens the class flip). */
+
+/* The field fills its whole surface (sized to the output by the glue). It is a
+   wrapping flex row with a little gutter; transparent so an unpainted gap shows
+   the scene below (per-pixel alpha). */
+body.field {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: stretch;
+    justify-content: center;
+    padding: 6dp;
+    background-color: transparent;
+}
+
+/* A window tile. Default (unfocused): an equal, smaller share of the row. The
+   transition animates focus changes (flex-basis grow/shrink, the lift transform,
+   the highlight border) AND the layout reflow when a window maps/unmaps. RmlUi
+   6.2 has no bare `linear` keyword, so the carrier ease is cubic-in-out. */
+div.win {
+    display: block;
+    position: relative;
+    flex: 1 1 30%;
+    min-width: 20%;
+    height: 46%;
+    margin: 6dp;
+    background-color: #1c1c20ff;
+    border-radius: 8dp;
+    border-width: 2dp;
+    border-color: #00000000;
+    overflow: hidden;
+    transform: scale(0.96);
+    transform-origin: 50% 50%;
+    transition: flex-basis 0.22s cubic-in-out,
+                width 0.22s cubic-in-out,
+                height 0.22s cubic-in-out,
+                transform 0.22s cubic-in-out,
+                border-color 0.22s cubic-in-out;
+}
+
+/* The FOCUSED window DOMINATES the field: a large flex-basis so it takes the
+   bulk of the row (the rest wrap below as the smaller tile row), full height, a
+   bright highlight border, and a subtle lift (scale 1.0) — the "raise". This is
+   the only state C++ drives (the `focused` bool); everything else is geometry
+   RCSS owns. */
+div.win.focused {
+    flex: 1 1 100%;
+    height: 70%;
+    border-color: #4da3ffff;
+    transform: scale(1.0);
+}
+
+/* The live window texture fills its tile 1:1 (the <img src=live_uri> of the
+   surface element). The tile's rounded overflow:hidden clips it to the card. */
+div.win img.live {
+    display: block;
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+}
