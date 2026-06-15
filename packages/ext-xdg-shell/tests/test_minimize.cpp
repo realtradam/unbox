@@ -244,10 +244,10 @@ TEST_CASE("slice 10/b1: hide/show/geometry/scene_tree on a real mapped toplevel"
 
     // scene_tree(): non-null, a borrow, and equal to what the kernel registry
     // resolves the toplevel's surface to (the typed surface->tree contract the
-    // dock relies on). We recover the toplevel's wl_surface by walking the
-    // buffer nodes under the returned tree (the public Toplevel contract does
-    // not expose the surface; the kernel registry keys on it), then confirm the
-    // round-trip scene_tree_for(surface) == scene_tree().
+    // dock relies on). We independently recover the toplevel's root surface by
+    // walking the buffer nodes under the returned tree (the kernel registry keys
+    // on it), then confirm the round-trip scene_tree_for(surface) ==
+    // scene_tree().
     wlr_scene_tree* tree = tl->scene_tree();
     REQUIRE(tree != nullptr);
     struct SurfaceCatch {
@@ -266,6 +266,18 @@ TEST_CASE("slice 10/b1: hide/show/geometry/scene_tree on a real mapped toplevel"
         &caught);
     REQUIRE(caught.surface != nullptr);
     CHECK(observer->host()->scene_tree_for(caught.surface) == tree);
+
+    // wl_surface() (RML compositing Wave 2): the contract now exposes the
+    // toplevel's ROOT wl_surface — the handle ext-window-field passes to
+    // UiSubstrate::create_surface_element(). For a mapped toplevel it is
+    // non-null and IS the root surface: it must equal both the surface the scene
+    // tree hosts (walked above) and the surface the kernel registry resolves
+    // this very tree from. (Additive — scene_tree()/hide()/show()/geometry()
+    // are unchanged; the existing wlr_scene compositing path is untouched.)
+    wlr_surface* root = tl->wl_surface();
+    REQUIRE(root != nullptr);
+    CHECK(root == caught.surface);
+    CHECK(observer->host()->scene_tree_for(root) == tree);
 
     // geometry(): a non-empty box for a mapped toplevel.
     wlr_box box = tl->geometry();
@@ -292,20 +304,51 @@ TEST_CASE("slice 10/b1: hide/show/geometry/scene_tree on a real mapped toplevel"
     tl->show();
     CHECK(tree->node.enabled == true);
 
-    // A hidden toplevel must still unmap normally when the client closes it:
-    // hide it again, then destroy client-side; on_toplevel_unmapped MUST fire.
+    // A hidden toplevel must still unmap normally when the client withdraws it:
+    // hide it again, then UNMAP from the client side by committing a NULL buffer
+    // (the xdg_toplevel withdraw — the surface unmaps without the role object or
+    // wl_surface resource being destroyed); on_toplevel_unmapped MUST fire.
+    //
+    // Teardown-order note (listener-lifetime): we deliberately unmap via a
+    // null-buffer commit rather than tearing the wl_surface resource down
+    // mid-session. Destroying the wl_surface while the server is still running
+    // would run wlroots' surface_handle_resource_destroy, which asserts
+    // wl_list_empty(&surface->events.commit.listener_list). Any commit listener
+    // still bound to that surface at that instant aborts the whole test process.
+    // Our own ToplevelEntry::commit listener IS released in time (it dies with
+    // the entry on the xdg_toplevel destroy), but the kernel's headless
+    // surface-capture test seam keeps a commit listener on every client surface
+    // for the Server's lifetime and only detaches it during Server teardown
+    // (before it destroys the clients) — so a client-driven surface-resource
+    // destroy mid-test trips the assertion. We therefore let the surface (and
+    // the rest of the client's objects) be reaped by the Server destructor's
+    // ordered teardown (seam detached first, clients destroyed after), which is
+    // the same ordering a real session uses. See reports/ext-xdg-shell.md and
+    // the kernel change-request for the seam's missing per-surface unsubscribe.
     tl->hide();
+    wl_surface_attach(c.surface, nullptr, 0, 0);
+    wl_surface_commit(c.surface);
+    for (int i = 0; i < 200 && observer->unmapped_count() == 0; ++i) {
+        pump(*server, c.display);
+    }
+    CHECK(observer->unmapped_count() == 1);
+
+    // Client shutdown. We destroy every client proxy (so libwayland-client frees
+    // them — keeps the asan/lsan suite clean, mirroring the kernel's client
+    // test) and then disconnect, but we do NOT pump the server afterwards. The
+    // destroy requests sit unflushed-to-dispatch on the server until the Server
+    // destructor reaps the whole connection via wl_display_destroy_clients —
+    // which the kernel runs AFTER detaching its surface-capture commit seam, so
+    // the wl_surface resource is destroyed with no commit listener still bound
+    // (no surface_handle_resource_destroy assertion). Pumping here instead would
+    // dispatch the surface-destroy while the server (and seam) is alive and trip
+    // that wlroots assertion — the teardown-order bug this test now avoids.
     xdg_toplevel_destroy(c.toplevel);
     xdg_surface_destroy(c.xsurface);
     wl_surface_destroy(c.surface);
     c.toplevel = nullptr;
     c.xsurface = nullptr;
     c.surface = nullptr;
-    for (int i = 0; i < 200 && observer->unmapped_count() == 0; ++i) {
-        pump(*server, c.display);
-    }
-    CHECK(observer->unmapped_count() == 1);
-
     wl_buffer_destroy(buffer);
     if (c.wm_base != nullptr) {
         xdg_wm_base_destroy(c.wm_base);
@@ -319,7 +362,5 @@ TEST_CASE("slice 10/b1: hide/show/geometry/scene_tree on a real mapped toplevel"
     if (c.registry != nullptr) {
         wl_registry_destroy(c.registry);
     }
-    wl_display_flush(c.display);
-    pump(*server, c.display);
     wl_display_disconnect(c.display);
 }

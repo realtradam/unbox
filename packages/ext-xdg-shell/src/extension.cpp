@@ -87,6 +87,12 @@ struct ToplevelEntry final : Toplevel {
         return box;
     }
     [[nodiscard]] auto scene_tree() -> wlr_scene_tree* override { return scene; }
+    [[nodiscard]] auto wl_surface() -> wlr_surface* override {
+        // The toplevel's ROOT surface: the SAME surface whose tree `scene`
+        // hosts (it is what host_surface() registered and scene_tree_for()
+        // resolves back to this tree). A borrow with the Toplevel's lifetime.
+        return xdg_toplevel != nullptr ? xdg_toplevel->base->surface : nullptr;
+    }
     void hide() override {
         if (scene != nullptr) {
             wlr_scene_node_set_enabled(&scene->node, false);

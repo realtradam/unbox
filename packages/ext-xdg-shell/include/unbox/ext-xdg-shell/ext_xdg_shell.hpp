@@ -85,6 +85,19 @@ public:
     // hide()/show() enable/disable.
     [[nodiscard]] virtual auto scene_tree() -> wlr_scene_tree* = 0;
 
+    // The toplevel's ROOT wl_surface — the surface whose tree scene_tree()
+    // hosts (i.e. xdg_toplevel->base->surface). This is the handle a
+    // compositor / window-field passes to UiSubstrate::create_surface_element()
+    // to composite the window as a live RCSS surface element (RML compositing,
+    // Phase 2): the kernel then manages the toplevel's whole subsurface/popup
+    // tree itself, so this extension does NOT expose popup/subsurface handles.
+    // A non-owning BORROW with the SAME lifetime as the rest of Toplevel: valid
+    // only while the Toplevel borrow is live (i.e. until the matching
+    // on_toplevel_unmapped fires for it). Never store it; never destroy it.
+    // Returns nullptr only in the degenerate case of an already-destroyed
+    // underlying xdg_toplevel (never for a live, mapped toplevel).
+    [[nodiscard]] virtual auto wl_surface() -> wlr_surface* = 0;
+
     // Compositor-side HIDE / SHOW: disable / enable the toplevel's scene node
     // so it is not composited and the client stops receiving frame callbacks
     // (wlr_scene withholds them from a non-visible node), WITHOUT unmapping it
