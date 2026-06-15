@@ -7,6 +7,7 @@
 #include <unbox/kernel/listener.hpp>
 #include <unbox/kernel/wlr.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -68,6 +69,16 @@ struct ToplevelEntry final : Toplevel {
             wlr_xdg_toplevel_send_close(xdg_toplevel);
         }
     }
+    void set_size(int width, int height) override {
+        // Async size request (the same wlr call begin_resize uses for grabs and
+        // handle_new_toplevel uses for the initial 0×0). Clamp negatives to 0
+        // ("client picks"); the client replies on a later commit. No-op when
+        // detached (a destroyed underlying toplevel).
+        if (xdg_toplevel != nullptr) {
+            wlr_xdg_toplevel_set_size(xdg_toplevel, static_cast<std::uint32_t>(std::max(0, width)),
+                                      static_cast<std::uint32_t>(std::max(0, height)));
+        }
+    }
 
     // ---- minimize mechanism (slice 10 / b1) ----
     [[nodiscard]] auto geometry() const -> wlr_box override {
@@ -114,10 +125,21 @@ struct PopupEntry {
     Listener destroy;
 };
 
+// One xdg-toplevel-decoration object (the client opted into decoration
+// negotiation). We re-assert our preferred mode whenever the client (re)requests
+// one, and drop the entry on destroy. Listeners live as long as the entry.
+struct DecorationEntry {
+    wlr_xdg_toplevel_decoration_v1* deco = nullptr;
+    Listener commit;       // toplevel surface commit: apply the mode once initialized
+    Listener request_mode; // client asked for a mode: re-assert ours
+    Listener destroy;
+};
+
 class XdgShellExtension final : public kernel::Extension, public ActivationProbe {
 public:
-    XdgShellExtension()
-        : manifest_{"xdg-shell", kernel::Tier::core, {}} {}
+    explicit XdgShellExtension(bool prefer_server_side_decorations)
+        : prefer_ssd_(prefer_server_side_decorations),
+          manifest_{"xdg-shell", kernel::Tier::core, {}} {}
 
     [[nodiscard]] auto manifest() const -> const kernel::Manifest& override { return manifest_; }
 
@@ -143,6 +165,20 @@ public:
         new_popup_.connect(xdg_shell_->events.new_popup, [this](void* data) {
             handle_new_popup(static_cast<wlr_xdg_popup*>(data));
         });
+
+        // xdg-decoration: advertise the manager so clients negotiate who draws
+        // the titlebar. When the RML window field draws the chrome
+        // (prefer_ssd_), we force SERVER_SIDE so clients drop their own CSD;
+        // otherwise (classic wlr_scene path, no server chrome) we leave them
+        // CLIENT_SIDE. Owned by the display; dies with it.
+        decoration_mgr_ = wlr_xdg_decoration_manager_v1_create(host.display());
+        if (decoration_mgr_ != nullptr) {
+            new_decoration_.connect(
+                decoration_mgr_->events.new_toplevel_decoration, [this](void* data) {
+                    handle_new_decoration(
+                        static_cast<wlr_xdg_toplevel_decoration_v1*>(data));
+                });
+        }
 
         // Pointer routing is ENTIRELY ours: the kernel moves the cursor and
         // emits, but forwards NOTHING to clients (host.hpp catalogue). We
@@ -324,6 +360,50 @@ private:
             // Last action: erases `popup` (and its Listeners with it).
             popups_.erase(popup->xdg_popup);
         });
+    }
+
+    // The preferred decoration mode for THIS session (RML field draws chrome =>
+    // server-side; classic path => client-side).
+    [[nodiscard]] auto preferred_decoration_mode() const
+        -> wlr_xdg_toplevel_decoration_v1_mode {
+        return prefer_ssd_ ? WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
+                           : WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+    }
+
+    // Apply our preferred mode, but ONLY once the xdg_surface is initialized:
+    // set_mode schedules a configure, and wlr_xdg_surface_schedule_configure
+    // asserts `initialized` (the client creates the decoration object + requests
+    // a mode BEFORE its initial commit, so a naive set_mode there aborts). Guarded
+    // + idempotent via scheduled_mode, so the repeated commit/request_mode calls
+    // schedule at most one configure.
+    void apply_decoration_mode(DecorationEntry* entry) {
+        wlr_xdg_toplevel_decoration_v1* deco = entry->deco;
+        const auto mode = preferred_decoration_mode();
+        if (deco->toplevel->base->initialized && deco->scheduled_mode != mode) {
+            wlr_xdg_toplevel_decoration_v1_set_mode(deco, mode);
+        }
+    }
+
+    void handle_new_decoration(wlr_xdg_toplevel_decoration_v1* deco) {
+        auto owned = std::make_unique<DecorationEntry>();
+        DecorationEntry* entry = owned.get();
+        entry->deco = deco;
+        decorations_.emplace(deco, std::move(owned));
+
+        // Apply on the toplevel's surface commits (initialized is true by the
+        // commit event — same point the initial 0x0 configure is sent), and again
+        // whenever the client requests a mode (some toolkits ask for CSD; we
+        // re-assert SSD so the field's chrome is the only decoration). The
+        // immediate call covers a decoration created on an ALREADY-initialized
+        // surface; all routes are guarded by apply_decoration_mode.
+        entry->commit.connect(deco->toplevel->base->surface->events.commit,
+                              [this, entry](void*) { apply_decoration_mode(entry); });
+        entry->request_mode.connect(deco->events.request_mode,
+                                    [this, entry](void*) { apply_decoration_mode(entry); });
+        entry->destroy.connect(deco->events.destroy, [this, entry](void*) {
+            decorations_.erase(entry->deco); // last action: drops `entry` + its Listeners
+        });
+        apply_decoration_mode(entry);
     }
 
     // ---- scene hit-test (mirrors the former kernel toplevel_at) ----
@@ -634,9 +714,11 @@ private:
         double origin_y = 0.0;
     };
 
+    bool prefer_ssd_ = false; // force server-side decorations (RML field chrome)
     kernel::Manifest manifest_;
     Host* host_ = nullptr;
     wlr_xdg_shell* xdg_shell_ = nullptr;
+    wlr_xdg_decoration_manager_v1* decoration_mgr_ = nullptr;
     bool activated_ = false;
 
     // Exported hooks (adopt()ed; stable members — never moved).
@@ -645,9 +727,11 @@ private:
     kernel::Event<const ToplevelEvent&> on_focused_;
     ServiceImpl service_{};
 
-    // Window/popup ownership.
+    // Window/popup/decoration ownership.
     std::unordered_map<wlr_xdg_toplevel*, std::unique_ptr<ToplevelEntry>> toplevels_;
     std::unordered_map<wlr_xdg_popup*, std::unique_ptr<PopupEntry>> popups_;
+    std::unordered_map<wlr_xdg_toplevel_decoration_v1*, std::unique_ptr<DecorationEntry>>
+        decorations_;
 
     // Grab state (one at a time). The pure machine owns the move/resize/none
     // mode + button-down tracking; these hold the geometry for the active grab.
@@ -668,6 +752,7 @@ private:
     // Raw xdg-shell signal listeners (RAII).
     Listener new_toplevel_;
     Listener new_popup_;
+    Listener new_decoration_;
 
     // Kernel-catalogue subscriptions (RAII; dropped on destruction).
     Subscription sub_motion_;
@@ -687,12 +772,14 @@ void ToplevelEntry::focus() { ext->focus_toplevel(this); }
 
 } // namespace
 
-auto create() -> std::unique_ptr<kernel::Extension> {
-    return std::make_unique<XdgShellExtension>();
+auto create(bool prefer_server_side_decorations) -> std::unique_ptr<kernel::Extension> {
+    return std::make_unique<XdgShellExtension>(prefer_server_side_decorations);
 }
 
 auto make_extension_with_probe() -> ExtensionWithProbe {
-    auto ext = std::make_unique<XdgShellExtension>();
+    // Tests do not exercise decoration mode; default to client-side (the classic
+    // posture), matching a non-RML session.
+    auto ext = std::make_unique<XdgShellExtension>(false);
     ActivationProbe* probe = ext.get();
     return {std::move(ext), probe};
 }

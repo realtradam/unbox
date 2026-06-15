@@ -60,6 +60,20 @@ public:
     // its own unmap/destroy then fires normally.
     virtual void close() = 0;
 
+    // Ask the client to render this window at width×height (an xdg_toplevel
+    // configure carrying the size). It is a REQUEST: the configure is async and
+    // the client picks the next buffer size — it may honour, clamp, or ignore it
+    // (per its min/max hints), and the new buffer arrives on a later commit, not
+    // synchronously. Passing 0 for a dimension cedes that axis to the client
+    // ("you choose"); negatives are clamped to 0. No-op if the toplevel is no
+    // longer mapped. Used by the window field to make a client paint AT its tile
+    // size (so the live texture fills the tile 1:1) instead of being scaled into
+    // it. This is a SIZE request only — it does NOT move the window or change the
+    // on-screen rectangle (RCSS/the wm still owns placement). Calling it
+    // repeatedly with the SAME size is cheap but still re-sends a configure, so
+    // callers should send only on an actual size change.
+    virtual void set_size(int width, int height) = 0;
+
     // ---- Minimize mechanism (slice 10 / stage dock) ----------------------
     //
     // Neutral compositor-side mechanism the stage dock drives to minimize a
@@ -160,6 +174,15 @@ protected:
 // Construct the extension; install() it into the Server (ownership transfer).
 // Construction is side-effect free — all wiring happens in activate(). The
 // manifest is { id: "xdg-shell", tier: core, depends_on: {} }.
-[[nodiscard]] auto create() -> std::unique_ptr<unbox::kernel::Extension>;
+//
+// prefer_server_side_decorations: when true, the extension advertises the
+// xdg-decoration manager and forces SERVER_SIDE mode, so clients DROP their own
+// titlebars (CSD) — used when something else draws the chrome (the RML window
+// field). When false (the classic wlr_scene path, no server chrome), clients
+// keep client-side decorations. Note: some toolkits (notably GTK/libadwaita)
+// ignore the server's SSD preference and always draw CSD — that is a client
+// limitation, not addressable here.
+[[nodiscard]] auto create(bool prefer_server_side_decorations = false)
+    -> std::unique_ptr<unbox::kernel::Extension>;
 
 } // namespace unbox::ext_xdg_shell
