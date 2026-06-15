@@ -47,6 +47,20 @@ wlr_layer_shell_protocol_h = custom_target(
   command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
 )
 
+# stb_image: single-header decoder (PNG/JPEG/BMP/GIF/TGA/PSD). Compiled in its
+# own static library with warning_level=0 to isolate stb's -Wall -Wextra
+# diagnostics from the rest of the kernel. The implementation TU defines
+# STB_IMAGE_IMPLEMENTATION then #includes stb_image.h; nothing else does.
+# stb returns pixels in R,G,B,A byte order when channels=4 is requested —
+# the GL upload in rmlui_renderer_gl3.cpp must NOT apply the TGA BGR swizzle.
+stb_image_inc = include_directories('src/third_party')
+stb_image_lib = static_library(
+  'unbox-stb-image',
+  'src/third_party/stb_image_impl.cpp',
+  include_directories: stb_image_inc,
+  override_options: ['warning_level=0'],
+)
+
 # UNBOX_RMLUI_GLES selects the native GLES 3.2 path in the adapted RmlUi GL3
 # renderer (src/rmlui_renderer_gl3.cpp) without poisoning the TU with the
 # __ANDROID__ builtin. Scoped to this library only.
@@ -63,9 +77,10 @@ kernel_lib = static_library(
   # TU compiles and puts its build dir on this lib's include path.
   wlr_layer_shell_protocol_h,
   cpp_args: ['-DUNBOX_RMLUI_GLES'],
-  include_directories: kernel_inc,
+  include_directories: [kernel_inc, stb_image_inc],
   dependencies: [wlroots_dep, wayland_server_dep, xkbcommon_dep, rmlui_dep,
                  egl_dep, glesv2_dep],
+  link_with: [stb_image_lib],
 )
 
 # What consumers get. wlroots/wayland propagate because wlr.hpp is a public

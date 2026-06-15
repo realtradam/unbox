@@ -178,8 +178,12 @@ public:
     // known layout point, so a test can assert a surface element forwards the
     // pick to its client at surface-LOCAL coords via the seat. Single-thread only.
     void ui_route_pointer_motion_for_test(double lx, double ly, unsigned int time_msec);
-    void ui_route_pointer_button_for_test(double lx, double ly, bool pressed,
-                                          unsigned int time_msec);
+    // Returns true if the substrate consumed the press (a visible, non-input-
+    // transparent surface was hit), false if the press fell through to the bus.
+    // This return value is the test-observable consumption result — used by the
+    // input-transparent test to prove a transparent surface does not consume.
+    auto ui_route_pointer_button_for_test(double lx, double ly, bool pressed,
+                                          unsigned int time_msec) -> bool;
     void ui_route_touch_down_for_test(int id, double lx, double ly, unsigned int time_msec);
     void ui_route_touch_up_for_test(int id, unsigned int time_msec);
     // Add a minimal virtual keyboard to the seat (headless has none) so the

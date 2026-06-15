@@ -8,8 +8,18 @@
 //      instead of the hardcoded default framebuffer, so the bridge can
 //      direct RmlUi's result into its own offscreen FBO. See
 //      SetOutputFramebuffer() / output_framebuffer.
+//   3. LoadTexture() branch B: stb_image is tried before the TGA fallback so
+//      any PNG/JPEG/BMP/GIF the document references decodes correctly.
+//      stb_image.h is included here in declaration-only mode (no STB_IMAGE_
+//      IMPLEMENTATION); the implementation lives in third_party/stb_image_impl.cpp
+//      compiled with warning_level=0 to isolate stb's diagnostics. stb returns
+//      pixels in R,G,B,A byte order — do NOT apply the TGA BGR swizzle.
 // Everything else is verbatim upstream; do not "improve" it.
 #include "rmlui_renderer_gl3.h"
+// stb_image declaration-only (implementation is in third_party/stb_image_impl.cpp).
+// Included before any other header so it doesn't conflict with malloc/free
+// redefinitions; no STB_IMAGE_IMPLEMENTATION is defined in this TU.
+#include "stb_image.h"
 #include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/DecorationTypes.h>
 #include <RmlUi/Core/FileInterface.h>
@@ -1266,9 +1276,9 @@ Rml::TextureHandle RenderInterface_GL3::LoadTexture(Rml::Vector2i& texture_dimen
 	size_t buffer_size = file_interface->Tell(file_handle);
 	file_interface->Seek(file_handle, 0, SEEK_SET);
 
-	if (buffer_size <= sizeof(TGAHeader))
+	if (buffer_size == 0)
 	{
-		Rml::Log::Message(Rml::Log::LT_ERROR, "Texture file size is smaller than TGAHeader, file is not a valid TGA image.");
+		Rml::Log::Message(Rml::Log::LT_ERROR, "Texture file is empty.");
 		file_interface->Close(file_handle);
 		return false;
 	}
@@ -1277,6 +1287,53 @@ Rml::TextureHandle RenderInterface_GL3::LoadTexture(Rml::Vector2i& texture_dimen
 	Rml::UniquePtr<byte[]> buffer(new byte[buffer_size]);
 	file_interface->Read(buffer.get(), buffer_size, file_handle);
 	file_interface->Close(file_handle);
+
+	// unbox branch B-1: try stb_image first (handles PNG/JPEG/BMP/GIF/TGA/PSD).
+	// stb returns pixels in R,G,B,A byte order with 4 channels; no BGR swizzle
+	// is needed here (unlike the TGA path below which stores BGR on disk).
+	// The caller uploads via GenerateTexture which expects premultiplied RGBA8.
+	// stb returns straight (non-premultiplied) alpha; premultiply it here to
+	// match what RmlUi expects (same as the TGA path does for 32-bit TGAs).
+	{
+		int stb_w = 0, stb_h = 0, stb_ch = 0;
+		stbi_uc* pixels = stbi_load_from_memory(
+			reinterpret_cast<const stbi_uc*>(buffer.get()),
+			static_cast<int>(buffer_size),
+			&stb_w, &stb_h, &stb_ch, /*desired_channels=*/4);
+		if (pixels != nullptr)
+		{
+			// stb succeeded. Premultiply alpha in-place: each RGB channel is
+			// multiplied by alpha/255, matching the TGA branch's premultiply and
+			// RmlUi's expectation. Opaque pixels (alpha==255) are unchanged.
+			const size_t pixel_count = static_cast<size_t>(stb_w) * static_cast<size_t>(stb_h);
+			for (size_t i = 0; i < pixel_count; ++i)
+			{
+				const stbi_uc alpha = pixels[i * 4 + 3];
+				if (alpha != 255)
+				{
+					pixels[i * 4 + 0] = static_cast<stbi_uc>((pixels[i * 4 + 0] * alpha) / 255);
+					pixels[i * 4 + 1] = static_cast<stbi_uc>((pixels[i * 4 + 1] * alpha) / 255);
+					pixels[i * 4 + 2] = static_cast<stbi_uc>((pixels[i * 4 + 2] * alpha) / 255);
+				}
+			}
+			texture_dimensions.x = stb_w;
+			texture_dimensions.y = stb_h;
+			const size_t image_size = pixel_count * 4;
+			const Rml::TextureHandle handle = GenerateTexture(
+				{reinterpret_cast<const byte*>(pixels), image_size}, texture_dimensions);
+			stbi_image_free(pixels);
+			return handle;
+		}
+		// stb returned null: not a recognised format (or corrupted file). Fall
+		// through to the legacy TGA path so existing TGA assets keep working.
+	}
+
+	// unbox branch B-2: legacy TGA fallback (original upstream path).
+	if (buffer_size <= sizeof(TGAHeader))
+	{
+		Rml::Log::Message(Rml::Log::LT_ERROR, "Texture file size is smaller than TGAHeader, file is not a valid TGA image.");
+		return false;
+	}
 
 	TGAHeader header;
 	memcpy(&header, buffer.get(), sizeof(TGAHeader));

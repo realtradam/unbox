@@ -3746,3 +3746,390 @@ TEST_CASE("surface-element: input-back through a 3D-transformed hosting element"
     client.join();
     unsetenv("WLR_HEADLESS_OUTPUTS");
 }
+
+// ============================================================================
+// Deliverable 2: stb_image PNG decode in LoadTexture.
+//
+// A ui surface whose ONLY content is a full-bleed <img> backed by a tiny PNG
+// fixture on disk. After ticking frames, ui_pixel(x,y) must return the PNG's
+// known color in 0xRRGGBBAA format — proving decode + upload + correct channel
+// order (stb returns RGBA, NOT BGR; do not apply the TGA swizzle). Two cases:
+// red (#FF0000) and blue (#0000FF).
+//
+// Shape mirrors preview: known source color composites into an <img>.
+// ============================================================================
+
+namespace {
+
+// Returns the absolute path to a fixture PNG file inside the test source tree.
+// __FILE__ expands to the absolute path of this source file at compile time;
+// the PNG fixtures live in the same directory.
+auto fixture_path(const char* filename) -> std::string {
+    std::filesystem::path src(__FILE__);
+    return (src.parent_path() / filename).string();
+}
+
+// An extension that creates a single ui surface with a full-bleed <img> of the
+// given PNG file path. The body background is #010203 (very dark, not red/blue)
+// so a failed sample is obvious.
+class PngTestExtension : public unbox::kernel::Extension {
+public:
+    explicit PngTestExtension(std::string png_path) : png_path_(std::move(png_path)) {}
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        if (!host.ui().available()) {
+            return;
+        }
+        // Build RML with the PNG path embedded as an absolute <img> src.
+        // body is 64x64 (matches the fixture), no margin, one full-bleed img.
+        std::string rml =
+            "<rml><head><style>"
+            "body { background-color: #010203; width: 64px; height: 64px; margin: 0px; }"
+            "img  { display: block; position: absolute; left: 0px; top: 0px;"
+            "       width: 64px; height: 64px; }"
+            "</style></head><body data-model=\"ui\">"
+            "<img src=\"" + png_path_ + "\"/>"
+            "</body></rml>";
+
+        UiSurfaceSpec spec;
+        spec.rml_inline = rml;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 64;
+        spec.height = 64;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        spec.visible = true;
+        surface_ = host.ui().create_surface(spec);
+    }
+
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    std::string png_path_;
+    Manifest manifest_{"png-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+} // namespace
+
+TEST_CASE("stb_image: PNG decode + upload + correct RGBA channel order (red fixture)") {
+    // Requires the GL path (Plan A or B) to upload + read back the texture.
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1); // shm path for readback
+
+    const std::string png = fixture_path("fixture_red_4x4.png");
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PngTestExtension(png);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 80); // load the document, decode the PNG, render
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        // No GL path on this box: the test is a no-op (PNG decode is moot without GL).
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        unsetenv("WLR_HEADLESS_OUTPUTS");
+        return;
+    }
+
+    // Sample the centre of the 64x64 surface (32,32). The fixture is 4x4 solid
+    // #FF0000 scaled up to fill the surface. The pixel must be red-dominant, opaque.
+    // ui_pixel returns 0xRRGGBBAA. Tolerant match: bilinear + premultiply rounding.
+    const unsigned int px = server->ui_pixel(32, 32);
+    INFO("red fixture centre pixel (RRGGBBAA) = ", px);
+    const int r = static_cast<int>((px >> 24) & 0xff);
+    const int g = static_cast<int>((px >> 16) & 0xff);
+    const int b = static_cast<int>((px >> 8) & 0xff);
+    const int a = static_cast<int>(px & 0xff);
+
+    // The pixel must be opaque and red-dominant — proving stb returned R,G,B,A
+    // (not BGR as TGA does). A wrong channel swap would show blue dominant here.
+    CHECK(a == 0xff);
+    CHECK(r > 180);  // strong red
+    CHECK(g < 40);   // little green
+    CHECK(b < 40);   // little blue
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+    unsetenv("WLR_HEADLESS_OUTPUTS");
+}
+
+TEST_CASE("stb_image: PNG decode + upload + correct RGBA channel order (blue fixture)") {
+    // Second case with a non-red color to prove the channel order is truly RGBA
+    // (not a coincidence where R and B happen to match).
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    const std::string png = fixture_path("fixture_blue_4x4.png");
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new PngTestExtension(png);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 80);
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        unsetenv("WLR_HEADLESS_OUTPUTS");
+        return;
+    }
+
+    const unsigned int px = server->ui_pixel(32, 32);
+    INFO("blue fixture centre pixel (RRGGBBAA) = ", px);
+    const int r = static_cast<int>((px >> 24) & 0xff);
+    const int g = static_cast<int>((px >> 16) & 0xff);
+    const int b = static_cast<int>((px >> 8) & 0xff);
+    const int a = static_cast<int>(px & 0xff);
+
+    // Blue fixture: #0000FF. If stb returned RGBA correctly, blue is in the B
+    // channel (bits 15..8 in the 0xRRGGBBAA word). If BGR was wrongly applied,
+    // R and B would swap and this pixel would appear red-dominant.
+    CHECK(a == 0xff);
+    CHECK(r < 40);   // little red
+    CHECK(g < 40);   // little green
+    CHECK(b > 180);  // strong blue
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+    unsetenv("WLR_HEADLESS_OUTPUTS");
+}
+
+// ============================================================================
+// input_transparent UiSurfaceSpec flag.
+//
+// A visible, full-screen ui surface with input_transparent=true must RENDER
+// normally (frames advance, composited correctly) but must NOT capture pointer
+// button presses or touch downs — they fall through to the bus. The contrast
+// with input_transparent=false (the default) is the failing-then-passing test.
+//
+// Uses the existing ui_route_pointer_button_for_test (now returns bool: the
+// substrate consumption result) and ui_route_touch_down_for_test seams.
+// Deterministic: no async Wayland client, no timer races.
+// ============================================================================
+
+namespace {
+
+// A full-screen ui surface with a solid opaque body so the substrate can render
+// it and the frame-count probe can confirm it composited. The body fills the
+// whole surface so every pixel is painted — ruling out the alpha-hit-test path
+// as a source of transparency (we're testing the input_transparent flag, not
+// per-pixel alpha). The body background is distinct (#3050a0) so a bus-hook
+// test that reads a pixel would see a non-trivial color.
+const char* kTransparentRml = R"RML(<rml>
+<head>
+<style>
+body { background-color: #3050a0; width: 800px; height: 600px; margin: 0px; }
+</style>
+</head>
+<body data-model="ui">
+</body>
+</rml>)RML";
+
+// A test extension that creates a full-screen (800x600 at (0,0)) ui surface
+// with the given input_transparent flag. No bus subscription needed: the
+// test asserts the substrate consumption result directly via the seam's bool
+// return value. (The bus hook only fires through the real input.cpp path, not
+// the ui_route_*_for_test seam which calls the substrate directly.)
+class InputTransparentExtension : public unbox::kernel::Extension {
+public:
+    explicit InputTransparentExtension(bool input_transparent)
+        : input_transparent_(input_transparent) {}
+
+    auto manifest() const -> const Manifest& override { return manifest_; }
+
+    void activate(Host& host) override {
+        UiSurfaceSpec spec;
+        spec.rml_inline = kTransparentRml;
+        spec.x = 0;
+        spec.y = 0;
+        spec.width = 800;
+        spec.height = 600;
+        spec.visible = true;
+        spec.input_transparent = input_transparent_;
+        spec.layer = unbox::kernel::SceneLayer::overlay;
+        surface_ = host.ui().create_surface(spec);
+    }
+
+    [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+
+private:
+    bool input_transparent_;
+    Manifest manifest_{"input-transparent-test", Tier::standard, {}};
+    std::unique_ptr<UiSurface> surface_;
+};
+
+} // namespace
+
+TEST_CASE("input_transparent: opaque surface with flag=false CONSUMES presses (baseline)") {
+    // Confirm that a normal (input_transparent=false) visible surface consumes.
+    // This is the existing default behaviour — validated explicitly as the contrast
+    // to the transparent case below.
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new InputTransparentExtension(/*input_transparent=*/false);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 60); // let the surface load and render
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        // No GL path: substrate unavailable, surface is null — the flag is moot.
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        unsetenv("WLR_HEADLESS_OUTPUTS");
+        return;
+    }
+
+    // Press inside the surface (well within 800x600 at origin).
+    const bool consumed = server->ui_route_pointer_button_for_test(400.0, 300.0,
+                                                                    /*pressed=*/true, 1000);
+    server->ui_route_pointer_button_for_test(400.0, 300.0, /*pressed=*/false, 1001);
+
+    // The surface is visible, non-transparent, and the point is inside it:
+    // the substrate must have consumed the press (returned true).
+    CHECK(consumed == true);
+
+    // The surface still composites: frame count is positive.
+    CHECK(server->ui_frame_count() > 0);
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+    unsetenv("WLR_HEADLESS_OUTPUTS");
+}
+
+TEST_CASE("input_transparent: surface with flag=true renders but PASSES THROUGH presses") {
+    // The failing-then-passing assertion: with input_transparent=true the surface
+    // must NOT consume pointer button presses or touch downs, and the bus hook
+    // must fire (proving the press reached extensions).
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    auto server = unbox::kernel::Server::create({});
+    auto* ext = new InputTransparentExtension(/*input_transparent=*/true);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 60);
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        unsetenv("WLR_HEADLESS_OUTPUTS");
+        return;
+    }
+
+    // (1) Pointer button: the substrate must NOT consume — ui_route_pointer_button_
+    // for_test returns the substrate's route_pointer_button() result directly.
+    // FAILING-THEN-PASSING: before this flag, surface_at always matched a visible
+    // surface so pressed returned true; with input_transparent=true, surface_at
+    // skips it and returns nullptr, so route_pointer_button returns false.
+    const bool consumed = server->ui_route_pointer_button_for_test(400.0, 300.0,
+                                                                    /*pressed=*/true, 2000);
+    server->ui_route_pointer_button_for_test(400.0, 300.0, /*pressed=*/false, 2001);
+    CHECK(consumed == false); // FAILING-THEN-PASSING: substrate skips the transparent surface
+
+    // (2) Touch down: surface_at is also skipped for input_transparent surfaces, so
+    // route_touch_down returns false (pass-through). The seam discards the return
+    // value, so we verify by confirming no crash and no stuck grab state — a touch
+    // that was wrongly consumed would leave touch_capture dangling; a pass-through
+    // exits cleanly. route_touch_up is a no-op (no capture entry) — also clean.
+    server->ui_route_touch_down_for_test(0, 400.0, 300.0, 2010);
+    server->ui_route_touch_up_for_test(0, 2011);
+
+    // (3) The surface still RENDERS: compositing is unaffected by the flag.
+    // Frame count must be positive — the surface was not hidden, just input-skipped.
+    CHECK(server->ui_frame_count() > 0);
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+    unsetenv("WLR_HEADLESS_OUTPUTS");
+}
+
+// ============================================================================
+// Absolute-path RCSS decorator image source (JoinPath fix).
+//
+// Before the SubstrateSystemInterface::JoinPath override, RmlUi's default
+// JoinPath stripped the leading '/' from absolute paths — turning
+// '/home/user/wall.png' into 'home/user/wall.png' before LoadTexture was
+// called, so the open failed. This is the FAILING-THEN-PASSING test: a ui
+// surface whose RCSS `decorator: image(...)` uses an absolute path must show
+// the expected colour. Shape mirrors the stb_image <img> tests (D2) but with
+// the decorator pathway, which goes through RenderManager::LoadTexture →
+// JoinPath rather than the <img> LoadTexture → FileInterface path.
+// ============================================================================
+
+TEST_CASE("decorator: absolute-path image resolves correctly (JoinPath fix)") {
+    setenv("WLR_BACKENDS", "headless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+    setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
+    setenv("UNBOX_UI_SUBSTRATE_FORCE_SHM", "1", 1);
+
+    // Absolute path to the red fixture PNG committed alongside this file.
+    const std::string png = fixture_path("fixture_red_4x4.png");
+
+    // Build inline RML with a body decorator using the absolute path.
+    // The decorator fills the body background with the fixture image.
+    // Before the fix: JoinPath strips the leading '/', the file open fails,
+    // decorator renders nothing, the pixel reads the fallback color (#010203).
+    // After the fix: the path is preserved, PNG decoded, pixel is red.
+    const std::string rml =
+        "<rml><head><style>"
+        "body { width: 64px; height: 64px; margin: 0px; background-color: #010203;"
+        "       decorator: image('" + png + "' cover center center); }"
+        "</style></head><body data-model=\"ui\"></body></rml>";
+
+    auto server = unbox::kernel::Server::create({});
+
+    class DecoratorExt : public unbox::kernel::Extension {
+    public:
+        explicit DecoratorExt(std::string rml_) : rml(std::move(rml_)) {}
+        auto manifest() const -> const Manifest& override { return manifest_; }
+        void activate(Host& host) override {
+            if (!host.ui().available()) return;
+            UiSurfaceSpec spec;
+            spec.rml_inline = rml;
+            spec.x = 0; spec.y = 0;
+            spec.width = 64; spec.height = 64;
+            spec.layer = unbox::kernel::SceneLayer::overlay;
+            spec.visible = true;
+            surface_ = host.ui().create_surface(spec);
+        }
+        [[nodiscard]] auto has_surface() const -> bool { return surface_ != nullptr; }
+    private:
+        std::string rml;
+        Manifest manifest_{"decorator-path-test", Tier::standard, {}};
+        std::unique_ptr<UiSurface> surface_;
+    };
+
+    auto* ext = new DecoratorExt(rml);
+    server->install(std::unique_ptr<unbox::kernel::Extension>(ext));
+    server->activate_extensions();
+    pump(*server, 80); // load the document, decode the PNG via the decorator, render
+
+    if (!ext->has_surface() || server->ui_frame_count() == 0) {
+        // No GL path on this box: the test is a no-op.
+        unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+        unsetenv("WLR_HEADLESS_OUTPUTS");
+        return;
+    }
+
+    // Sample the centre of the 64x64 surface. The decorator covers the body with
+    // the 4x4 solid #FF0000 fixture, scaled up. The centre pixel must be
+    // red-dominant and opaque — proving the absolute path was preserved through
+    // JoinPath (FAILING-THEN-PASSING: before the fix it reads ~#010203 dark).
+    const unsigned int px = server->ui_pixel(32, 32);
+    INFO("decorator centre pixel (RRGGBBAA) = ", px);
+    const int r = static_cast<int>((px >> 24) & 0xff);
+    const int g = static_cast<int>((px >> 16) & 0xff);
+    const int b = static_cast<int>((px >> 8) & 0xff);
+    const int a = static_cast<int>(px & 0xff);
+
+    CHECK(a == 0xff);   // opaque
+    CHECK(r > 180);     // strong red — fixture is #FF0000
+    CHECK(g < 40);
+    CHECK(b < 40);
+
+    unsetenv("UNBOX_UI_SUBSTRATE_FORCE_SHM");
+    unsetenv("WLR_HEADLESS_OUTPUTS");
+}

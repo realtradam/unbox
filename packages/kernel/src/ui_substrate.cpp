@@ -127,6 +127,33 @@ public:
         return true;
     }
 
+    // Fix for absolute filesystem paths in RCSS decorators.
+    //
+    // RmlUi's default JoinPath (SystemInterface.cpp) strips the leading '/'
+    // from an absolute path: `path[0]=='/' → translated_path = path.substr(1)`.
+    // That turns `/home/user/wall.png` into `home/user/wall.png` before
+    // LoadTexture is called, so the file open fails. The bug surfaces specifically
+    // for decorator image sources (RenderManager::LoadTexture calls JoinPath)
+    // when the document has no base URL (inline documents have an empty
+    // document_path), because the resolution has nothing to anchor to.
+    //
+    // The fix: if `path` is already an absolute filesystem path (starts with '/')
+    // return it unchanged. URI-scheme paths (unbox-preview://, unbox-surface://,
+    // file://, etc.) and relative paths fall through to the default implementation,
+    // which handles them correctly.
+    void JoinPath(Rml::String& translated_path, const Rml::String& document_path,
+                  const Rml::String& path) override {
+        if (!path.empty() && path[0] == '/') {
+            // Absolute filesystem path: return as-is, preserving the root '/'.
+            translated_path = path;
+            return;
+        }
+        // All other paths (relative, URI-scheme, Windows-style): delegate to the
+        // default implementation so relative paths against a document dir still
+        // work (e.g. a file-backed document that links a sibling image).
+        Rml::SystemInterface::JoinPath(translated_path, document_path, path);
+    }
+
     // Snapshot/read the parse-error counter (hot-reload validity check).
     [[nodiscard]] auto parse_errors() const -> int { return parse_errors_; }
 
@@ -360,6 +387,7 @@ struct Surface {
     int x = 0;
     int y = 0;
     bool is_visible = true;
+    bool input_transparent = false; // renders but never captures input (see UiSurfaceSpec)
 
     // Plan: dmabuf swapchain (A) or single shm buffer (B).
     bool dmabuf = false;
@@ -795,7 +823,12 @@ struct Substrate::Impl {
     auto surface_at(double lx, double ly) -> Surface* {
         Surface* hit = nullptr;
         for (Surface& s : surfaces) {
-            if (s.is_visible && point_in_rect(lx, ly, s.x, s.y, s.width, s.height)) {
+            // input_transparent surfaces render normally but are invisible to
+            // input: skip them so presses/touches fall through to whatever is
+            // below (toplevels on the bus, lower ui surfaces). A wallpaper that
+            // covers the whole screen must not steal clicks from app windows.
+            if (s.is_visible && !s.input_transparent &&
+                point_in_rect(lx, ly, s.x, s.y, s.width, s.height)) {
                 hit = &s; // keep scanning: later = on top
             }
         }
@@ -2221,6 +2254,7 @@ auto Substrate::create_surface(ExtensionId who, wlr_scene_tree* parent, const Ui
     s.x = spec.x;
     s.y = spec.y;
     s.is_visible = spec.visible;
+    s.input_transparent = spec.input_transparent;
 
     bool ok = impl_->init_surface_gl(s);
     if (ok) {

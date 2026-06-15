@@ -161,14 +161,15 @@ void Server::ui_route_pointer_motion_for_test(double lx, double ly, unsigned int
     }
 }
 
-void Server::ui_route_pointer_button_for_test(double lx, double ly, bool pressed,
-                                              unsigned int time_msec) {
+auto Server::ui_route_pointer_button_for_test(double lx, double ly, bool pressed,
+                                              unsigned int time_msec) -> bool {
     if (impl_->substrate != nullptr) {
         // A button needs a hover first (the cursor is already at (lx,ly) on a real
         // seat); feed a motion so the substrate's pick is current, then the button.
         impl_->substrate->route_pointer_motion(lx, ly, time_msec);
-        (void)impl_->substrate->route_pointer_button(lx, ly, pressed, time_msec);
+        return impl_->substrate->route_pointer_button(lx, ly, pressed, time_msec);
     }
+    return false;
 }
 
 void Server::ui_route_touch_down_for_test(int id, double lx, double ly, unsigned int time_msec) {
@@ -352,6 +353,15 @@ void Server::Impl::init() {
     }
 
     output_layout = require(wlr_output_layout_create(display), "wlr_output_layout");
+
+    // Policy-free Wayland globals for screenshot capability (e.g. grim).
+    // wlr_screencopy_manager_v1 lets clients capture output framebuffers via the
+    // wlr-screencopy protocol; wlr_xdg_output_manager_v1 advertises logical
+    // output names and geometry so clients can select outputs by name. Both are
+    // owned by the wl_display (destroyed with it) — no stored pointer needed.
+    wlr_screencopy_manager_v1_create(display);
+    wlr_xdg_output_manager_v1_create(display, output_layout);
+
     new_output.connect(backend->events.new_output, [this](void* data) {
         handle_new_output(static_cast<wlr_output*>(data));
     });

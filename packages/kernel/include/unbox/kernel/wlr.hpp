@@ -89,6 +89,16 @@ extern "C" {
 // decoration. ext-xdg-shell creates the manager + forces SERVER_SIDE when RML
 // compositing draws the chrome. Plain declarations only — static-blanking inert.
 #include <wlr/types/wlr_xdg_decoration_v1.h>
+// wlr-screencopy-v1: enables `grim` and other screenshot tools to capture outputs
+// via the wlr-screencopy protocol. The final composited image (all wlr_scene_buffer
+// nodes, including RML surfaces) is captured correctly because wlr_scene_output_commit
+// already produces the composited framebuffer. Plain declarations only —
+// static-blanking inert across this header.
+#include <wlr/types/wlr_screencopy_v1.h>
+// xdg-output-v1: provides clients (including grim) with logical output geometry
+// and names via the xdg-output protocol. Requires the output_layout already
+// created. Plain declarations only — static-blanking inert.
+#include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/util/log.h>
 #include <wlr/version.h>
 #undef namespace

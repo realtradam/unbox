@@ -301,6 +301,15 @@ struct UiSurfaceSpec {
     int height = 0;
     SceneLayer layer = SceneLayer::overlay;
     bool visible = true;
+    // When true, the surface still RENDERS/composites normally but NEVER captures
+    // pointer or touch input: presses, touches (and hover) fall through as if the
+    // surface were not there for input purposes, so whatever is below it (toplevels
+    // on the bus, lower ui surfaces) receives them. This is the input-only
+    // counterpart of `visible` (which gates BOTH render and input). Use it for a
+    // full-screen, non-interactive backdrop (e.g. a wallpaper) that must not steal
+    // clicks. Default false = today's behaviour (a visible surface owns presses over
+    // its rectangle).
+    bool input_transparent = false;
 };
 
 // A FROZEN, graphically scalable image of a toplevel's pixels, snapshotted from
