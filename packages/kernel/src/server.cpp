@@ -325,12 +325,27 @@ void Server::Impl::init() {
     if (compositor != nullptr) {
         test_new_surface.connect(compositor->events.new_surface, [this](void* data) {
             auto* surface = static_cast<wlr_surface*>(data);
-            test_surface_commits.emplace_back();
-            Listener& commit = test_surface_commits.back();
-            commit.connect(surface->events.commit, [this, surface](void*) {
+            test_surface_captures.emplace_back();
+            Impl::TestSurfaceCapture& cap = test_surface_captures.back();
+            cap.surface = surface;
+            cap.commit.connect(surface->events.commit, [this, surface](void*) {
                 if (surface->buffer != nullptr) {
                     test_last_client_surface = surface;
                 }
+            });
+            // RAII to the surface's lifetime: when the client destroys this
+            // wl_surface, drop its capture record — unsubscribing the commit
+            // listener BEFORE wlroots destroys the surface resource (which asserts
+            // commit.listener_list is empty). Clearing the record is the handler's
+            // LAST action; nothing touches it afterwards (listener.hpp's
+            // destroy-event pattern). Also forget it if it was the captured one, so
+            // no probe builds a SurfaceElement from a dead surface.
+            cap.destroy.connect(surface->events.destroy, [this, surface](void*) {
+                if (test_last_client_surface == surface) {
+                    test_last_client_surface = nullptr;
+                }
+                test_surface_captures.remove_if(
+                    [surface](const Impl::TestSurfaceCapture& c) { return c.surface == surface; });
             });
         });
     }
@@ -574,7 +589,7 @@ void Server::Impl::shutdown() {
     // commit hook) and the capture listeners BEFORE the substrate/compositor go.
     test_surface_element.reset();
     test_new_surface.disconnect();
-    test_surface_commits.clear();
+    test_surface_captures.clear(); // each record's commit+destroy listeners unsubscribe
     test_last_client_surface = nullptr;
     // The virtual test keyboard (if added) is finished + freed before the seat /
     // display die (a wlr_keyboard outliving the seat it was set on is UB).

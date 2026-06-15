@@ -94,7 +94,19 @@ struct Server::Impl : detail::DisableSink {
     // production code path reads these.
     wlr_compositor* compositor = nullptr;
     Listener test_new_surface;
-    std::list<Listener> test_surface_commits; // per captured client surface
+    // One capture record per live client wl_surface: its commit listener (records
+    // the latest surface with a buffer) AND its destroy listener, both RAII and
+    // scoped to THIS surface's lifetime. The record is erased — unsubscribing the
+    // commit listener — the instant the surface is destroyed, so wlroots' teardown
+    // assertion (wl_list_empty(commit.listener_list)) never fires for a surface a
+    // client drops mid-session. std::list: Listener is non-movable (self-pointer),
+    // so element addresses must stay stable.
+    struct TestSurfaceCapture {
+        wlr_surface* surface = nullptr;
+        Listener commit;
+        Listener destroy;
+    };
+    std::list<TestSurfaceCapture> test_surface_captures;
     wlr_surface* test_last_client_surface = nullptr; // last surface with a buffer
     std::unique_ptr<SurfaceElement> test_surface_element; // built on demand by the probe
 
