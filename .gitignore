@@ -18,3 +18,6 @@ subprojects/*
 
 # local spike launcher (run-spike.sh)
 /run-spike.sh
+
+# captured unbox stderr from the rml-* run-spike modes (local debug log)
+/unbox-rml.log

@@ -39,3 +39,26 @@ action = "focus-next"
 [[keybind]]
 keys   = "Ctrl+Alt+Backspace" # quit the unbox session
 action = "quit"
+
+# Window field (RML compositing) ------------------------------------------------
+# Tunes how the window field (when --rml-compositing is on) sizes a client to the
+# on-screen TILE that RCSS lays out for it. The tile animates over a short RCSS
+# transition on every focus / map / unmap, so the question is WHEN to push the new
+# size to the client — each push makes the client reallocate its buffer + redraw.
+#
+#   resize_mode
+#     "off"        Never resize the client: it keeps its own size, scaled to fill
+#                  the tile. No reconfigure cost.
+#     "settle"     (default) Wait for the tile to stop animating, then send ONE
+#                  configure to the final size. ~1 client redraw per focus change.
+#     "continuous" Send a configure every frame the tile changes — exact tracking,
+#                  but ~1 redraw per animation frame (heavy on low-end GPUs).
+#     "debounced"  Coalesce: at most one configure per `resize_debounce_ms` during
+#                  the animation, plus a final one on settle.
+#
+#   resize_debounce_ms   Used only by "debounced" (milliseconds, >= 0). Default 100.
+#
+# Omit this table to get the defaults below. Edits hot-reload live.
+[window-field]
+resize_mode        = "settle"
+resize_debounce_ms = 100

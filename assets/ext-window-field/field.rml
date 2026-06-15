@@ -2,24 +2,57 @@
 <head>
 <link type="text/rcss" href="field.rcss"/>
 </head>
-<!-- The WINDOW FIELD document (GLOSSARY: "window field"). data-model "ui". The
-     C++ glue (ext-window-field) drives ONLY the data: the bound "wins" list (one
-     row per mapped toplevel, each a live SURFACE ELEMENT) + the per-row `focused`
-     flag. LAYOUT + ANIMATION are RCSS (field.rcss) — the user's contract
-     decision: C++ never computes a window's on-screen rectangle.
+<!-- The WINDOW FIELD document (GLOSSARY: "window field"). data-model "ui".
+     FLOATING windows: the C++ glue (ext-window-field) holds each window's box as
+     bound STATE (x,y,w,h,z) updated by drag gestures, and this document APPLIES
+     it as data-style (the contract: C++ owns interactive geometry STATE, RCSS
+     owns rendering/animation). One row per mapped toplevel:
 
-     Each row paints the window's LIVE texture via an RCSS `image()` decorator
-     bound with data-style-decorator (the proven dynamic-texture pattern — RmlUi
-     does NOT substitute a data binding inside an <img src>, so the URI must reach
-     RCSS, not the src attribute). live_uri = SurfaceElement::source_uri() from
-     UiSubstrate::create_surface_element. `contain` shows the whole window
-     (letterboxed) rather than cropping. The kernel manages the toplevel's whole
-     subsurface/popup tree behind that single element; the document addresses only
-     the root. data-class-focused keys the RCSS highlight/raise off the focused
-     window. -->
+       .win      — the floating frame: positioned by data-style left/top, sized
+                   by data-style width/height, stacked by data-style z-index;
+                   data-class-focused keys the highlight border. (left/top, NOT a
+                   transform: a transform is not applied by RmlUi's data-style here
+                   the way left/top/width/height are, and it would also offset the
+                   drag hit-test — left/top keeps drag coords in honest surface
+                   space.)
+       .titlebar — drag to MOVE (data-event-drag* -> dmove(it_index)); a tap
+                   (no travel) raises/focuses (data-event-click -> raise). Holds
+                   the window title.
+       .closebtn — a sibling over the titlebar's right (NOT inside the draggable
+                   titlebar, so a tap closes instead of starting a move);
+                   data-event-click -> close(it_index) -> Toplevel::close().
+       img.live  — the live window texture, src data-bound to the surface
+                   element's source_uri() (data-attr-src; the <img> is what the
+                   kernel keys input-back / popup placement / size readback off).
+       .grip-bl / .grip-br — the two BOTTOM resize grips (drag -> dbl/dbr); the
+                   top edge is fixed (the titlebar lives there).
+
+     it_index is the row index RmlUi supplies; the glue resolves it to a stable
+     Toplevel identity on the drag start phase. -->
 <body data-model="ui" class="field">
-<div data-for="w : wins" class="win" data-class-focused="w.focused">
-<div class="live" data-style-decorator="'image( ' + w.live_uri + ' contain center center )'"/>
+<div data-for="w : wins" class="win" data-class-focused="w.focused"
+     data-style-left="'' + w.x + 'px'"
+     data-style-top="'' + w.y + 'px'"
+     data-style-width="'' + w.w + 'px'"
+     data-style-height="'' + w.h + 'px'"
+     data-style-z-index="w.z">
+  <div class="titlebar" style="drag: drag;"
+       data-event-dragstart="dmove(it_index)"
+       data-event-drag="dmove(it_index)"
+       data-event-dragend="dmove(it_index)"
+       data-event-click="raise(it_index)">
+    <span class="title">{{ w.title }}</span>
+  </div>
+  <div class="closebtn" data-event-click="close(it_index)">&#215;</div>
+  <img class="live" data-attr-src="w.live_uri"/>
+  <div class="grip grip-bl" style="drag: drag;"
+       data-event-dragstart="dbl(it_index)"
+       data-event-drag="dbl(it_index)"
+       data-event-dragend="dbl(it_index)"/>
+  <div class="grip grip-br" style="drag: drag;"
+       data-event-dragstart="dbr(it_index)"
+       data-event-drag="dbr(it_index)"
+       data-event-dragend="dbr(it_index)"/>
 </div>
 </body>
 </rml>

@@ -1,79 +1,113 @@
-/* The WINDOW FIELD layout (GLOSSARY: "window field"). RML compositing Wave 3.
-   LAYOUT + ANIMATION live ENTIRELY here (the user's contract decision): the C++
-   glue only feeds the bound "wins" list + the per-row `focused` flag; this RCSS
-   decides every window's on-screen box and animates changes. Real tiling /
-   stage-manager is a LATER refinement on this same field + list — Wave 3 keeps
-   it SIMPLE but clearly working.
+/* The WINDOW FIELD layout (GLOSSARY: "window field") — FLOATING windows. The C++
+   glue feeds each row's box as bound state (x,y,w,h,z) + the focused flag; this
+   stylesheet turns that into the on-screen frame, chrome, and highlight. There is
+   NO automatic layout here (that was the earlier focused-dominates tiling): every
+   window is absolutely positioned, moved by a data-style translate and sized by
+   data-style width/height. Tiled / sidebar containers are a LATER wave (windows
+   will migrate between containers with captured-state animations). */
 
-   THE LAYOUT (simple, N-window-safe with no per-index data): the field is a
-   flex row that wraps; every window is a flex tile sharing the space. The
-   FOCUSED window grows to dominate the field (a large flex-basis) and is
-   highlighted + lifted; the rest stay a row of smaller equal tiles. Because it
-   is pure flex keyed only on the `.focused` class, it works for any window
-   count and needs no geometry from C++. A `transition` on flex/transform/border
-   animates focus + map/unmap changes (RmlUi tweens the class flip). */
-
-/* The field fills its whole surface (sized to the output by the glue). It is a
-   wrapping flex row with a little gutter; transparent so an unpainted gap shows
-   the scene below (per-pixel alpha). */
+/* The field fills its whole surface (sized to the output by the glue) and is
+   transparent so the scene below shows through every unpainted pixel (per-pixel
+   alpha). Absolutely-positioned .win children stack within it. */
 body.field {
     width: 100%;
     height: 100%;
-    display: flex;
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: stretch;
-    justify-content: center;
-    padding: 6dp;
     background-color: transparent;
+    font-family: Noto Sans;
 }
 
-/* A window tile. Default (unfocused): an equal, smaller share of the row. The
-   transition animates focus changes (flex-basis grow/shrink, the lift transform,
-   the highlight border) AND the layout reflow when a window maps/unmaps. RmlUi
-   6.2 has no bare `linear` keyword, so the carrier ease is cubic-in-out. */
+/* A floating window frame. Absolutely positioned; data-style left/top place it,
+   width/height size it, z-index stacks it (all driven by the bound box state).
+   Column flex so the titlebar sits above the live body with no calc(). Rounded +
+   overflow:hidden clips the body texture to the card; a 1dp border becomes the
+   bright focus ring via .focused. */
 div.win {
-    display: block;
-    position: relative;
-    flex: 1 1 30%;
-    min-width: 20%;
-    height: 46%;
-    margin: 6dp;
-    background-color: #1c1c20ff;
-    border-radius: 8dp;
-    border-width: 2dp;
-    border-color: #00000000;
-    overflow: hidden;
-    transform: scale(0.96);
-    transform-origin: 50% 50%;
-    transition: flex-basis 0.22s cubic-in-out,
-                width 0.22s cubic-in-out,
-                height 0.22s cubic-in-out,
-                transform 0.22s cubic-in-out,
-                border-color 0.22s cubic-in-out;
-}
-
-/* The FOCUSED window DOMINATES the field: a large flex-basis so it takes the
-   bulk of the row (the rest wrap below as the smaller tile row), full height, a
-   bright highlight border, and a subtle lift (scale 1.0) — the "raise". This is
-   the only state C++ drives (the `focused` bool); everything else is geometry
-   RCSS owns. */
-div.win.focused {
-    flex: 1 1 100%;
-    height: 70%;
-    border-color: #4da3ffff;
-    transform: scale(1.0);
-}
-
-/* The live window texture fills its tile (the surface element's live_uri, painted
-   via an RCSS `image()` decorator bound in field.rml — the proven dynamic-texture
-   pattern, since RmlUi does NOT substitute data bindings in an <img src>). The
-   tile's rounded overflow:hidden clips it to the card. */
-div.win .live {
-    display: block;
     position: absolute;
     left: 0;
     top: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: #1c1c20ff;
+    border-width: 1dp;
+    border-color: #00000088;
+    border-radius: 8dp;
+    overflow: hidden;
+}
+
+/* The FOCUSED window gets a bright highlight ring (z-order is driven by the bound
+   `z`, so no transform/raise needed here). A short transition tweens the ring. */
+div.win.focused {
+    border-color: #4da3ffff;
+}
+
+/* Titlebar: the move handle (drag: drag set inline in the RML). Fixed height,
+   full width, holds the centered title. */
+div.win .titlebar {
+    height: 30dp;
     width: 100%;
-    height: 100%;
+    background-color: #26262cff;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+}
+div.win.focused .titlebar {
+    background-color: #2e3340ff;
+}
+div.win .title {
+    color: #c7c9d1ff;
+    font-size: 13dp;
+    /* leave room so a long title does not slide under the close button */
+    padding: 0 36dp 0 36dp;
+}
+
+/* Close button: a sibling laid over the titlebar's right edge (NOT inside the
+   draggable titlebar, so a tap closes rather than starting a move). The "×" glyph
+   renders in Noto Sans (loaded by the substrate). */
+div.win .closebtn {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 30dp;
+    height: 30dp;
+    color: #c7c9d1ff;
+    font-size: 18dp;
+    text-align: center;
+    background-color: transparent;
+}
+div.win .closebtn:hover {
+    background-color: #e0414aff;
+    color: #ffffffff;
+}
+
+/* The live window texture fills the body below the titlebar (flex:1). RmlUi
+   scales the texture to this box; once the client is configured to the box size
+   (resize_mode, default "settle") it maps 1:1. */
+img.live {
+    display: block;
+    flex: 1 1 0;
+    width: 100%;
+    min-height: 0;
+}
+
+/* The two BOTTOM resize grips, overlaid at the bottom corners (drag: drag set in
+   the RML). Small, subtle, slightly brighter on hover; touch can grab the 22dp
+   square. The top corners have no grip (the titlebar owns the top edge). */
+div.win .grip {
+    position: absolute;
+    bottom: 0;
+    width: 22dp;
+    height: 22dp;
+    background-color: #ffffff14;
+}
+div.win .grip:hover {
+    background-color: #ffffff3c;
+}
+div.win .grip-bl {
+    left: 0;
+    border-top-right-radius: 8dp;
+}
+div.win .grip-br {
+    right: 0;
+    border-top-left-radius: 8dp;
 }

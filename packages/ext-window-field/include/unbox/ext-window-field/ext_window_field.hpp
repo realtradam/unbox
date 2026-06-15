@@ -3,6 +3,8 @@
 #include <unbox/kernel/extension.hpp>
 
 #include <memory>
+#include <optional>
+#include <string>
 
 // ext-window-field — RML compositing's window manager (GLOSSARY: "window
 // field"). The CORE extension that composites application toplevels as RCSS
@@ -31,6 +33,14 @@ namespace unbox::ext_window_field {
 // Construct the extension. Cheap and side-effect free (per the Extension
 // contract); ALL wiring happens in activate(). Ownership transfers to the
 // caller (host-bin installs it into the Server).
-[[nodiscard]] auto create() -> std::unique_ptr<kernel::Extension>;
+//
+// config_path: the explicit unbox.toml path (host-bin --config). If nullopt,
+// activate() discovers $XDG_CONFIG_HOME/unbox/unbox.toml then
+// ~/.config/unbox/unbox.toml. The [window-field] table tunes how a window is
+// resized to its tile (resize_mode / resize_debounce_ms — see src/config.hpp);
+// a missing/malformed config falls back to the compiled defaults (resize_mode
+// "settle"). The effective file is watched for live hot-reload.
+[[nodiscard]] auto create(std::optional<std::string> config_path = std::nullopt)
+    -> std::unique_ptr<kernel::Extension>;
 
 } // namespace unbox::ext_window_field

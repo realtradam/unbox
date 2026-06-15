@@ -50,12 +50,44 @@ compositing is FUNCTIONAL behind `--rml-compositing` / `UNBOX_RML_COMPOSITING`:
 - Click/tap-to-focus: kernel `SurfaceElement::on_pressed` + window-field wires it
   to `Toplevel::focus()`.
 All unit suites + build-asan green; no regressions.
-NEXT ACTIONS (need USER): (1) **real-seat verification** —
-`UNBOX_RML_COMPOSITING=1 ./build/packages/host-bin/unbox` nested under labwc / on
-the CF-AX3 (headless has no GL, so the visual is the user's, like the spike
-runbook). (2) **Wave 4 decision** — how minimize-to-dock coordinates with the
-window-field. (3) **Wave 5 decision** — damage limiting has real unknowns (RmlUi
-exposes no per-element screen damage), may need a spike or scoped Option-A.
+
+**POST-W3 polish + W3.5 (user-driven, real-seat CONFIRMED on the CF-AX3):**
+- **Resize-to-tile** (real-seat verified, "resolution is great"): kernel
+  `SurfaceElement::rendered_width()/height()` (reads back the RCSS-resolved <img>
+  box — substrate already computes it for popup placement), ext-xdg-shell
+  `Toplevel::set_size()`, and an ext-window-field frame-pumped feedback loop that
+  configures each client to its on-screen box so the live texture maps 1:1.
+  Policy is config-driven (`unbox.toml [window-field] resize_mode` =
+  off|settle|continuous|debounced, hot-reloaded; pure doctested core).
+- **ROOT-CAUSE FIX:** the field now shows each window via `<img data-attr-src>`,
+  NOT a `data-style-decorator`. RmlUi DOES bind `src` (data-attr); the decorator
+  had silently disabled everything the substrate keys off the `src` attribute —
+  pointer/touch input-back, click-to-focus, popup/subsurface placement, AND size
+  readback. (The dock keeps its decorator: frozen previews need none of that.)
+- **W3.5 — FLOATING WINDOWS** (this wave, inserted before the dock per user): the
+  field is now a floating desktop — move (titlebar drag), resize (two bottom
+  corner grips), and a close button per window. New kernel primitive
+  `UiSurface::bind_list_drag` (per-row drag, the list analogue of bind_drag).
+  ext-window-field: per-window geometry STATE (x,y,w,h,z) bound + applied as RCSS
+  data-style (C++ owns interactive state, RCSS renders — contract-clean); pure
+  doctested geometry core (`src/geometry.cpp`: move / resize_bl / resize_br with
+  anchored-opposite-edge + min-size, field clamp); z-order raise on focus; cascade
+  placement. The earlier focused-dominates TILING is dropped — tiled / sidebar
+  containers return LATER as containers windows migrate between (captured-state
+  animations), per the user's staged plan. All suites + build-asan green.
+- **SERVER-SIDE DECORATIONS** (CSD fix for floating windows): ext-xdg-shell now
+  advertises the xdg-decoration manager and forces SERVER_SIDE when RML
+  compositing is on (host-bin passes the flag to create()), so clients drop their
+  own titlebars and only the field's RML chrome shows. Classic path keeps CSD.
+  Kernel wrapper exposes wlr_xdg_decoration_v1. (Caveat: GTK/libadwaita ignore
+  SSD and always draw CSD — a client limitation.)
+
+NEXT ACTIONS (need USER): (1) **real-seat check of floating windows** —
+`UNBOX_RML_COMPOSITING=1 UNBOX_ASSET_DIR=<repo>/assets ./build/packages/host-bin/unbox`
+on the CF-AX3: drag titlebars to move, drag bottom grips to resize, tap × to
+close. (2) **Wave 4 (now W5) decision** — how minimize-to-dock coordinates with
+the floating window-field. (3) **Wave 6 decision** — damage limiting has real
+unknowns (RmlUi exposes no per-element screen damage), may need a spike.
 DEFERRED: Wave 3b (layer-shell wallpaper as surface element — wallpaper/panels
 already work via wlr_scene background/overlay bands); spike-target deletion +
 final doc reconcile (after W5).

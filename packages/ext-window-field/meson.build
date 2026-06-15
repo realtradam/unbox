@@ -12,13 +12,24 @@
 
 ext_window_field_inc = include_directories('include')
 
-# Glue library: needs the kernel ABI (ui substrate + SurfaceElement) and
-# ext-xdg-shell's public contract (Toplevel::wl_surface(), the Service events).
+# toml++: the APPROVED config dep (notes/plan.md §2), a project-global Meson wrap
+# (subprojects/tomlplusplus.wrap). Force default_library=static so the installed
+# `unbox` binary bakes it in (the wrap's own meson.build hardcodes shared, which
+# would need libtomlplusplus.so at runtime). Same rationale as ext-keybindings.
+tomlplusplus_dep = dependency('tomlplusplus',
+                              default_options: ['default_library=static'])
+
+# Glue library: needs the kernel ABI (ui substrate + SurfaceElement), ext-xdg-
+# shell's public contract (Toplevel::wl_surface()/set_size(), the Service events),
+# and toml++ (the [window-field] resize-policy loader, src/config.cpp). The policy
+# parse is a PURE core in src/config.{hpp,cpp} (toml++ only; doctest-covered).
 ext_window_field_lib = static_library(
   'unbox-ext-window-field',
   'src/extension.cpp',
+  'src/config.cpp',
+  'src/geometry.cpp',
   include_directories: ext_window_field_inc,
-  dependencies: [kernel_dep, ext_xdg_shell_dep],
+  dependencies: [kernel_dep, ext_xdg_shell_dep, tomlplusplus_dep],
 )
 
 # What host-bin links against (the factory). kernel_dep rides through for the
@@ -30,10 +41,43 @@ ext_window_field_dep = declare_dependency(
   dependencies: [kernel_dep],
 )
 
-# Tests, asymmetric (AGENTS.md: strict cores, lenient shell). This unit is PURE
-# GLUE — its only policy (window layout) lives in RCSS, not C++, so there is no
-# doctest-able decision core; the SMOKE test (factory/manifest) + a lenient
-# HEADLESS GLUE test (below) are the whole suite.
+# Tests, asymmetric (AGENTS.md: strict cores, lenient shell). Window LAYOUT lives
+# in RCSS (no C++ decision core), but the resize-policy CONFIG parse (src/config.
+# cpp) IS a pure core and is doctest-hard below. The SMOKE test (factory/manifest)
+# + a lenient HEADLESS GLUE test round out the suite.
+
+# CONFIG core test: the pure [window-field] toml parser (defaults, every
+# resize_mode value, debounce clamping, malformed input). No kernel/wlroots; the
+# core TU compiles config.cpp directly and needs `src` on the include path
+# (a unit may read its own src/) plus toml++.
+ext_window_field_config_test = executable(
+  'ext-window-field-config-tests',
+  'tests/test_config.cpp',
+  'src/config.cpp',
+  include_directories: [ext_window_field_inc, include_directories('src')],
+  dependencies: [doctest_dep, tomlplusplus_dep],
+)
+test(
+  'ext-window-field-config',
+  ext_window_field_config_test,
+  suite: 'ext-window-field',
+)
+
+# GEOMETRY core test: the pure floating-window drag/resize math (move, the two
+# bottom resize grips with the anchored-opposite-edge rule, min-size clamp,
+# field clamp). No kernel/wlroots.
+ext_window_field_geometry_test = executable(
+  'ext-window-field-geometry-tests',
+  'tests/test_geometry.cpp',
+  'src/geometry.cpp',
+  include_directories: [ext_window_field_inc, include_directories('src')],
+  dependencies: [doctest_dep],
+)
+test(
+  'ext-window-field-geometry',
+  ext_window_field_geometry_test,
+  suite: 'ext-window-field',
+)
 
 # SMOKE test: the factory yields the window-field extension with the right
 # manifest. Cheap, no kernel/wlroots running.
@@ -98,5 +142,7 @@ test(
 # Aggregate alias: `ninja -C build ext-window-field-tests`.
 alias_target('ext-window-field-tests',
   ext_window_field_smoke_test,
+  ext_window_field_config_test,
+  ext_window_field_geometry_test,
   ext_window_field_glue_test,
 )

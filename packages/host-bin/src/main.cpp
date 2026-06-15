@@ -62,7 +62,10 @@ auto main(int argc, char* argv[]) -> int {
         // The composition root: the ONLY place that names every extension.
         // install() transfers ownership; run() activates in dependency order
         // (ext-keybindings depends_on xdg-shell, resolved topologically).
-        server->install(unbox::ext_xdg_shell::create());
+        // When RML compositing is on, the window field draws window chrome, so
+        // tell xdg-shell to force server-side decorations (clients drop their own
+        // CSD titlebars). In the classic path, leave client-side decorations.
+        server->install(unbox::ext_xdg_shell::create(rml_compositing));
         server->install(unbox::ext_layer_shell::create());
         server->install(unbox::ext_keybindings::create(config_path));
         // The stage dock: Super+M minimizes the focused window into a left-edge
@@ -73,7 +76,7 @@ auto main(int argc, char* argv[]) -> int {
         // as RCSS surface elements. depends_on "xdg-shell" (topologically
         // activated). When off, toplevels keep compositing through wlr_scene.
         if (rml_compositing) {
-            server->install(unbox::ext_window_field::create());
+            server->install(unbox::ext_window_field::create(config_path));
         }
         if (ui_demo) {
             server->install(unbox::host_bin::create_demo_ui());

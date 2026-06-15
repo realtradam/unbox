@@ -1,5 +1,7 @@
 #include <unbox/ext-window-field/ext_window_field.hpp>
 
+#include "config.hpp"
+#include "geometry.hpp"
 #include "probe.hpp"
 
 #include <unbox/ext-xdg-shell/ext_xdg_shell.hpp>
@@ -9,7 +11,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -54,6 +60,56 @@ namespace {
 using kernel::Host;
 using Toplevel = ext_xdg_shell::Toplevel;
 
+// ---- config load (effect): discover + read the file, parse, fall back -------
+//
+// Mirrors ext-keybindings: file discovery/reading is the effect here; the pure
+// parse lives in config.cpp. No readable file / parse error / bad values ->
+// compiled defaults (resize_mode "settle"). Never throws.
+auto read_file(const std::string& path, std::string& out) -> bool {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+auto discover_config_path(const std::optional<std::string>& explicit_path)
+    -> std::optional<std::string> {
+    if (explicit_path) {
+        return explicit_path; // host-bin --config: use it verbatim
+    }
+    if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg != nullptr && xdg[0] != '\0') {
+        return std::string(xdg) + "/unbox/unbox.toml";
+    }
+    if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+        return std::string(home) + "/.config/unbox/unbox.toml";
+    }
+    return std::nullopt;
+}
+
+// Load the window-field policy from the effective path (or compiled defaults).
+// Logs every warning. Used both at activate() and on hot-reload.
+auto load_policy(const std::optional<std::string>& effective_path) -> config::ResizePolicy {
+    if (!effective_path) {
+        wlr_log(WLR_INFO, "ext-window-field: no config path; using defaults (resize_mode settle)");
+        return config::ResizePolicy{};
+    }
+    std::string text;
+    if (!read_file(*effective_path, text)) {
+        wlr_log(WLR_INFO, "ext-window-field: no config at '%s'; using defaults",
+                effective_path->c_str());
+        return config::ResizePolicy{};
+    }
+    config::LoadResult loaded = config::load_from_string(text);
+    for (const std::string& w : loaded.warnings) {
+        wlr_log(WLR_ERROR, "ext-window-field: %s", w.c_str());
+    }
+    return loaded.policy;
+}
+
 // One window in the field. The Toplevel* is a BORROW valid map..unmapped (per
 // the ext-xdg-shell contract), so we may key our own tracking on it and deref
 // it within that window; we drop the Window the instant on_toplevel_unmapped
@@ -66,6 +122,35 @@ struct Window {
     std::unique_ptr<kernel::SurfaceElement> element;     // owns the live import (null = no GL)
     std::string title;                                   // copied at map time
     std::string app_id;                                  // copied at map time
+
+    // FLOATING geometry STATE (field px), the bound source of truth RCSS applies
+    // as data-style transform/size. Updated by the drag gesture cores; never read
+    // back from the client. `z` is the stack order (higher = on top), bumped on
+    // focus/raise so the active window rises.
+    geom::Box box;
+    int z = 0;
+
+    // Resize-to-tile bookkeeping (the feedback loop, see apply_resize). `sent_*`
+    // is the size we last configured the client to (so we re-send only on a real
+    // change); `seen_*` is the element's resolved tile box observed on the
+    // PREVIOUS frame (so "settle" = box unchanged since last frame). Both 0 until
+    // the first laid-out frame.
+    int sent_w = 0, sent_h = 0;
+    int seen_w = 0, seen_h = 0;
+};
+
+// The single in-flight drag (one pointer => one move/resize at a time). Keyed on
+// the Toplevel IDENTITY (not the row index) so a list reorder/erase mid-drag
+// cannot misattribute it. `start_box` + `start_*` are captured on the start
+// phase; every move/end recomputes from the CUMULATIVE pointer delta (the pure
+// core is stateless — apply_drag(start_box, delta)).
+struct DragSession {
+    Toplevel* tl = nullptr;
+    geom::Handle handle = geom::Handle::move;
+    geom::Box start_box;
+    double start_x = 0.0;
+    double start_y = 0.0;
+    bool active = false;
 };
 
 // The window field document lives in EXTERNAL ASSET FILES (loaded via
@@ -82,6 +167,11 @@ struct Window {
 
 class WindowFieldExtension final : public kernel::Extension, public TestProbe {
 public:
+    explicit WindowFieldExtension(std::optional<std::string> config_path)
+        : config_path_(std::move(config_path)),
+          effective_path_(discover_config_path(config_path_)),
+          policy_(load_policy(effective_path_)) {}
+
     [[nodiscard]] auto manifest() const -> const kernel::Manifest& override { return manifest_; }
 
     // ---- TestProbe (src/probe.hpp; glue-test only) ----
@@ -141,6 +231,16 @@ public:
             shell_->on_toplevel_unmapped(),
             [this](const ext_xdg_shell::ToplevelEvent& e) { on_unmapped(e.toplevel); });
 
+        // Config hot-reload: watch the EFFECTIVE config path so editing
+        // unbox.toml re-applies the resize policy live, with no restart (the
+        // kernel fires on_change on create too, so a later-written file is picked
+        // up). A throwing callback is error-isolated by the kernel. No path -> no
+        // watch (defaults stand). config_watch_ is a member: the watch lives
+        // exactly as long as this extension.
+        if (effective_path_) {
+            config_watch_ = host.watch_file(*effective_path_, [this] { reload_config(); });
+        }
+
         activated_ = true;
     }
 
@@ -159,6 +259,8 @@ private:
         w.tl = tl;
         w.title = std::string(tl->title());   // copy: title() is call-only
         w.app_id = std::string(tl->app_id());  // copy: app_id() is call-only
+        w.box = initial_placement(tl);         // floating: cascade + client's size
+        w.z = ++z_counter_;                    // a freshly mapped window is on top
 
         // Turn the toplevel's ROOT wl_surface into a live surface element. The
         // wl_surface is a borrow valid until unmapped (we drop the element then).
@@ -197,7 +299,27 @@ private:
 
         windows_.push_back(std::move(w));
         focused_ = tl; // map-focus: a freshly mapped window is focused
+        ++map_count_;
         dirty_wins();
+    }
+
+    // Initial floating box for a freshly mapped toplevel: the client's own
+    // committed size (its xdg geometry — what it asked to be) clamped to the min,
+    // cascaded down-right so stacked windows do not perfectly overlap, then
+    // clamped into the field. A 0-size geometry (no buffer yet) falls back to a
+    // sane default. Pure-ish (reads tl->geometry() + the output box).
+    [[nodiscard]] auto initial_placement(Toplevel* tl) -> geom::Box {
+        const geom::Limits lim;
+        const wlr_box g = tl->geometry();
+        geom::Box b;
+        b.w = std::max(lim.min_w, g.width > 0 ? g.width : 800);
+        b.h = std::max(lim.min_h, g.height > 0 ? g.height : 540);
+        const int step = 36;
+        const int n = static_cast<int>(map_count_ % 6);
+        b.x = 60 + n * step;
+        b.y = 60 + n * step;
+        const wlr_box f = primary_output_box();
+        return geom::clamp_to_field(b, f.width, f.height);
     }
 
     // A toplevel unmapping: drop its Window (frees the SurfaceElement — we must
@@ -281,15 +403,224 @@ private:
             "wins", "app_id", [this](std::size_t i) -> std::string {
                 return i < windows_.size() ? windows_[i].app_id : std::string{};
             });
+
+        // FLOATING geometry (field px) — the bound STATE the RML applies as
+        // data-style transform/size + z-index. x/y drive a translate, w/h the
+        // element box, z the stack order.
+        field_surface_->bind_list_int("wins", "x", [this](std::size_t i) -> int {
+            return i < windows_.size() ? windows_[i].box.x : 0;
+        });
+        field_surface_->bind_list_int("wins", "y", [this](std::size_t i) -> int {
+            return i < windows_.size() ? windows_[i].box.y : 0;
+        });
+        field_surface_->bind_list_int("wins", "w", [this](std::size_t i) -> int {
+            return i < windows_.size() ? windows_[i].box.w : 0;
+        });
+        field_surface_->bind_list_int("wins", "h", [this](std::size_t i) -> int {
+            return i < windows_.size() ? windows_[i].box.h : 0;
+        });
+        field_surface_->bind_list_int("wins", "z", [this](std::size_t i) -> int {
+            return i < windows_.size() ? windows_[i].z : 0;
+        });
+
+        // Close button (per-row click): ask the client to close. close() is a
+        // request — the window stays valid until its own unmap fires.
+        field_surface_->bind_list_event("wins", "close", [this](std::size_t i) {
+            if (i < windows_.size()) {
+                windows_[i].tl->close();
+            }
+        });
+        // Raise (titlebar tap with no drag): focus + lift, same as a body click.
+        field_surface_->bind_list_event("wins", "raise", [this](std::size_t i) {
+            if (i < windows_.size()) {
+                focus_and_raise(windows_[i].tl);
+            }
+        });
+
+        // Drag interactions: one binding per chrome control, each baking in its
+        // Handle. The row index identifies the window on the start phase; the
+        // session then tracks it by identity (see on_window_drag).
+        field_surface_->bind_list_drag(
+            "wins", "dmove", [this](std::size_t i, kernel::UiSurface::DragPhase ph, double x, double y) {
+                on_window_drag(i, geom::Handle::move, ph, x, y);
+            });
+        field_surface_->bind_list_drag(
+            "wins", "dbl", [this](std::size_t i, kernel::UiSurface::DragPhase ph, double x, double y) {
+                on_window_drag(i, geom::Handle::resize_bl, ph, x, y);
+            });
+        field_surface_->bind_list_drag(
+            "wins", "dbr", [this](std::size_t i, kernel::UiSurface::DragPhase ph, double x, double y) {
+                on_window_drag(i, geom::Handle::resize_br, ph, x, y);
+            });
+    }
+
+    // ---- floating interaction (move / resize / focus) -----------------------
+
+    // Focus + raise a window: keyboard focus (fires on_toplevel_focused -> RCSS
+    // highlight) and bump its z so it sits on top. No-op for an untracked/null tl.
+    void focus_and_raise(Toplevel* tl) {
+        const std::ptrdiff_t idx = index_of(tl);
+        if (idx < 0) {
+            return;
+        }
+        windows_[static_cast<std::size_t>(idx)].z = ++z_counter_;
+        tl->focus(); // keyboard focus + on_toplevel_focused (updates focused_)
+        dirty_wins();
+    }
+
+    // A drag on a window's chrome (titlebar=move, grips=resize). Phase start
+    // captures the box + pointer and resolves the row to a STABLE identity
+    // (Toplevel*), focusing/raising the window; move/end recompute the box from
+    // the cumulative pointer delta via the pure core and clamp it into the field.
+    // Robust to a list reorder/erase mid-drag (it tracks the Toplevel, not the
+    // row index). A throw is impossible here (pure math) but the substrate
+    // isolates it regardless.
+    void on_window_drag(std::size_t row, geom::Handle handle, kernel::UiSurface::DragPhase phase,
+                        double x, double y) {
+        if (phase == kernel::UiSurface::DragPhase::start) {
+            if (row >= windows_.size()) {
+                return;
+            }
+            Window& w = windows_[row];
+            drag_ = DragSession{.tl = w.tl,
+                                .handle = handle,
+                                .start_box = w.box,
+                                .start_x = x,
+                                .start_y = y,
+                                .active = true};
+            focus_and_raise(w.tl);
+            return;
+        }
+        // move / end: apply the cumulative delta to the start box, by identity.
+        if (!drag_.active || drag_.handle != handle) {
+            return; // not our session (e.g. a stale fire)
+        }
+        const std::ptrdiff_t idx = index_of(drag_.tl);
+        if (idx < 0) {
+            drag_.active = false; // the window went away mid-drag
+            return;
+        }
+        const int dx = static_cast<int>(x - drag_.start_x);
+        const int dy = static_cast<int>(y - drag_.start_y);
+        geom::Box nb = geom::apply_drag(drag_.start_box, handle, dx, dy, geom::Limits{});
+        const wlr_box f = primary_output_box();
+        nb = geom::clamp_to_field(nb, f.width, f.height);
+        windows_[static_cast<std::size_t>(idx)].box = nb;
+        if (phase == kernel::UiSurface::DragPhase::end) {
+            drag_.active = false;
+        }
+        dirty_wins(); // re-render at the new box + kick the client-resize loop
     }
 
     // Re-read the bound list (count + every visible row field) and re-render the
     // field on the next frame. No-op when the surface is null (no-GL backend) —
-    // the model is still tracked for the probe.
+    // the model is still tracked for the probe. Also kicks the resize loop: a
+    // map/unmap/focus/move/resize changes a window's box, so the client must be
+    // re-sized to match (apply_resize reads the resolved <img> box and configures
+    // the client).
     void dirty_wins() {
         if (field_surface_ != nullptr) {
             field_surface_->dirty("wins");
         }
+        kick_resize();
+    }
+
+    // ---- resize-to-tile feedback loop ---------------------------------------
+
+    // Start the per-frame resize pump if the policy is active and there is
+    // something to do. Cheap + idempotent: a no-op when mode==off, no surface
+    // (no-GL), or already pumping. Called whenever the layout may change
+    // (dirty_wins, size_to_primary_output, reload). The pump stops itself once
+    // every window's tile box has settled (apply_resize releases the handle).
+    void kick_resize() {
+        if (policy_.mode == config::ResizeMode::off || field_surface_ == nullptr ||
+            host_ == nullptr || resize_frames_.active()) {
+            return;
+        }
+        debounce_accum_ = 0.0;
+        resize_frames_ = host_->request_frames([this](double dt) { apply_resize(dt); });
+    }
+
+    // Per-frame: read each window's RCSS-resolved tile box (rendered_width/height
+    // — the kernel reading back the rectangle RCSS laid the <img> out to) and,
+    // per the policy, configure its client to that size so the live texture fills
+    // the tile 1:1 instead of being scaled into it. Runs only while the pump is
+    // active; releases the pump (stops the frame clock) once all windows have
+    // settled, so there is no busy render at rest.
+    void apply_resize(double dt_seconds) {
+        if (policy_.mode == config::ResizeMode::off) {
+            resize_frames_.reset();
+            return;
+        }
+        debounce_accum_ += dt_seconds;
+        const double debounce_s = static_cast<double>(policy_.debounce_ms) / 1000.0;
+
+        bool all_settled = true;
+        bool sent_this_frame = false;
+        for (Window& w : windows_) {
+            if (w.element == nullptr) {
+                continue; // no-GL: nothing to size
+            }
+            const int cw = w.element->rendered_width();
+            const int ch = w.element->rendered_height();
+            if (cw <= 0 || ch <= 0) {
+                all_settled = false; // not laid out yet; keep pumping
+                continue;
+            }
+            const bool stable = (cw == w.seen_w && ch == w.seen_h); // unchanged since last frame
+            const bool needs = (cw != w.sent_w || ch != w.sent_h);  // differs from last configured
+
+            bool do_send = false;
+            switch (policy_.mode) {
+                case config::ResizeMode::continuous:
+                    do_send = needs;
+                    break;
+                case config::ResizeMode::settle:
+                    do_send = needs && stable;
+                    break;
+                case config::ResizeMode::debounced:
+                    do_send = needs && (stable || debounce_accum_ >= debounce_s);
+                    break;
+                case config::ResizeMode::off:
+                    break;
+            }
+            if (do_send) {
+                w.tl->set_size(cw, ch);
+                w.sent_w = cw;
+                w.sent_h = ch;
+                sent_this_frame = true;
+            }
+            // Settled iff the box is stable AND matches what we last sent (nothing
+            // left to do for this window). The tile box is pure RCSS layout — it
+            // does NOT depend on the client's buffer size — so once we have sent
+            // the stable size there is no feedback that could re-dirty it.
+            if (!stable || cw != w.sent_w || ch != w.sent_h) {
+                all_settled = false;
+            }
+            w.seen_w = cw;
+            w.seen_h = ch;
+        }
+        if (sent_this_frame) {
+            debounce_accum_ = 0.0;
+        }
+        if (all_settled) {
+            resize_frames_.reset(); // stop the frame clock until the next layout change
+        }
+    }
+
+    // Re-read the effective config file and swap the live policy. Mirrors
+    // ext-keybindings' reload: error-isolated (load_policy never throws), keeps
+    // the loop coherent. A switch to "off" lets apply_resize release the pump on
+    // its next tick; any other mode re-kicks the pump so the new policy takes
+    // hold immediately. Last-sent sizes are retained (no spurious reconfigure).
+    void reload_config() {
+        if (!effective_path_) {
+            return;
+        }
+        policy_ = load_policy(effective_path_);
+        wlr_log(WLR_INFO, "ext-window-field: config reloaded (resize_mode=%d) from '%s'",
+                static_cast<int>(policy_.mode), effective_path_->c_str());
+        kick_resize();
     }
 
     // Resize/reposition the field to the primary output's box. Called on
@@ -304,6 +635,8 @@ private:
         }
         field_surface_->set_position(box.x, box.y);
         field_surface_->set_size(box.width, box.height);
+        // The field resized -> every %-based tile box changed -> re-size clients.
+        kick_resize();
     }
 
     // The primary (first) output's box in layout coords, or an empty box (0x0)
@@ -353,10 +686,28 @@ private:
     bool activated_ = false;                  // TestProbe; set at end of activate()
     std::size_t hidden_count_ = 0;            // # windows taken out of wlr_scene
 
+    // Config (resize-to-tile policy). config_path_ is the explicit --config (or
+    // none); effective_path_ is the resolved file actually loaded + watched.
+    // policy_ is the live policy, swapped on hot-reload; it is read by
+    // apply_resize, so it must outlive resize_frames_ (declared early => destroyed
+    // late). debounce_accum_ accumulates frame dt for the "debounced" mode.
+    std::optional<std::string> config_path_;
+    std::optional<std::string> effective_path_;
+    config::ResizePolicy policy_;
+    double debounce_accum_ = 0.0;
+
     // The currently focused window (a borrow valid until its unmapped). Drives
     // the per-row `focused` bool the RCSS highlights/raises. Cleared when its
     // window unmaps.
     Toplevel* focused_ = nullptr;
+
+    // Floating-window bookkeeping. z_counter_ is the monotonic stack-order source
+    // (each focus/raise/map assigns ++z_counter_ so the active window is on top).
+    // map_count_ drives the cascade placement offset. drag_ is the single in-
+    // flight move/resize session (keyed by Toplevel identity, not row index).
+    int z_counter_ = 0;
+    std::size_t map_count_ = 0;
+    DragSession drag_;
 
     // The window model. Declared BEFORE field_surface_ so the surface (whose
     // bindings read windows_) is destroyed FIRST — windows_ (and its
@@ -371,8 +722,12 @@ private:
     // no-GL backend.
     std::unique_ptr<kernel::UiSurface> field_surface_;
 
-    // RAII subscriptions — declared LAST so they release FIRST at teardown,
-    // before the field surface + model their callbacks touch (listener-lifetime).
+    // RAII handles — declared LAST so they release FIRST at teardown, before the
+    // field surface + model their callbacks touch (listener-lifetime). The frame
+    // pump (apply_resize) reads windows_/field_surface_/policy_, and the config
+    // watch (reload_config) re-kicks it, so both must stop before those die.
+    kernel::FrameRequest resize_frames_;
+    kernel::FileWatch config_watch_;
     kernel::Subscription output_added_;
     kernel::Subscription mapped_;
     kernel::Subscription focused_sub_;
@@ -381,12 +736,15 @@ private:
 
 } // namespace
 
-auto create() -> std::unique_ptr<kernel::Extension> {
-    return std::make_unique<WindowFieldExtension>();
+auto create(std::optional<std::string> config_path) -> std::unique_ptr<kernel::Extension> {
+    return std::make_unique<WindowFieldExtension>(std::move(config_path));
 }
 
 auto make_extension_with_probe() -> ExtensionWithProbe {
-    auto ext = std::make_unique<WindowFieldExtension>();
+    // Tests do not exercise config: no path -> compiled defaults (resize_mode
+    // settle), no watch. The headless backend has no GL substrate, so the resize
+    // loop has no elements to size anyway (apply_resize is a no-op there).
+    auto ext = std::make_unique<WindowFieldExtension>(std::nullopt);
     TestProbe* probe = ext.get();
     return ExtensionWithProbe{.extension = std::move(ext), .probe = probe};
 }
