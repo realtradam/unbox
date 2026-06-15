@@ -71,6 +71,12 @@
 | **restore** | Return a minimized toplevel to the normal layer at its prior geometry and focus it; its preview leaves the dock. | unminimize, unhide |
 | **reveal** | The proportional, finger-following show/hide of the stage dock driven by the edge swipe (fraction 0..1); release snaps fully open or closed. | slide, animate (bare) |
 
+## Wallpaper (ext-wallpaper)
+
+| Term | Meaning | Aliases to avoid |
+|---|---|---|
+| **wallpaper** | The desktop background image, composited in the `background` scene layer below every window by ext-wallpaper (standard tier). Config-driven (`[wallpaper]` in `unbox.toml`: `path`/`fit`/`color`), hot-reloaded; an input-transparent ui surface; falls back to a bundled default image when no `path` is set. | background (bare), desktop background, backdrop |
+
 ## Workflow
 
 | Term | Meaning | Aliases to avoid |

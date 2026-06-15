@@ -5,6 +5,24 @@
 
 ## Now
 
+**Just landed — screenshots + wallpaper (user-driven, real-seat/nested VERIFIED):**
+- **Screenshots (grim):** kernel creates `wlr_screencopy_manager_v1` +
+  `wlr_xdg_output_manager_v1` (policy-free plumbing, like data-device). grim
+  captures the standard `wlr_scene_output_commit` composite (RML docs are
+  scene-buffer nodes → captured). Verified nested: `grim` → valid 1280×720 PNG.
+- **Arbitrary image decode:** vendored `stb_image` (user-approved); substrate
+  `LoadTexture` now decodes PNG/JPEG/… (was TGA-only), and a SubstrateSystemInterface
+  `JoinPath` override stops RmlUi stripping the leading `/` of an absolute path, so
+  `decorator: image('/abs')` AND `<img src='/abs'>` both load. Kernel ui_pixel tests.
+- **`ext-wallpaper` (NEW, standard tier):** `[wallpaper]` in unbox.toml
+  (path/fit/color), shown in the `background` layer, hot-reloaded (drop+recreate
+  inline doc); bundled default `assets/ext-wallpaper/default.jpg` when no path set.
+  Needed a new kernel **`UiSurfaceSpec::input_transparent`** flag (a full-screen
+  background surface must not steal clicks — substrate press-ownership is per-rect,
+  pre-bus). Verified nested: configured image + bundled default both render; input
+  passes through. swaybg (layer-shell) still works too. GAP: multi-output (primary
+  only). Commits on feat/rml-compositing.
+
 **ACTIVE (core, user-driven) — Slice 13: RML COMPOSITING (Phase 0 GO → Phase 2 impl).** Big direction
 change: RMLUi becomes the content compositor — toplevels + layer-shell (incl.
 wallpaper) + chrome are RML elements backed by LIVE, SHARED GL textures, with
