@@ -59,6 +59,7 @@
 #include <thread>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -3183,14 +3184,31 @@ private:
 
 // Client-side: a real Wayland client that maps an xdg toplevel + a subsurface +
 // an xdg popup, and records what its wl_pointer / wl_touch / wl_keyboard receive
-// (so the test can assert the input-back surface-local coords). On its own thread.
+// (so the test can assert the input-back surface-local coords).
+//
+// DE-FLAKE DESIGN (replaces the original free-running-thread approach):
+//   Phase 1 (background thread): XDG protocol setup — the configure/ack
+//     handshake needs both the server and client dispatching concurrently, so
+//     a background thread is still used for this phase. It sets ready=true
+//     once the toplevel + subsurface + popup are all committed, then EXITS its
+//     loop and sets loop_done=true so the main test thread knows it is safe to
+//     take over.
+//   Phase 2 (main test thread): cooperative dispatch — after observing ready
+//     and calling take_over() to join the background thread, the main test
+//     thread exclusively owns dpy. It drives wl_display_dispatch_pending() +
+//     wl_display_flush() itself, interleaved with server->dispatch() pumps via
+//     pump_both(). No sleeping, no races.
+//   Teardown: called from main thread after all assertions; destroys proxies.
 struct TreeClient {
     std::thread thread;
-    std::atomic<bool> ready{false};      // toplevel + subsurface + popup committed
-    std::atomic<bool> stop{false};
+    std::atomic<bool> ready{false};     // toplevel + subsurface + popup committed
+    std::atomic<bool> loop_done{false}; // bg thread exited its loop (owns nothing now)
+    std::atomic<bool> stop{false};      // tells bg thread to exit
     std::string socket;
 
-    // Recorded client input (atomics: read from the test thread).
+    // Recorded client input (plain ints: ONLY accessed from the main test
+    // thread after take_over() — no more atomics needed once we own dpy).
+    // Keep atomics for thread-safety during setup phase (ready signalling).
     std::atomic<int> ptr_enters{0};
     std::atomic<int> ptr_motions{0};
     std::atomic<int> ptr_buttons{0};
@@ -3207,11 +3225,72 @@ struct TreeClient {
 
     explicit TreeClient(std::string sock) : socket(std::move(sock)) {}
     void start() { thread = std::thread([this] { run(); }); }
-    void join() {
+
+    // Called from main thread after observing ready: stops the bg thread and
+    // joins it so the main thread exclusively owns dpy.
+    void take_over() {
         stop = true;
         if (thread.joinable()) {
             thread.join();
         }
+    }
+
+    // Dispatch pending client events from the MAIN TEST THREAD (only after
+    // take_over() — must not be called while the bg thread is running).
+    // Uses the non-blocking prepare/poll/read/dispatch pattern so it never
+    // blocks: if no data is on the socket, cancel_read and return immediately.
+    void dispatch_pending() {
+        if (dpy == nullptr) return;
+        // Flush any outgoing client requests first.
+        wl_display_flush(dpy);
+        // Drain already-buffered events before preparing the fd read.
+        while (wl_display_prepare_read(dpy) != 0) {
+            wl_display_dispatch_pending(dpy);
+        }
+        // Non-blocking poll: if data is available on the Wayland fd, read it.
+        struct pollfd pfd = { wl_display_get_fd(dpy), POLLIN, 0 };
+        if (::poll(&pfd, 1, 0) > 0 && ((pfd.revents & POLLIN) != 0)) {
+            wl_display_read_events(dpy);
+        } else {
+            wl_display_cancel_read(dpy);
+        }
+        wl_display_dispatch_pending(dpy);
+        wl_display_flush(dpy);
+    }
+
+    // Full teardown: destroy all Wayland proxies and disconnect. Called from
+    // the main test thread after take_over() and after all assertions.
+    void teardown() {
+        if (dpy == nullptr) return;
+        if (pop_buf != nullptr)  { wl_buffer_destroy(pop_buf);  pop_buf  = nullptr; }
+        if (sub_buf != nullptr)  { wl_buffer_destroy(sub_buf);  sub_buf  = nullptr; }
+        if (root_buf != nullptr) { wl_buffer_destroy(root_buf); root_buf = nullptr; }
+        if (xpop != nullptr)     { xdg_popup_destroy(xpop);     xpop     = nullptr; }
+        if (xpopsurf != nullptr) { xdg_surface_destroy(xpopsurf); xpopsurf = nullptr; }
+        if (pop != nullptr)      { wl_surface_destroy(pop);     pop      = nullptr; }
+        if (subsurface != nullptr) { wl_subsurface_destroy(subsurface); subsurface = nullptr; }
+        if (sub != nullptr)      { wl_surface_destroy(sub);     sub      = nullptr; }
+        if (xtop != nullptr)     { xdg_toplevel_destroy(xtop);  xtop     = nullptr; }
+        if (xsurf != nullptr)    { xdg_surface_destroy(xsurf);  xsurf    = nullptr; }
+        if (root != nullptr)     { wl_surface_destroy(root);    root     = nullptr; }
+        if (pointer != nullptr)  { wl_pointer_destroy(pointer); pointer  = nullptr; }
+        if (touch != nullptr)    { wl_touch_destroy(touch);     touch    = nullptr; }
+        if (keyboard != nullptr) { wl_keyboard_destroy(keyboard); keyboard = nullptr; }
+        if (seat != nullptr)     { wl_seat_destroy(seat);       seat     = nullptr; }
+        if (wm_base != nullptr)  { xdg_wm_base_destroy(wm_base); wm_base = nullptr; }
+        if (subcompositor != nullptr) { wl_subcompositor_destroy(subcompositor); subcompositor = nullptr; }
+        if (compositor != nullptr) { wl_compositor_destroy(compositor); compositor = nullptr; }
+        if (shm != nullptr)      { wl_shm_destroy(shm);         shm      = nullptr; }
+        if (registry != nullptr) { wl_registry_destroy(registry); registry = nullptr; }
+        wl_display_flush(dpy);
+        wl_display_disconnect(dpy);
+        dpy = nullptr;
+    }
+
+    // Legacy join() for the 3D-transform test which still uses the old pattern.
+    // After take_over(), teardown() must still be called explicitly.
+    void join() {
+        take_over();
     }
 
     wl_display* dpy = nullptr;
@@ -3233,6 +3312,11 @@ struct TreeClient {
     xdg_surface* xpopsurf = nullptr;
     xdg_popup* xpop = nullptr;
     bool configured = false;
+    // Lifted from run() locals so teardown() can destroy them from the main thread.
+    wl_subsurface* subsurface = nullptr;
+    wl_buffer* root_buf = nullptr;
+    wl_buffer* sub_buf = nullptr;
+    wl_buffer* pop_buf = nullptr;
 
     auto surface_index(wl_surface* s) const -> int {
         if (s == root) {
@@ -3409,17 +3493,18 @@ struct TreeClient {
     void run() {
         dpy = wl_display_connect(socket.c_str());
         if (dpy == nullptr) {
+            loop_done = true;
             return;
         }
         registry = wl_display_get_registry(dpy);
         static const wl_registry_listener reg_l = {reg_global, reg_remove};
         wl_registry_add_listener(registry, &reg_l, this);
         wl_display_roundtrip(dpy); // bind globals
-        // wl_seat capabilities arrive async; roundtrip again so get_keyboard works
-        // once the kernel advertises a (test) keyboard.
         if (compositor == nullptr || shm == nullptr || subcompositor == nullptr ||
             wm_base == nullptr || seat == nullptr) {
             wl_display_disconnect(dpy);
+            dpy = nullptr;
+            loop_done = true;
             return;
         }
         static const xdg_wm_base_listener wm_l = {wm_ping};
@@ -3437,16 +3522,16 @@ struct TreeClient {
         wl_surface_commit(root); // initial commit -> server sends configure
         while (!configured && wl_display_dispatch(dpy) != -1) {
         }
-        wl_buffer* root_buf = make_buffer(shm, 200, 200, 0xff2060c0);
+        root_buf = make_buffer(shm, 200, 200, 0xff2060c0);
         wl_surface_attach(root, root_buf, 0, 0);
         wl_surface_damage(root, 0, 0, 200, 200);
 
         // --- subsurface (node 1): 40x40 at tree offset (20,30) ---
         sub = wl_compositor_create_surface(compositor);
-        wl_subsurface* subsurface = wl_subcompositor_get_subsurface(subcompositor, sub, root);
+        subsurface = wl_subcompositor_get_subsurface(subcompositor, sub, root);
         wl_subsurface_set_position(subsurface, 20, 30);
         wl_subsurface_set_desync(subsurface);
-        wl_buffer* sub_buf = make_buffer(shm, 40, 40, 0xff60c020);
+        sub_buf = make_buffer(shm, 40, 40, 0xff60c020);
         wl_surface_attach(sub, sub_buf, 0, 0);
         wl_surface_damage(sub, 0, 0, 40, 40);
         wl_surface_commit(sub);
@@ -3469,7 +3554,7 @@ struct TreeClient {
         (void)xps2;
         wl_surface_commit(pop); // initial popup commit -> configure
         wl_display_roundtrip(dpy);
-        wl_buffer* pop_buf = make_buffer(shm, 60, 50, 0xff2080e0);
+        pop_buf = make_buffer(shm, 60, 50, 0xff2080e0);
         wl_surface_attach(pop, pop_buf, 0, 0);
         wl_surface_damage(pop, 0, 0, 60, 50);
         wl_surface_commit(pop);
@@ -3480,79 +3565,36 @@ struct TreeClient {
         wl_display_flush(dpy);
         ready = true;
 
+        // DE-FLAKE: the original approach ran a dispatch loop with sleep_for(2ms)
+        // here, causing starvation races under load. Now we simply signal that the
+        // setup phase is done and exit. The main test thread takes over all
+        // dispatching cooperatively (no sleep, no race). loop_done signals the
+        // main thread that it is safe to call dispatch_pending().
+        loop_done = true;
+        // Wait for the main thread to signal teardown (it calls take_over()
+        // which sets stop=true). This keeps dpy alive for the main thread's
+        // cooperative dispatch phase.
         while (!stop) {
-            if (wl_display_dispatch_pending(dpy) == -1) {
-                break;
-            }
-            wl_display_flush(dpy);
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-
-        // Teardown: destroy every proxy before disconnect (asan leak-clean).
-        if (pop_buf != nullptr) {
-            wl_buffer_destroy(pop_buf);
-        }
-        if (sub_buf != nullptr) {
-            wl_buffer_destroy(sub_buf);
-        }
-        if (root_buf != nullptr) {
-            wl_buffer_destroy(root_buf);
-        }
-        if (xpop != nullptr) {
-            xdg_popup_destroy(xpop);
-        }
-        if (xpopsurf != nullptr) {
-            xdg_surface_destroy(xpopsurf);
-        }
-        if (pop != nullptr) {
-            wl_surface_destroy(pop);
-        }
-        if (subsurface != nullptr) {
-            wl_subsurface_destroy(subsurface);
-        }
-        if (sub != nullptr) {
-            wl_surface_destroy(sub);
-        }
-        if (xtop != nullptr) {
-            xdg_toplevel_destroy(xtop);
-        }
-        if (xsurf != nullptr) {
-            xdg_surface_destroy(xsurf);
-        }
-        if (root != nullptr) {
-            wl_surface_destroy(root);
-        }
-        if (pointer != nullptr) {
-            wl_pointer_destroy(pointer);
-        }
-        if (touch != nullptr) {
-            wl_touch_destroy(touch);
-        }
-        if (keyboard != nullptr) {
-            wl_keyboard_destroy(keyboard);
-        }
-        if (seat != nullptr) {
-            wl_seat_destroy(seat);
-        }
-        if (wm_base != nullptr) {
-            xdg_wm_base_destroy(wm_base);
-        }
-        if (subcompositor != nullptr) {
-            wl_subcompositor_destroy(subcompositor);
-        }
-        if (compositor != nullptr) {
-            wl_compositor_destroy(compositor);
-        }
-        if (shm != nullptr) {
-            wl_shm_destroy(shm);
-        }
-        if (registry != nullptr) {
-            wl_registry_destroy(registry);
-        }
-        wl_display_flush(dpy);
-        wl_display_disconnect(dpy);
+        // Teardown is now done by the main thread via teardown(). The thread
+        // just returns; dpy is still valid when take_over() is called.
     }
 };
+
+// Cooperative pump: advance the server event loop AND dispatch pending client
+// events until pred() is true or max_turns elapse. Used in the input-back test
+// to synchronously deliver wl_seat events to the client after the server sends
+// them — no sleeps, no races. Must only be called after client.take_over().
+template <typename Pred>
+auto pump_both(unbox::kernel::Server& s, TreeClient& client, Pred pred,
+               int max_turns = 400) -> bool {
+    for (int i = 0; i < max_turns && !pred(); ++i) {
+        s.dispatch(5);
+        client.dispatch_pending();
+    }
+    return pred();
+}
 
 } // namespace
 
@@ -3573,15 +3615,32 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
     TreeClient client(server->socket_name());
     client.start();
 
-    const bool ok = pump_until_se(*server, [&] { return client.ready.load(); }, 800) &&
-                    pump_until_se(*server, [&] { return ext->has_surface(); }, 800);
-    if (!ok || !ext->has_element() || server->ui_frame_count() == 0) {
-        // No GL path on this box, or the client could not map: skip (mirrors the
-        // other GL-gated tests). The pure-core input math is asserted separately.
-        client.join();
+    // Wait for the client to complete XDG setup and the substrate to build the
+    // element. pump_until_se only pumps the server (the client thread runs
+    // concurrently during setup). Both must succeed; if not (no GL path), still
+    // take_over + teardown for leak-clean shutdown.
+    pump_until_se(*server, [&] { return client.ready.load(); }, 800);
+    pump_until_se(*server, [&] { return client.loop_done.load(); }, 100);
+
+    // Take exclusive ownership of the client display: stop the bg thread
+    // (which is now idle after loop_done) and join it. From this point all
+    // wl_display operations happen on the main test thread — no races.
+    client.take_over();
+
+    // Drain any pending client events that arrived during setup.
+    client.dispatch_pending();
+
+    pump_until_se(*server, [&] { return ext->has_surface(); }, 800);
+
+    if (!ext->has_element() || server->ui_frame_count() == 0) {
+        // No GL path on this box: degrade gracefully (same pattern as the other
+        // GL-gated tests). All coverage is still asserted when GL is available.
+        client.teardown();
+        unsetenv("WLR_HEADLESS_OUTPUTS");
         return;
     }
     pump(*server, 40); // let the tree re-walk + child <img> placement settle
+    client.dispatch_pending(); // drain any events from the settle phase
 
     // Install the click/tap-to-focus press hook (ui.hpp SurfaceElement::on_pressed).
     // It must fire exactly once per pointer PRESS / touch DOWN routed to the
@@ -3605,11 +3664,13 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
     // ROOT region of the element. Surface at (40,30); the root img fills 200x200
     // 1:1 with the 200x200 buffer, so layout (40+50, 30+60) => surface-local
     // (50,60) on the root client surface.
+    // pump_both co-pumps server + client until the assertion predicate is true —
+    // the client receives the wl_seat event deterministically with no sleep.
     using DK = unbox::kernel::Server::UiTouchOverride; // (unused; keep includes warm)
     (void)DK::automatic;
     server->ui_route_pointer_motion_for_test(TreeTestExtension::kSurfX + 50.0,
                                              TreeTestExtension::kSurfY + 60.0, 1000);
-    pump_until_se(*server, [&] { return client.ptr_enters.load() > 0; }, 200);
+    pump_both(*server, client, [&] { return client.ptr_enters.load() > 0; }, 200);
     CHECK(client.ptr_enters.load() > 0);
     CHECK(client.ptr_enter_surface.load() == 0); // hit the ROOT node
     CHECK(client.last_ptr_x.load() == doctest::Approx(50.0).epsilon(0.05));
@@ -3623,9 +3684,10 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
     // (30,45) on the root, which lands inside the subsurface (its <img> spans
     // (20,30)..(60,70)). The pick must hit the SUBSURFACE node and report coords
     // LOCAL TO THE SUBSURFACE: (30-20, 45-30) = (10,15).
+    const int enters_before_sub = client.ptr_enters.load();
     server->ui_route_pointer_motion_for_test(TreeTestExtension::kSurfX + 30.0,
                                              TreeTestExtension::kSurfY + 45.0, 1010);
-    pump(*server, 5);
+    pump_both(*server, client, [&] { return client.ptr_enters.load() > enters_before_sub; }, 200);
     CHECK(client.ptr_enter_surface.load() == 1); // the subsurface node
     CHECK(client.last_ptr_x.load() == doctest::Approx(10.0).epsilon(0.1));
     CHECK(client.last_ptr_y.load() == doctest::Approx(15.0).epsilon(0.1));
@@ -3642,7 +3704,7 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
                                              TreeTestExtension::kSurfY + 60.0, false, 1021);
     // (B) PRESS HOOK: the RELEASE does NOT fire the hook (still one fire total).
     CHECK(ext->pressed_count() == pressed0 + 1);
-    pump_until_se(*server, [&] { return client.ptr_buttons.load() > btn0; }, 200);
+    pump_both(*server, client, [&] { return client.ptr_buttons.load() > btn0; }, 200);
     CHECK(client.ptr_buttons.load() > btn0);
 
     // (B) PRESS HOOK over a CHILD node: a press at layout (40+30, 30+45) lands on
@@ -3653,6 +3715,7 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
                                              TreeTestExtension::kSurfY + 45.0, true, 1024);
     server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 30.0,
                                              TreeTestExtension::kSurfY + 45.0, false, 1025);
+    client.dispatch_pending();
     CHECK(client.ptr_enter_surface.load() == 1);            // the pick hit the subsurface
     CHECK(ext->pressed_count() == pressed_child0 + 1);      // root handler still fired ONCE
 
@@ -3663,6 +3726,7 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
                                              TreeTestExtension::kSurfY + 1000.0, true, 1028);
     server->ui_route_pointer_button_for_test(TreeTestExtension::kSurfX + 1000.0,
                                              TreeTestExtension::kSurfY + 1000.0, false, 1029);
+    client.dispatch_pending();
     CHECK(ext->pressed_count() == pressed_miss0);
 
     // (B) INPUT-BACK touch: a touch-down over the root forwards a wl_touch down at
@@ -3670,7 +3734,7 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
     const int pressed_touch0 = ext->pressed_count();
     server->ui_route_touch_down_for_test(7, TreeTestExtension::kSurfX + 50.0,
                                          TreeTestExtension::kSurfY + 60.0, 1030);
-    pump_until_se(*server, [&] { return client.touch_downs.load() > 0; }, 200);
+    pump_both(*server, client, [&] { return client.touch_downs.load() > 0; }, 200);
     CHECK(client.touch_downs.load() > 0);
     CHECK(client.last_touch_x.load() == doctest::Approx(50.0).epsilon(0.05));
     CHECK(client.last_touch_y.load() == doctest::Approx(60.0).epsilon(0.05));
@@ -3683,15 +3747,15 @@ TEST_CASE("surface-element: tree (subsurface + popup) + input-back + keyboard fo
     // (C) KEYBOARD FOCUS: focusing the element delivers a wl_keyboard enter, then
     // a forwarded key reaches the client.
     ext->focus();
-    pump_until_se(*server, [&] { return client.kbd_enters.load() > 0; }, 200);
+    pump_both(*server, client, [&] { return client.kbd_enters.load() > 0; }, 200);
     CHECK(client.kbd_enters.load() > 0);
     const int keys0 = client.keys.load();
     server->ui_send_key_for_test(/*KEY_A*/ 30, true);
     server->ui_send_key_for_test(/*KEY_A*/ 30, false);
-    pump_until_se(*server, [&] { return client.keys.load() > keys0; }, 200);
+    pump_both(*server, client, [&] { return client.keys.load() > keys0; }, 200);
     CHECK(client.keys.load() > keys0);
 
-    client.join();
+    client.teardown();
     unsetenv("WLR_HEADLESS_OUTPUTS");
 }
 
@@ -3721,13 +3785,20 @@ TEST_CASE("surface-element: input-back through a 3D-transformed hosting element"
     TreeClient client(server->socket_name());
     client.start();
 
-    const bool ok = pump_until_se(*server, [&] { return client.ready.load(); }, 800) &&
-                    pump_until_se(*server, [&] { return ext->has_surface(); }, 800);
-    if (!ok || !ext->has_element() || server->ui_frame_count() == 0) {
-        client.join();
+    pump_until_se(*server, [&] { return client.ready.load(); }, 800);
+    pump_until_se(*server, [&] { return client.loop_done.load(); }, 100);
+    client.take_over();
+    client.dispatch_pending();
+
+    pump_until_se(*server, [&] { return ext->has_surface(); }, 800);
+
+    if (!ext->has_element() || server->ui_frame_count() == 0) {
+        client.teardown();
+        unsetenv("WLR_HEADLESS_OUTPUTS");
         return;
     }
     pump(*server, 40);
+    client.dispatch_pending();
 
     // The element box is 200x200 at layout (40,30); its centre is layout
     // (40+100, 30+100). Under perspective+rotateY about the 50% origin the centre
@@ -3737,13 +3808,13 @@ TEST_CASE("surface-element: input-back through a 3D-transformed hosting element"
     // axis point, proving the projection — not a naive axis-aligned map — runs.)
     server->ui_route_pointer_motion_for_test(TreeTestExtension::kSurfX + 100.0,
                                              TreeTestExtension::kSurfY + 100.0, 2000);
-    pump_until_se(*server, [&] { return client.ptr_enters.load() > 0; }, 200);
+    pump_both(*server, client, [&] { return client.ptr_enters.load() > 0; }, 200);
     REQUIRE(client.ptr_enters.load() > 0);
     CHECK(client.ptr_enter_surface.load() == 0); // the root node
     CHECK(client.last_ptr_x.load() == doctest::Approx(100.0).epsilon(0.03));
     CHECK(client.last_ptr_y.load() == doctest::Approx(100.0).epsilon(0.03));
 
-    client.join();
+    client.teardown();
     unsetenv("WLR_HEADLESS_OUTPUTS");
 }
 
