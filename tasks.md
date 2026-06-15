@@ -38,12 +38,27 @@ doctested) + `SurfaceElement::focus_keyboard()` primitive. Kernel suite (72c/375
 in W3) + ext-layer-shell (expose its surface); **W3** = NEW `ext-window-field`
 (window list + RCSS layout + focus policy via `focus_keyboard()`, flips the flag);
 **W4** = ext-stage-dock; **W5** = damage limiting (Option B) + scanout bypass.
-NEXT ACTION: **Wave 2** (ext-xdg-shell + ext-layer-shell, disjoint/parallel).
-TRACKED BUG (pre-existing, baseline-confirmed, NOT from these waves): the
-`ext-stage-dock-glue` + `ext-xdg-shell-client` test suites abort at teardown on a
-wlroots `wl_list_empty(...commit.listener_list)` assertion (a listener-lifetime
-teardown-order bug in those units' tests) — fix `ext-xdg-shell-client` in W2,
-`ext-stage-dock-glue` in W4.
+**Waves 1b/2/3 + click-to-focus DONE + verified + committed.** Core RML
+compositing is FUNCTIONAL behind `--rml-compositing` / `UNBOX_RML_COMPOSITING`:
+- W2 ext-xdg-shell: `Toplevel::wl_surface()` (additive; scene compositing intact).
+- Kernel: fixed the W1 test-seam listener-lifetime bug (root cause of the
+  `ext-stage-dock-glue`/`ext-xdg-shell-client` teardown aborts — both now GREEN).
+- W3 NEW `ext-window-field` (core, `--rml-compositing`-gated): toplevels become
+  RCSS surface elements in ONE window-field ui surface; `bind_list("wins")` +
+  RCSS flex layout (`assets/ext-window-field/field.{rml,rcss}`); `Toplevel::hide()`
+  takes them out of wlr_scene; focus via `on_toplevel_focused`.
+- Click/tap-to-focus: kernel `SurfaceElement::on_pressed` + window-field wires it
+  to `Toplevel::focus()`.
+All unit suites + build-asan green; no regressions.
+NEXT ACTIONS (need USER): (1) **real-seat verification** —
+`UNBOX_RML_COMPOSITING=1 ./build/packages/host-bin/unbox` nested under labwc / on
+the CF-AX3 (headless has no GL, so the visual is the user's, like the spike
+runbook). (2) **Wave 4 decision** — how minimize-to-dock coordinates with the
+window-field. (3) **Wave 5 decision** — damage limiting has real unknowns (RmlUi
+exposes no per-element screen damage), may need a spike or scoped Option-A.
+DEFERRED: Wave 3b (layer-shell wallpaper as surface element — wallpaper/panels
+already work via wlr_scene background/overlay bands); spike-target deletion +
+final doc reconcile (after W5).
 Tiling (slice 7) is DEFERRED behind this (becomes RCSS over surface elements;
 pure layout core in `notes/tiling-spec.md` carries over). Stage dock (slice 10)
 real-seat feel check is paused under this pivot.
