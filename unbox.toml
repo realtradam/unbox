@@ -62,3 +62,22 @@ action = "quit"
 [window-field]
 resize_mode        = "settle"
 resize_debounce_ms = 100
+
+# Wallpaper ---------------------------------------------------------------------
+# The desktop background, composited below every window. Edits hot-reload live.
+#
+#   path   Absolute path to an image file (PNG, JPEG, BMP, GIF, TGA, …). Empty or
+#          omitted = no image, just the solid `color` fill below.
+#   fit    How the image fills the screen:
+#            "cover"   (default) crop to fill, preserves aspect ratio, no bars
+#            "contain" letterbox: whole image visible, preserves aspect ratio
+#            "stretch" distort to exactly fill the screen
+#            "center"  natural pixel size, centred (no scaling)
+#   color  Solid fill shown behind/around the image (and when `path` is empty).
+#          CSS hex, "#rrggbb" or "#rgb". Default "#000000".
+#
+# Omit this table for a plain black background.
+[wallpaper]
+path  = ""
+fit   = "cover"
+color = "#1e1e2e"

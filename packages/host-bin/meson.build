@@ -4,6 +4,6 @@
 executable(
   'unbox',
   'src/main.cpp',
-  dependencies: [kernel_dep, ext_xdg_shell_dep, ext_layer_shell_dep, ext_keybindings_dep, ext_stage_dock_dep, ext_window_field_dep],
+  dependencies: [kernel_dep, ext_xdg_shell_dep, ext_layer_shell_dep, ext_keybindings_dep, ext_stage_dock_dep, ext_window_field_dep, ext_wallpaper_dep],
   install: true,
 )

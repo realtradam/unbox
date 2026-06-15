@@ -3,6 +3,7 @@
 #include <unbox/ext-keybindings/ext_keybindings.hpp>
 #include <unbox/ext-layer-shell/ext_layer_shell.hpp>
 #include <unbox/ext-stage-dock/ext_stage_dock.hpp>
+#include <unbox/ext-wallpaper/ext_wallpaper.hpp>
 #include <unbox/ext-window-field/ext_window_field.hpp>
 #include <unbox/ext-xdg-shell/ext_xdg_shell.hpp>
 #include <unbox/kernel/kernel.hpp>
@@ -72,6 +73,11 @@ auto main(int argc, char* argv[]) -> int {
         // dock of previews; tap a preview to restore. Standard tier, hidden until
         // it holds a minimized window (depends_on xdg-shell, topo-activated).
         server->install(unbox::ext_stage_dock::create());
+        // The desktop wallpaper: a config-driven background image ([wallpaper] in
+        // unbox.toml), composited in the background scene layer below every window.
+        // Standard tier, always on; its surface is input-transparent so it never
+        // steals clicks. depends_on nothing (topo-activated).
+        server->install(unbox::ext_wallpaper::create(config_path));
         // RML compositing (Phase 2, opt-in): the window field composites toplevels
         // as RCSS surface elements. depends_on "xdg-shell" (topologically
         // activated). When off, toplevels keep compositing through wlr_scene.
