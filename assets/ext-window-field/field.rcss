@@ -65,9 +65,11 @@ div.win.focused {
     transform: scale(1.0);
 }
 
-/* The live window texture fills its tile 1:1 (the <img src=live_uri> of the
-   surface element). The tile's rounded overflow:hidden clips it to the card. */
-div.win img.live {
+/* The live window texture fills its tile (the surface element's live_uri, painted
+   via an RCSS `image()` decorator bound in field.rml — the proven dynamic-texture
+   pattern, since RmlUi does NOT substitute data bindings in an <img src>). The
+   tile's rounded overflow:hidden clips it to the card. */
+div.win .live {
     display: block;
     position: absolute;
     left: 0;

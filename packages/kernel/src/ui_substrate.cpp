@@ -1613,15 +1613,18 @@ bool Substrate::Impl::adopt_node(SurfaceElementState& el, SurfaceNode& node) {
         EGLImageKHR img =
             gl.egl_create_image(gl.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, ia);
         if (img != EGL_NO_IMAGE_KHR) {
-            // Drop the old GL objects, build the new texture from the EGLImage.
-            if (node.tex != 0) {
-                glDeleteTextures(1, &node.tex);
-                node.tex = 0;
+            // STABLE TEXTURE ID across re-imports. RmlUi's image()/<img> decorator
+            // caches the texture HANDLE it gets from LoadTexture(uri) ONCE (at load
+            // time) and draws that handle every frame — so if we regenerated the GL
+            // id on each re-import, a live window would show its FIRST frame then go
+            // blank (it would draw a DELETED texture). Allocate node.tex ONCE and
+            // just re-point it at the NEW EGLImage on every re-import, destroying the
+            // PREVIOUS image after the rebind. The id stays constant => the cached
+            // RmlUi handle stays valid => the window updates live.
+            EGLImageKHR old_image = node.image;
+            if (node.tex == 0) {
+                glGenTextures(1, &node.tex);
             }
-            if (node.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
-                gl.egl_destroy_image(gl.egl_display, node.image);
-            }
-            glGenTextures(1, &node.tex);
             glBindTexture(GL_TEXTURE_2D, node.tex);
             gl.gl_image_target_texture(GL_TEXTURE_2D, static_cast<GLeglImageOES>(img));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1629,6 +1632,9 @@ bool Substrate::Impl::adopt_node(SurfaceElementState& el, SurfaceNode& node) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glBindTexture(GL_TEXTURE_2D, 0);
+            if (old_image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
+                gl.egl_destroy_image(gl.egl_display, old_image);
+            }
             node.image = img;
             node.width = attribs.width;
             node.height = attribs.height;
@@ -1647,15 +1653,16 @@ bool Substrate::Impl::adopt_node(SurfaceElementState& el, SurfaceNode& node) {
         wlr_buffer_unlock(buf); // import failed: drop the lock we just took
         return node.tex != 0;
     }
-    if (node.tex != 0) {
-        glDeleteTextures(1, &node.tex);
-        node.tex = 0;
-    }
+    // STABLE TEXTURE ID (see the dmabuf path above): reuse node.tex so RmlUi's
+    // cached decorator handle stays valid; a re-upload (glTexImage2D) into the
+    // same id refreshes the pixels for an shm client's live updates.
     if (node.image != EGL_NO_IMAGE_KHR && gl.egl_destroy_image != nullptr) {
         gl.egl_destroy_image(gl.egl_display, node.image);
         node.image = EGL_NO_IMAGE_KHR;
     }
-    glGenTextures(1, &node.tex);
+    if (node.tex == 0) {
+        glGenTextures(1, &node.tex);
+    }
     glBindTexture(GL_TEXTURE_2D, node.tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
